@@ -6,36 +6,45 @@
 #  UDP Custom · SlowDNS · OpenVPN · WireGuard
 #  Sistemas: Ubuntu 20.04/22.04/24.04 y Debian 11/12 (como root)
 #
-#  Uso:
-#    bash vps-panel.sh                 registro del VPS (1a vez) + menú ("vpspanel")
-#    bash vps-panel.sh --install-all   instalación completa sin menú
+#  En el primer inicio pide el registro del VPS (nombre y tema de color)
+#  y dibuja un banner con ese nombre en todas las pantallas.
 #
-#  Valores por defecto: banner SSH desactivado, auto-inicio del panel activado.
-#  Los puertos se cambian en Protocolos y se guardan en /etc/vpspanel/ports.conf
-#    UDPCUSTOM_URL=<url> vpspanel      (opcional) usar otro binario de udp-custom
+#  Uso:
+#    bash vps-panel.sh                 menú interactivo (instala "vpspanel")
+#    bash vps-panel.sh --install-all   instalación completa sin menú
+#    bash vps-panel.sh --register      repetir el registro del VPS
+#    UDPCUSTOM_URL=<url> vpspanel      URL del binario udp-custom
+#
+#  Variables opcionales: NO_COLOR=1 (sin colores), VPSPANEL_TRUECOLOR=1
+#  (degradados de 24 bits si la terminal los soporta).
 # ======================================================================
 
 set -u
-shopt -s extglob
 export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_MODE=a
 export VPSPANEL_ACTIVE=1
+shopt -s extglob
 
-# La interfaz usa caracteres Unicode (marcos y bloques); se necesita un locale UTF-8
-if [[ $(locale charmap 2>/dev/null) != UTF-8 ]]; then
-  locale -a 2>/dev/null | grep -qiE '^c\.utf-?8$' && export LC_ALL=C.UTF-8
-fi
-if [[ $(locale charmap 2>/dev/null) == UTF-8 ]]; then UTF=1; else UTF=0; fi
+# Locale UTF-8: necesario para dibujar el banner y las cajas.
+for _l in C.UTF-8 C.utf8 en_US.UTF-8 en_US.utf8; do
+  if [[ $(LC_ALL=$_l locale charmap 2>/dev/null) == UTF-8 ]]; then
+    export LC_ALL=$_l LANG=$_l
+    break
+  fi
+done
+unset _l
 
+[[ $EUID -eq 0 ]] || { echo "Ejecuta como root."; exit 1; }
+command -v systemctl >/dev/null 2>&1 || { echo "Se requiere systemd."; exit 1; }
 # ------------------------------ Configuración -------------------------
-VERSION=2.1
-BASE=${VPSPANEL_BASE:-/etc/vpspanel}
+PANEL_VER=2.0
+BASE=/etc/vpspanel
 USERDB=$BASE/users.db
 V2DB=$BASE/v2ray.db
 BANNER=$BASE/banner
 CERT=$BASE/cert.pem
 DOMAIN_F=$BASE/domain
-NAME_F=$BASE/vps.name
-REG_F=$BASE/vps.reg
+CONF=$BASE/vps.conf
 V2CFG=/usr/local/etc/v2ray/config.json
 V2PATH=/v2ray
 
@@ -49,19 +58,6 @@ PORT_UDP=${PORT_UDP:-36712}
 PORT_SLOWDNS=${PORT_SLOWDNS:-5300}
 UDPCUSTOM_URL=${UDPCUSTOM_URL:-}
 
-# Puertos personalizables (Protocolos > Cambiar puerto). PVAR: variable de cada protocolo.
-declare -A PVAR=([dropbear]=PORT_DROPBEAR [ssl]=PORT_SSL [badvpn]=PORT_BADVPN [ws]=PORT_WS
-                 [squid]=PORT_SQUID [v2ray]=PORT_V2RAY [udp]=PORT_UDP [slowdns]=PORT_SLOWDNS)
-declare -A PDEF=([dropbear]=110 [ssl]=443 [badvpn]=7300 [ws]=80
-                 [squid]=3128 [v2ray]=8080 [udp]=36712 [slowdns]=5300)
-PORT_KEYS=(dropbear ssl ws squid v2ray badvpn udp slowdns)
-
-# UDP Custom: binario x86_64 descargado automáticamente. La URL apunta a un commit
-# exacto del repositorio (no a "main") y el archivo se verifica con SHA256 antes de
-# instalarlo, así no puede cambiar sin que el panel se entere.
-UDP_BIN_URL=https://raw.githubusercontent.com/Rerechan02/UDP/d0ebcc4b65a4ac3dffc3739df402a36d7297ef08/bin/udp-custom-linux-amd64
-UDP_BIN_SHA256=2a1b5584c7947feb5a02e847e09795751024f63ce7137a353c2b9c2a4282d636
-
 SSH_PORT=$(awk 'tolower($1)=="port"{print $2; exit}' /etc/ssh/sshd_config 2>/dev/null)
 SSH_PORT=${SSH_PORT:-22}
 
@@ -71,6 +67,533 @@ V2_INSTALL_URL=https://raw.githubusercontent.com/v2fly/fhs-install-v2ray/master/
 BADVPN_REPO=https://github.com/ambrop72/badvpn.git
 DNSTT_REPO=https://www.bamsoftware.com/git/dnstt.git
 GO_VERSION=1.22.5
+
+mkdir -p "$BASE"
+touch "$USERDB" "$V2DB"
+chmod 600 "$USERDB" "$V2DB"
+
+
+# ============================== INTERFAZ ==============================
+ML="  "        # margen izquierdo
+FLASH=""       # aviso de una sola vez, se muestra sobre el prompt
+T_COLS=80; T_ROWS=30; UW=62; IW=58; CW=28; TWO_COL=1
+
+if [[ -t 1 && -z ${NO_COLOR:-} && ${TERM:-dumb} != dumb ]]; then UI_COLOR=1; else UI_COLOR=0; fi
+COLOR_MODE=auto    # auto | 24 | 256  (se guarda en el registro)
+TRUECOLOR=0
+set_colormode() { # aplica COLOR_MODE a TRUECOLOR
+  case $COLOR_MODE in
+    24)  TRUECOLOR=1 ;;
+    256) TRUECOLOR=0 ;;
+    *)   TRUECOLOR=0
+         if [[ ${COLORTERM:-} == *truecolor* || ${COLORTERM:-} == *24bit* || ${VPSPANEL_TRUECOLOR:-0} == 1 ]]; then
+           TRUECOLOR=1
+         fi ;;
+  esac
+}
+set_colormode
+
+if (( UI_COLOR )); then
+  N=$'\e[0m'; BD=$'\e[1m'
+  DIM=$'\e[38;5;245m'; BRD=$'\e[38;5;240m'; WHT=$'\e[39m'
+  GRN=$'\e[38;5;42m'; RED=$'\e[38;5;203m'; YEL=$'\e[38;5;221m'
+  T_INFO=$'\e[1;48;5;31;38;5;255m INFO  \e[0m'
+  T_OK=$'\e[1;48;5;35;38;5;16m  OK   \e[0m'
+  T_ERR=$'\e[1;48;5;160;38;5;255m ERROR \e[0m'
+  T_WRN=$'\e[1;48;5;178;38;5;16m AVISO \e[0m'
+else
+  N=''; BD=''; DIM=''; BRD=''; WHT=''; GRN=''; RED=''; YEL=''
+  T_INFO='[INFO] '; T_OK='[ OK ] '; T_ERR='[ERROR]'; T_WRN='[AVISO]'
+fi
+
+# ---- Temas de color: nombre|inicio|medio|fin (RGB) ----
+THEMES=(
+  "Aurora|0,230,170|0,160,255|140,90,255"
+  "Ciber|0,229,255|80,140,255|205,100,255"
+  "Fuego|255,225,80|255,140,40|255,60,100"
+  "Oceano|110,245,210|40,175,235|50,90,225"
+  "Atardecer|255,200,100|255,100,150|165,85,235"
+  "Esmeralda|190,245,100|60,215,130|0,160,175"
+)
+TH_R=(0 0 0); TH_G=(0 0 0); TH_B=(0 0 0); TH_NAME=""
+A1=''; A2=''; A3=''
+GRAD=(); GRADD=()
+BAN_KEY=''; BAN_RAW=(); BAN_ROWS=(); BAN_W=0; BAN_KIND=1; SIDE_USED=0; SIDE=()
+VPS_NAME=""; VPS_NAME_UP="VPS PANEL"; VPS_THEME=1; VPS_DATE=""; VPS_DATE_TXT="-"
+OS_NAME=""
+
+rgb_fg() { # r g b -> REPLY (secuencia de color de primer plano)
+  if (( ! UI_COLOR )); then REPLY=''; return 0; fi
+  if (( TRUECOLOR )); then
+    REPLY=$'\e[38;2;'"$1;$2;$3"m
+  else
+    local r=$1 g=$2 b=$3
+    (( r = r < 48 ? 0 : (r < 115 ? 1 : (r - 35) / 40) ))
+    (( g = g < 48 ? 0 : (g < 115 ? 1 : (g - 35) / 40) ))
+    (( b = b < 48 ? 0 : (b < 115 ? 1 : (b - 35) / 40) ))
+    REPLY=$'\e[38;5;'"$(( 16 + 36 * r + 6 * g + b ))"m
+  fi
+}
+
+apply_theme() { # índice (1..n)
+  local i=${1:-1} entry c0 c1 c2
+  (( i >= 1 && i <= ${#THEMES[@]} )) || i=1
+  VPS_THEME=$i
+  entry=${THEMES[i-1]}
+  TH_NAME=${entry%%|*}
+  IFS='|' read -r _ c0 c1 c2 <<< "$entry"
+  IFS=, read -r 'TH_R[0]' 'TH_G[0]' 'TH_B[0]' <<< "$c0"
+  IFS=, read -r 'TH_R[1]' 'TH_G[1]' 'TH_B[1]' <<< "$c1"
+  IFS=, read -r 'TH_R[2]' 'TH_G[2]' 'TH_B[2]' <<< "$c2"
+  rgb_fg "${TH_R[0]}" "${TH_G[0]}" "${TH_B[0]}"; A1=$REPLY
+  rgb_fg "${TH_R[1]}" "${TH_G[1]}" "${TH_B[1]}"; A2=$REPLY
+  rgb_fg "${TH_R[2]}" "${TH_G[2]}" "${TH_B[2]}"; A3=$REPLY
+  rgb_fg $(( TH_R[1] * 55 / 100 )) $(( TH_G[1] * 55 / 100 )) $(( TH_B[1] * 55 / 100 )); BRD=$REPLY
+  BAN_KEY=''
+}
+
+mkgrad() { # n -> GRAD[0..n-1] y GRADD[0..n-1] (variante oscura para la sombra)
+  local n=$1 i p t s r g b
+  GRAD=(); GRADD=()
+  for (( i = 0; i < n; i++ )); do
+    if (( n > 1 )); then p=$(( i * 1000 / (n - 1) )); else p=0; fi
+    if (( p < 500 )); then s=0; t=$(( p * 2 )); else s=1; t=$(( (p - 500) * 2 )); fi
+    r=$(( TH_R[s] + (TH_R[s+1] - TH_R[s]) * t / 1000 ))
+    g=$(( TH_G[s] + (TH_G[s+1] - TH_G[s]) * t / 1000 ))
+    b=$(( TH_B[s] + (TH_B[s+1] - TH_B[s]) * t / 1000 ))
+    rgb_fg "$r" "$g" "$b"; GRAD[i]=$REPLY
+    rgb_fg $(( r * 60 / 100 )) $(( g * 60 / 100 )) $(( b * 60 / 100 )); GRADD[i]=$REPLY
+  done
+}
+
+# ---- Tamaño de la terminal y diseño adaptable ----
+term_size() {
+  T_COLS=$(tput cols 2>/dev/null) || T_COLS=80
+  T_ROWS=$(tput lines 2>/dev/null) || T_ROWS=30
+  [[ $T_COLS =~ ^[0-9]+$ ]] || T_COLS=80
+  [[ $T_ROWS =~ ^[0-9]+$ ]] || T_ROWS=30
+  UW=$(( T_COLS - 4 ))
+  (( UW > 66 )) && UW=66
+  (( UW < 24 )) && UW=24
+  IW=$(( UW - 4 ))
+  if (( IW >= 56 )); then TWO_COL=1; CW=$(( (IW - 2) / 2 )); else TWO_COL=0; CW=$IW; fi
+}
+
+cls() { if (( UI_COLOR )); then printf '\e[H\e[2J'; fi; return 0; }
+
+# ---- Medición y relleno (ignora los códigos de color) ----
+vlen() { local s=$1; s=${s//$'\e'\[*([0-9;])m/}; REPLY=${#s}; }
+padr() { local s=${1:0:$2}; printf -v REPLY '%s%*s' "$s" $(( $2 - ${#s} )) ''; }          # texto plano
+padv() { vlen "$1"; local pad=$(( $2 - REPLY )); (( pad < 0 )) && pad=0; printf -v REPLY '%s%*s' "$1" "$pad" ''; }  # con color
+rep()  { if (( $2 > 0 )); then printf -v REPLY '%*s' "$2" ''; REPLY=${REPLY// /$1}; else REPLY=''; fi; }
+trim() { local s=$1; s=${s#"${s%%[![:space:]]*}"}; s=${s%"${s##*[![:space:]]}"}; REPLY=$s; }
+
+# ---- Mensajes ----
+info() { printf '%s%s %s\n' "$ML" "$T_INFO" "$*"; }
+ok()   { printf '%s%s %s\n' "$ML" "$T_OK" "$*"; }
+err()  { printf '%s%s %s\n' "$ML" "$T_ERR" "$*" >&2; }
+warn() { printf '%s%s %s\n' "$ML" "$T_WRN" "$*"; }
+flash_ok()   { FLASH="$T_OK $*"; }
+flash_warn() { FLASH="$T_WRN $*"; }
+
+note() { # párrafo ajustado al ancho, en gris
+  local -a words=(); local w line=''
+  read -ra words <<< "$*"
+  for w in "${words[@]}"; do
+    if [[ -n $line ]] && (( ${#line} + ${#w} + 1 > IW )); then
+      printf '%s%s%s%s\n' "$ML" "$DIM" "$line" "$N"; line=$w
+    else
+      line=${line:+$line }$w
+    fi
+  done
+  [[ -n $line ]] && printf '%s%s%s%s\n' "$ML" "$DIM" "$line" "$N"
+  return 0
+}
+
+ask() { # variable "etiqueta" ["sugerencia"]
+  local __v=$1 __p="$ML${A1}${BD}›${N} ${WHT}$2${N}" __r=''
+  [[ -n ${3:-} ]] && __p+=" ${DIM}[$3]${N}"
+  __p+="${DIM}:${N} "
+  if ! read -rp "$__p" __r; then
+    [[ -n $__r ]] || { echo; exit 0; }
+  fi
+  printf -v "$__v" '%s' "$__r"
+}
+
+pause() { local _x; printf '\n%s%s›%s %sPresiona ENTER para continuar...%s ' "$ML" "$A1" "$N" "$DIM" "$N"; read -r _x || true; }
+
+prompt_opt() { # lee la opción en O (número sin ceros a la izquierda)
+  if [[ -n $FLASH ]]; then printf '\n%s%s\n' "$ML" "$FLASH"; FLASH=''; fi
+  printf '\n%s%s%s›%s %s%sOpción%s%s:%s ' "$ML" "$A1" "$BD" "$N" "$BD" "$WHT" "$N" "$DIM" "$N"
+  IFS= read -r O || { echo; exit 0; }
+  O=${O//[[:space:]]/}
+  if [[ $O =~ ^[0-9]{1,6}$ ]]; then O=$(( 10#$O )); fi
+}
+
+spin() { # mensaje comando [args...]  -> ejecuta en segundo plano con un indicador
+  local msg=$1 pid rc i=0 fr='|/-\'
+  shift
+  if (( ! UI_COLOR )); then "$@" >/dev/null 2>&1; return; fi
+  "$@" >/dev/null 2>&1 &
+  pid=$!
+  printf '\e[?25l'
+  while kill -0 "$pid" 2>/dev/null; do
+    printf '\r%s%s%s%s %s\e[K' "$ML" "$A1" "${fr:i++%4:1}" "$N" "$msg"
+    sleep 0.1
+  done
+  wait "$pid"; rc=$?
+  printf '\r\e[K\e[?25h'
+  return "$rc"
+}
+
+# ---- Cajas ----
+box_top() { # título
+  local t=$1
+  rep "─" $(( UW - ${#t} - 5 ))
+  printf '%s%s╭─%s %s%s%s %s%s╮%s\n' "$ML" "$BRD" "$N" "$BD$A3" "$t" "$N" "$BRD" "$REPLY" "$N"
+}
+box_bot() { rep "─" $(( UW - 2 )); printf '%s%s╰%s╯%s\n' "$ML" "$BRD" "$REPLY" "$N"; }
+box_row() { # contenido (puede llevar colores)
+  local pad
+  vlen "$1"; pad=$(( IW - REPLY )); (( pad < 0 )) && pad=0
+  printf '%s%s│%s %s%*s %s│%s\n' "$ML" "$BRD" "$N" "$1" "$pad" '' "$BRD" "$N"
+}
+box_blank() { box_row ''; }
+pair_row() { if (( TWO_COL )); then box_row "$1  $2"; else box_row "$1"; box_row "$2"; fi; }
+
+krowc() { # etiqueta valor_coloreado
+  padr "$1" 11
+  box_row "${DIM}${REPLY}${N}$2"
+}
+krow() { krowc "$1" "${BD}${WHT}$2${N}"; } # etiqueta valor
+
+box_ports() { # etiqueta "Nombre valor"...  (reparte los elementos en filas que caben en la caja)
+  local label=$1 plain='' col='' it w=$(( IW - 11 ))
+  shift
+  for it in "$@"; do
+    if [[ -n $plain ]] && (( ${#plain} + 3 + ${#it} > w )); then
+      krowc "$label" "$col"; label=''; plain=''; col=''
+    fi
+    if [[ -n $plain ]]; then plain+='   '; col+='   '; fi
+    plain+=$it; col+="${WHT}${it% *} ${A1}${it##* }${N}"
+  done
+  [[ -n $plain ]] && krowc "$label" "$col"
+  return 0
+}
+
+kv() { # etiqueta valor_coloreado -> REPLY (ancho CW)
+  local l
+  padr "$1" 8; l=$REPLY
+  padv "$2" $(( CW - 8 )); REPLY="${DIM}${l}${N}${REPLY}"
+}
+
+bar() { # porcentaje ancho -> REPLY (ancho visible = $2)
+  local p=$1 w=$2 f e col s1 s2
+  (( p > 100 )) && p=100
+  (( p < 0 )) && p=0
+  f=$(( p * w / 100 )); e=$(( w - f ))
+  if (( p >= 85 )); then col=$RED; elif (( p >= 60 )); then col=$YEL; else col=$GRN; fi
+  rep "█" "$f"; s1=$REPLY; rep "░" "$e"; s2=$REPLY
+  REPLY="${col}${s1}${BRD}${s2}${N}"
+}
+
+section() { # título [etiqueta derecha]
+  local t=$1 tag a b f
+  if (( $# >= 2 )); then tag=$2; else tag="$VPS_NAME_UP v$PANEL_VER"; fi
+  a=${#t}; b=${#tag}
+  f=$(( UW - 4 - a - b ))
+  if (( b > 0 && f < 3 )); then tag=''; b=0; fi
+  if (( b > 0 )); then
+    rep "─" "$f"
+    printf '\n%s%s▌%s %s%s%s %s%s%s %s%s%s\n' "$ML" "$A1" "$N" "$BD$WHT" "$t" "$N" "$BRD" "$REPLY" "$N" "$A3" "$tag" "$N"
+  else
+    rep "─" $(( UW - 3 - a ))
+    printf '\n%s%s▌%s %s%s%s %s%s%s\n' "$ML" "$A1" "$N" "$BD$WHT" "$t" "$N" "$BRD" "$REPLY" "$N"
+  fi
+}
+
+back_line() { printf '\n%s%s%s00%s  %s%s%s\n' "$ML" "$RED" "$BD" "$N" "$DIM" "${1:-Volver al menú principal}" "$N"; }
+
+# ---- Rejilla de opciones (dos columnas, orden por columnas) ----
+MG_NUM=(); MG_LAB=(); MG_ST=()
+
+cell() { # num etiqueta [estado: on|off|none]  -> REPLY (ancho CW)
+  local n=$1 l=$2 s=${3-} nc=$A1 lc=$WHT st='' lw
+  case $s in
+    on)   st="${GRN}●${N} ${GRN}ON${N} " ;;
+    off)  st="${RED}●${N} ${RED}OFF${N}" ;;
+    none) st="${BRD}○ ---${N}"; nc=$BRD; lc=$DIM ;;
+  esac
+  if [[ -n $st ]]; then lw=$(( CW - 10 )); else lw=$(( CW - 4 )); fi
+  padr "$l" "$lw"
+  REPLY="${nc}${BD}${n}${N}  ${lc}${REPLY}${N}"
+  [[ -n $st ]] && REPLY+=" $st"
+  return 0
+}
+
+menu_grid() {
+  local n=${#MG_NUM[@]} rows i j left right blank
+  if (( TWO_COL )); then
+    rows=$(( (n + 1) / 2 ))
+    printf -v blank '%*s' "$CW" ''
+    for (( i = 0; i < rows; i++ )); do
+      cell "${MG_NUM[i]}" "${MG_LAB[i]}" "${MG_ST[i]-}"; left=$REPLY
+      j=$(( i + rows ))
+      if (( j < n )); then cell "${MG_NUM[j]}" "${MG_LAB[j]}" "${MG_ST[j]-}"; right=$REPLY; else right=$blank; fi
+      box_row "$left  $right"
+    done
+  else
+    for (( i = 0; i < n; i++ )); do
+      cell "${MG_NUM[i]}" "${MG_LAB[i]}" "${MG_ST[i]-}"; box_row "$REPLY"
+    done
+  fi
+}
+
+# ---- Fuentes del banner ----
+declare -A FB=() FBW=() FS=() FSW=()
+
+load_fonts() {
+  local c w r0 r1 r2 r3 r4 r5 k r
+  # fuente grande: caracter|ancho|6 filas
+  while IFS='|' read -r c w r0 r1 r2 r3 r4 r5; do
+    FBW["$c"]=$w
+    k=0
+    for r in "$r0" "$r1" "$r2" "$r3" "$r4" "$r5"; do
+      while (( ${#r} < w )); do r+=' '; done
+      FB["$c:$k"]=$r
+      k=$(( k + 1 ))
+    done
+  done <<'FONT_BIG'
+A|8| █████╗|██╔══██╗|███████║|██╔══██║|██║  ██║|╚═╝  ╚═╝
+B|8|██████╗|██╔══██╗|██████╔╝|██╔══██╗|██████╔╝|╚═════╝
+C|8| ██████╗|██╔════╝|██║|██║|╚██████╗| ╚═════╝
+D|8|██████╗|██╔══██╗|██║  ██║|██║  ██║|██████╔╝|╚═════╝
+E|8|███████╗|██╔════╝|█████╗|██╔══╝|███████╗|╚══════╝
+F|8|███████╗|██╔════╝|█████╗|██╔══╝|██║|╚═╝
+G|9| ██████╗|██╔════╝|██║  ███╗|██║   ██║|╚██████╔╝| ╚═════╝
+H|8|██╗  ██╗|██║  ██║|███████║|██╔══██║|██║  ██║|╚═╝  ╚═╝
+I|3|██╗|██║|██║|██║|██║|╚═╝
+J|8|     ██╗|     ██║|     ██║|██   ██║|╚█████╔╝| ╚════╝
+K|8|██╗  ██╗|██║ ██╔╝|█████╔╝|██╔═██╗|██║  ██╗|╚═╝  ╚═╝
+L|8|██╗|██║|██║|██║|███████╗|╚══════╝
+M|11|███╗   ███╗|████╗ ████║|██╔████╔██║|██║╚██╔╝██║|██║ ╚═╝ ██║|╚═╝     ╚═╝
+N|10|███╗   ██╗|████╗  ██║|██╔██╗ ██║|██║╚██╗██║|██║ ╚████║|╚═╝  ╚═══╝
+O|9| ██████╗|██╔═══██╗|██║   ██║|██║   ██║|╚██████╔╝| ╚═════╝
+P|8|██████╗|██╔══██╗|██████╔╝|██╔═══╝|██║|╚═╝
+Q|9| ██████╗|██╔═══██╗|██║   ██║|██║▄▄ ██║|╚██████╔╝| ╚══▀▀═╝
+R|8|██████╗|██╔══██╗|██████╔╝|██╔══██╗|██║  ██║|╚═╝  ╚═╝
+S|8|███████╗|██╔════╝|███████╗|╚════██║|███████║|╚══════╝
+T|9|████████╗|╚══██╔══╝|   ██║|   ██║|   ██║|   ╚═╝
+U|9|██╗   ██╗|██║   ██║|██║   ██║|██║   ██║|╚██████╔╝| ╚═════╝
+V|9|██╗   ██╗|██║   ██║|██║   ██║|╚██╗ ██╔╝| ╚████╔╝|  ╚═══╝
+W|10|██╗    ██╗|██║    ██║|██║ █╗ ██║|██║███╗██║|╚███╔███╔╝| ╚══╝╚══╝
+X|8|██╗  ██╗|╚██╗██╔╝| ╚███╔╝| ██╔██╗|██╔╝ ██╗|╚═╝  ╚═╝
+Y|9|██╗   ██╗|╚██╗ ██╔╝| ╚████╔╝|  ╚██╔╝|   ██║|   ╚═╝
+Z|8|███████╗|╚══███╔╝|  ███╔╝| ███╔╝|███████╗|╚══════╝
+0|9| ██████╗|██╔═████╗|██║██╔██║|████╔╝██║|╚██████╔╝| ╚═════╝
+1|4| ██╗|███║|╚██║| ██║| ██║| ╚═╝
+2|8|██████╗|╚════██╗| █████╔╝|██╔═══╝|███████╗|╚══════╝
+3|8|██████╗|╚════██╗| █████╔╝| ╚═══██╗|██████╔╝|╚═════╝
+4|8|██╗  ██╗|██║  ██║|███████║|╚════██║|     ██║|     ╚═╝
+5|8|███████╗|██╔════╝|███████╗|╚════██║|███████║|╚══════╝
+6|9| ██████╗|██╔════╝|███████╗|██╔═══██╗|╚██████╔╝| ╚═════╝
+7|8|███████╗|╚════██║|    ██╔╝|   ██╔╝|   ██║|   ╚═╝
+8|8| █████╗|██╔══██╗|╚█████╔╝|██╔══██╗|╚█████╔╝| ╚════╝
+9|8| █████╗|██╔══██╗|╚██████║| ╚═══██║| █████╔╝| ╚════╝
+-|6|||█████╗|╚════╝||
+_|8|||||███████╗|╚══════╝
+.|3|||||██╗|╚═╝
+ |3||||||
+FONT_BIG
+  # fuente compacta: caracter|5 filas de píxeles (se dibuja con medios bloques)
+  while IFS='|' read -r c r0 r1 r2 r3 r4; do
+    FSW["$c"]=${#r0}
+    FS["$c:0"]=$r0; FS["$c:1"]=$r1; FS["$c:2"]=$r2; FS["$c:3"]=$r3; FS["$c:4"]=$r4
+  done <<'FONT_SMALL'
+A|.#.|#.#|###|#.#|#.#
+B|##.|#.#|##.|#.#|##.
+C|.##|#..|#..|#..|.##
+D|##.|#.#|#.#|#.#|##.
+E|###|#..|##.|#..|###
+F|###|#..|##.|#..|#..
+G|.##|#..|#.#|#.#|.##
+H|#.#|#.#|###|#.#|#.#
+I|###|.#.|.#.|.#.|###
+J|..#|..#|..#|#.#|.#.
+K|#.#|#.#|##.|#.#|#.#
+L|#..|#..|#..|#..|###
+M|#...#|##.##|#.#.#|#...#|#...#
+N|#..#|##.#|#.##|#..#|#..#
+O|###|#.#|#.#|#.#|###
+P|##.|#.#|##.|#..|#..
+Q|###|#.#|#.#|###|..#
+R|##.|#.#|##.|#.#|#.#
+S|.##|#..|.#.|..#|##.
+T|###|.#.|.#.|.#.|.#.
+U|#.#|#.#|#.#|#.#|###
+V|#.#|#.#|#.#|#.#|.#.
+W|#...#|#...#|#.#.#|##.##|#...#
+X|#.#|#.#|.#.|#.#|#.#
+Y|#.#|#.#|.#.|.#.|.#.
+Z|###|..#|.#.|#..|###
+0|###|#.#|#.#|#.#|###
+1|.#.|##.|.#.|.#.|###
+2|##.|..#|.#.|#..|###
+3|##.|..#|.#.|..#|##.
+4|#.#|#.#|###|..#|..#
+5|###|#..|##.|..#|##.
+6|.##|#..|###|#.#|###
+7|###|..#|.#.|.#.|.#.
+8|###|#.#|###|#.#|###
+9|###|#.#|###|..#|##.
+-|...|...|###|...|...
+_|...|...|...|...|###
+.|.|.|.|.|#
+ |..|..|..|..|..
+FONT_SMALL
+}
+
+paint() { # texto [bitono] -> REPLY con degradado por columna (usa GRAD / GRADD)
+  local s=$1 two=${2:-0} x ch out=''
+  for (( x = 0; x < ${#s}; x++ )); do
+    ch=${s:x:1}
+    if [[ $ch == ' ' ]]; then out+=' '
+    elif (( two )) && [[ $ch != '█' ]]; then out+="${GRADD[x]}$ch"
+    else out+="${GRAD[x]}$ch"
+    fi
+  done
+  REPLY=$out$N
+}
+
+big_width() { local s=$1 i ch w t=0; for (( i = 0; i < ${#s}; i++ )); do ch=${s:i:1}; w=${FBW["$ch"]:-0}; t=$(( t + w )); done; REPLY=$t; }
+
+small_render() { # nombre -> BAN_RAW[0..2]; REPLY = ancho
+  local s=$1 t i ch w x a b ta tb row
+  BAN_RAW=()
+  for (( t = 0; t < 3; t++ )); do
+    row=''
+    for (( i = 0; i < ${#s}; i++ )); do
+      ch=${s:i:1}
+      w=${FSW["$ch"]:-0}
+      (( w > 0 )) || continue
+      a=${FS["$ch:$(( 2 * t ))"]}
+      if (( t < 2 )); then b=${FS["$ch:$(( 2 * t + 1 ))"]}; else b=''; fi
+      for (( x = 0; x < w; x++ )); do
+        ta=${a:x:1}; tb=${b:x:1}; tb=${tb:-.}
+        case $ta$tb in
+          '##') row+='█' ;;
+          '#.') row+='▀' ;;
+          '.#') row+='▄' ;;
+          *)    row+=' ' ;;
+        esac
+      done
+      row+=' '
+    done
+    BAN_RAW[t]=${row% }
+  done
+  REPLY=${#BAN_RAW[0]}
+}
+
+build_banner() { # arma BAN_ROWS según el nombre, el tema y el tamaño de la terminal
+  local key="$VPS_NAME_UP|$VPS_THEME|$T_COLS|$T_ROWS"
+  [[ $key == "$BAN_KEY" ]] && return 0
+  BAN_KEY=$key
+  local s=$VPS_NAME_UP w r i ch line
+  BAN_RAW=(); BAN_ROWS=(); BAN_W=0; BAN_KIND=1
+  big_width "$s"; w=$REPLY
+  if (( T_ROWS >= 30 && w > 0 && w + 4 <= T_COLS )); then        # banner grande (6 filas)
+    for (( r = 0; r < 6; r++ )); do
+      line=''
+      for (( i = 0; i < ${#s}; i++ )); do ch=${s:i:1}; line+=${FB["$ch:$r"]-}; done
+      BAN_RAW[r]=$line
+    done
+    mkgrad "$w"
+    for r in "${!BAN_RAW[@]}"; do paint "${BAN_RAW[r]}" 1; BAN_ROWS[r]=$REPLY; done
+    BAN_W=$w; BAN_KIND=3
+    return 0
+  fi
+  small_render "$s"; w=$REPLY                                    # banner compacto (3 filas)
+  if (( w > 0 && w + 4 <= T_COLS )); then
+    mkgrad "$w"
+    for r in "${!BAN_RAW[@]}"; do paint "${BAN_RAW[r]}" 0; BAN_ROWS[r]=$REPLY; done
+    BAN_W=$w; BAN_KIND=2
+    return 0
+  fi
+  line=''                                                        # una sola línea con letras espaciadas
+  for (( i = 0; i < ${#s}; i++ )); do line+="${s:i:1} "; done
+  line=${line% }; line=${line:0:T_COLS-4}
+  w=${#line}
+  mkgrad "$w"; paint "$line" 0
+  BAN_ROWS=("$BD$REPLY"); BAN_W=$w; BAN_KIND=1
+}
+
+gbar() { # carácter ancho  -> barra con degradado
+  local ch=$1 n=$2 i out=''
+  mkgrad "$n"
+  for (( i = 0; i < n; i++ )); do out+="${GRAD[i]}$ch"; done
+  printf '%s%s%s\n' "$ML" "$out" "$N"
+}
+
+side_lines() { # panel de datos a la derecha del banner grande
+  local pw vw now
+  pw=$(( UW - BAN_W - 4 )); vw=$(( pw - 10 )); (( vw < 8 )) && vw=8
+  printf -v now '%(%H:%M:%S)T' -1
+  SIDE=(
+    "${BD}${WHT}ADMINISTRADOR DE VPS${N}"
+    "${A1}${BD}v${PANEL_VER}${N}  ${DIM}Panel de túneles${N}"
+    "${DIM}REGISTRO${N}  ${WHT}${VPS_DATE_TXT}${N}"
+    "${DIM}IP${N}        ${WHT}${IP:0:vw}${N}"
+    "${DIM}SO${N}        ${WHT}${OS_NAME:0:vw}${N}"
+    "${DIM}HORA${N}      ${WHT}${now}${N}"
+  )
+}
+
+draw_logo() { # [1 = con panel lateral si cabe]
+  local want=${1:-0} hw r pw line
+  build_banner
+  hw=$(( BAN_W > UW ? BAN_W : UW ))
+  pw=$(( UW - BAN_W - 4 ))
+  SIDE_USED=0
+  gbar "▄" "$hw"
+  if (( want && BAN_KIND == 3 && pw >= 24 )); then
+    SIDE_USED=1
+    side_lines
+    for (( r = 0; r < ${#BAN_ROWS[@]}; r++ )); do
+      printf '%s%s  %s│%s %s\n' "$ML" "${BAN_ROWS[r]}" "$A2" "$N" "${SIDE[r]}"
+    done
+  else
+    for line in "${BAN_ROWS[@]}"; do printf '%s%s%s\n' "$ML" "$line" "$N"; done
+  fi
+  gbar "▀" "$hw"
+}
+
+info_band() { # título + datos en dos líneas (cuando no hay panel lateral)
+  local now l r gap a b
+  printf -v now '%(%H:%M:%S)T' -1
+  l="${BD}${WHT}ADMINISTRADOR DE VPS${N}  ${A1}${BD}v${PANEL_VER}${N}"
+  r="${DIM}HORA${N} ${WHT}${now}${N}"
+  vlen "$l"; a=$REPLY; vlen "$r"; b=$REPLY
+  gap=$(( UW - a - b ))
+  if (( gap >= 2 )); then
+    printf '%s%s%*s%s\n' "$ML" "$l" "$gap" '' "$r"
+    printf '%s%sIP%s %s%s%s   %sSO%s %s%s%s\n' "$ML" "$DIM" "$N" "$WHT" "${IP:0:20}" "$N" "$DIM" "$N" "$WHT" "$OS_NAME" "$N"
+  else   # terminal angosta: título arriba, datos abajo
+    printf '%s%s\n' "$ML" "$l"
+    printf '%s%sIP%s %s%s%s   %sHORA%s %s%s%s\n' "$ML" "$DIM" "$N" "$WHT" "${IP:0:20}" "$N" "$DIM" "$N" "$WHT" "$now" "$N"
+  fi
+}
+
+draw_header() {
+  term_size; cls
+  draw_logo 1
+  (( SIDE_USED )) || info_band
+}
+
+# ------------------------------ Utilidades ----------------------------
+if (( UI_COLOR )); then printf '\r%s%sIniciando panel...%s' "$ML" "$DIM" "$N"; fi
+IP=$(curl -4fsS --max-time 5 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')
+if (( UI_COLOR )); then printf '\r\e[K'; fi
+OS_NAME=$(. /etc/os-release 2>/dev/null; echo "${NAME%% *} ${VERSION_ID:-}")
 
 declare -A SVC=(
   [ssh]=ssh
@@ -96,314 +619,11 @@ declare -A INST=(
   [slowdns]=inst_slowdns
 )
 PROTO_KEYS=(dropbear ssl badvpn ws squid v2ray udp slowdns openvpn wireguard)
-PROTO_NAMES=("DROPBEAR" "SSL" "BADVPN" "WEBSOCKET" "SQUID"
-             "V2RAY" "UDP CUSTOM" "SLOWDNS" "OPENVPN" "WIREGUARD")
+PROTO_LABELS=("Dropbear" "SSL / Stunnel" "BadVPN UDPGW" "WebSocket" "Squid Proxy"
+              "V2Ray" "UDP Custom" "SlowDNS" "OpenVPN" "WireGuard")
 
-# ------------------------------ Interfaz ------------------------------
-# Todo el aspecto visual vive en este bloque: colores, marcos, banner y spinner.
-RAMP=(51 45 45 39 39 33 33 69 69 105 105 141 141 177)   # degradado cian -> violeta
-GC=()                                  # colores del degradado (se rellena con mk_grad)
+apt_i() { spin "Instalando ${1}${2:+ y dependencias}" apt-get install -y -qq "$@"; }
 
-init_ui() {
-  local cols
-  cols=$(tput cols 2>/dev/null); [[ $cols =~ ^[0-9]+$ ]] || cols=${COLUMNS:-56}
-  (( cols > 62 )) && cols=62
-  (( cols < 40 )) && cols=40
-  UW=$cols                 # ancho total de la interfaz
-  BW=$(( UW - 2 ))         # ancho de cada marco (1 espacio de margen a la izquierda)
-  IW=$(( BW - 5 ))         # ancho útil dentro de un marco (2 espacios a la izquierda)
-  if (( UW >= 52 )); then TWO=1; else TWO=0; fi   # dos columnas solo si hay espacio
-
-  if [[ ( -t 1 || -n ${VPSPANEL_COLOR:-} ) && -z ${NO_COLOR:-} && ${TERM:-dumb} != dumb ]]; then
-    RST=$'\e[0m\e[38;5;252m'; BOLD=$'\e[1m'
-    ACC=$'\e[38;5;45m';     ACC2=$'\e[38;5;141m'
-    HI=$'\e[1;38;5;255m';   TXT=$'\e[38;5;252m';  DIM=$'\e[38;5;245m'
-    OKC=$'\e[38;5;87m';      ERC=$'\e[38;5;203m';  WRC=$'\e[38;5;221m'
-    BRD=$'\e[38;5;37m';     SHC=$'\e[38;5;240m'; IPC=$'\e[1;38;5;219m'
-  else
-    RST='' BOLD='' ACC='' ACC2='' HI='' TXT='' DIM='' OKC='' ERC='' WRC='' BRD='' SHC='' IPC=''
-  fi
-
-  if (( UTF )); then
-    GH='─' GV='│' GTL='╭' GTR='╮' GBL='╰' GBR='╯'
-    GDOT='●' GRING='○' GFUL='━' GEMP='╌' GBAR='━' GBLK='█' ARW='›' SEP='·'
-    SPIN=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
-  else
-    GH='-' GV='|' GTL='+' GTR='+' GBL='+' GBR='+'
-    GDOT='*' GRING='o' GFUL='#' GEMP='.' GBAR='=' GBLK='#' ARW='>' SEP='-'
-    SPIN=('|' '/' '-' '\')
-  fi
-
-  # Alias de colores usados por los instaladores
-  R=$ERC; G=$OKC; Y=$WRC; M=$ACC2; C=$ACC; W=$HI; N=$RST; LINE=
-}
-
-rep() { local s; printf -v s '%*s' "$2" ''; printf '%s' "${s// /$1}"; }   # carácter n_veces
-
-vlen_set() { local s=${1//$'\e['*([0-9;])m/}; VL=${#s}; }                  # largo visible (sin colores)
-
-mk_grad() {   # ancho -> rellena GC[] con un color por columna
-  local w=$1 i k n=${#RAMP[@]}
-  GC=()
-  for (( i=0; i<w; i++ )); do
-    if [[ -n $RST ]]; then k=$(( i * n / w )); printf -v "GC[$i]" '\e[38;5;%sm' "${RAMP[k]}"; else GC[i]=; fi
-  done
-}
-
-gradient_bar() {
-  local i s=' '
-  mk_grad "$BW"
-  for (( i=0; i<BW; i++ )); do s+="${GC[i]}${GBAR}"; done
-  printf '%s%s\n' "$s" "$RST"
-}
-
-cls() { [[ -t 1 ]] && printf '\e[H\e[2J\e[3J%s' "$TXT"; return 0; }
-
-# ---- Marcos --------------------------------------------------------
-box_top() {   # titulo
-  local t=$1 n fill
-  vlen_set "$t"; n=$VL
-  fill=$(( BW - 5 - n )); (( fill < 1 )) && fill=1
-  printf ' %s%s%s%s %s%s%s %s%s%s%s\n' "$BRD" "$GTL" "$GH" "$RST" "$HI" "$t" "$RST" "$BRD" "$(rep "$GH" "$fill")" "$GTR" "$RST"
-}
-
-box_row() {   # texto (puede llevar colores)
-  local t=$1 pad
-  vlen_set "$t"; pad=$(( IW - VL )); (( pad < 0 )) && pad=0
-  printf ' %s%s%s  %s%*s %s%s%s\n' "$BRD" "$GV" "$RST" "$t" "$pad" '' "$BRD" "$GV" "$RST"
-}
-
-box_bottom() { printf ' %s%s%s%s%s\n' "$BRD" "$GBL" "$(rep "$GH" $(( BW - 2 )))" "$GBR" "$RST"; }
-
-box_cols() {  # izquierda derecha  (dos columnas; en pantallas angostas, dos filas)
-  local l=$1 r=$2 half pad
-  if (( TWO )); then
-    half=$(( IW / 2 ))
-    vlen_set "$l"; pad=$(( half - VL )); (( pad < 1 )) && pad=1
-    box_row "$l$(printf '%*s' "$pad" '')$r"
-  else
-    box_row "$l"; [[ -n $r ]] && box_row "$r"
-  fi
-  return 0
-}
-
-grid() {      # modo(col|row) celda...   reparte celdas en dos columnas
-  local mode=$1; shift
-  local -a c=("$@")
-  local n=${#c[@]} rows i l r
-  if (( TWO )); then
-    rows=$(( (n + 1) / 2 ))
-    for (( i=0; i<rows; i++ )); do
-      if [[ $mode == col ]]; then l=${c[i]}; r=${c[i+rows]:-}; else l=${c[2*i]}; r=${c[2*i+1]:-}; fi
-      box_cols "$l" "$r"
-    done
-  else
-    for l in "${c[@]}"; do box_row "$l"; done
-  fi
-}
-
-kv()    { printf '%s%-8s%s %s%s%s' "$DIM" "$1" "$RST" "${3:-$HI}" "$2" "$RST"; }  # etiqueta valor [color]
-mcell() { printf '%s%s%s  %s%s%s' "$ACC" "$1" "$RST" "${3:-$TXT}" "$2" "$RST"; } # NN etiqueta [color]
-pcell() { printf '%s%-11s%s %s%s%s' "$DIM" "$1" "$RST" "$HI" "$2" "$RST"; }      # etiqueta puerto
-
-bar() {       # porcentaje ancho -> ━━━╌╌╌  (degradado; ámbar desde 60%, rojo desde 85%)
-  local p=$1 w=$2 f i k n=${#RAMP[@]} s=''
-  (( p > 100 )) && p=100; (( p < 0 )) && p=0
-  f=$(( p * w / 100 )); (( p > 0 && f < 1 )) && f=1
-  for (( i=0; i<f; i++ )); do
-    if [[ -z $RST ]]; then s+=$GFUL
-    elif (( p >= 85 )); then s+="${ERC}${GFUL}"
-    elif (( p >= 60 )); then s+="${WRC}${GFUL}"
-    else k=$(( i * n / w )); printf -v k '\e[38;5;%sm' "${RAMP[k]}"; s+="${k}${GFUL}"; fi
-  done
-  printf '%s%s%s%s' "$s" "$SHC" "$(rep "$GEMP" $(( w - f )))" "$RST"
-}
-
-# ---- Mensajes ------------------------------------------------------
-info() { printf '  %s%s%s  %s\n' "$ACC" "$ARW" "$RST" "$*"; }
-ok()   { printf '  %s[OK]%s  %s\n' "$OKC" "$RST" "$*"; }
-err()  { printf '  %s[ERROR]%s  %s\n' "$ERC" "$RST" "$*" >&2; }
-warn() { printf '  %s[!]%s  %s\n' "$WRC" "$RST" "$*"; }
-pause() { local _; printf '\n'; read -rp "  ${DIM}Presiona ENTER para continuar...${RST}" _; }
-
-rd()  { local __p; printf -v __p '  %s%s%s %s' "$ACC" "$ARW" "$RST" "$1"; shift; read -rp "$__p" "$@"; }   # pregunta
-ask() { local __p; printf -v __p '\n  %s%s%s %s: ' "$ACC" "$ARW" "$RST" "$1"; read -rp "$__p" "$2"; }       # prompt de menú
-
-spin() {      # mensaje comando [args...]  -> ejecuta el comando mostrando un spinner
-  local msg=$1 pid i=0 rc; shift
-  if [[ ! -t 1 ]]; then info "$msg..."; "$@" >/dev/null 2>&1 </dev/null; return $?; fi
-  "$@" >/dev/null 2>&1 </dev/null &
-  pid=$!
-  printf '\e[?25l'
-  while kill -0 "$pid" 2>/dev/null; do
-    printf '\r  %s%s%s  %s' "$ACC" "${SPIN[i % ${#SPIN[@]}]}" "$RST" "$msg"
-    i=$(( i + 1 )); sleep 0.1
-  done
-  wait "$pid"; rc=$?
-  printf '\r\e[K\e[?25h'
-  return $rc
-}
-
-sub_header() { # titulo de la pantalla
-  cls
-  gradient_bar
-  printf ' %s%s%s  %s%s%s  %s%s%s\n' "$HI" "$(vps_name)" "$RST" "$DIM" "$ARW" "$RST" "$ACC" "$1" "$RST"
-  printf ' %s%s%s\n\n' "$DIM" "$(rep "$GH" "$BW")" "$RST"
-}
-
-# ---- Banner grande -------------------------------------------------
-# Fuente "ANSI Shadow": cada letra tiene 6 filas (separadas por |) y su propio ancho.
-declare -A SF=(
-  [A]=" █████╗ |██╔══██╗|███████║|██╔══██║|██║  ██║|╚═╝  ╚═╝"
-  [B]="██████╗ |██╔══██╗|██████╔╝|██╔══██╗|██████╔╝|╚═════╝ "
-  [C]=" ██████╗|██╔════╝|██║     |██║     |╚██████╗| ╚═════╝"
-  [D]="██████╗ |██╔══██╗|██║  ██║|██║  ██║|██████╔╝|╚═════╝ "
-  [E]="███████╗|██╔════╝|█████╗  |██╔══╝  |███████╗|╚══════╝"
-  [F]="███████╗|██╔════╝|█████╗  |██╔══╝  |██║     |╚═╝     "
-  [G]=" ██████╗ |██╔════╝ |██║  ███╗|██║   ██║|╚██████╔╝| ╚═════╝ "
-  [H]="██╗  ██╗|██║  ██║|███████║|██╔══██║|██║  ██║|╚═╝  ╚═╝"
-  [I]="██╗|██║|██║|██║|██║|╚═╝"
-  [J]="     ██╗|     ██║|     ██║|██   ██║|╚█████╔╝| ╚════╝ "
-  [K]="██╗  ██╗|██║ ██╔╝|█████╔╝ |██╔═██╗ |██║  ██╗|╚═╝  ╚═╝"
-  [L]="██╗     |██║     |██║     |██║     |███████╗|╚══════╝"
-  [M]="███╗   ███╗|████╗ ████║|██╔████╔██║|██║╚██╔╝██║|██║ ╚═╝ ██║|╚═╝     ╚═╝"
-  [N]="███╗   ██╗|████╗  ██║|██╔██╗ ██║|██║╚██╗██║|██║ ╚████║|╚═╝  ╚═══╝"
-  [O]=" ██████╗ |██╔═══██╗|██║   ██║|██║   ██║|╚██████╔╝| ╚═════╝ "
-  [P]="██████╗ |██╔══██╗|██████╔╝|██╔═══╝ |██║     |╚═╝     "
-  [Q]=" ██████╗ |██╔═══██╗|██║   ██║|██║▄▄ ██║|╚██████╔╝| ╚══▀▀═╝ "
-  [R]="██████╗ |██╔══██╗|██████╔╝|██╔══██╗|██║  ██║|╚═╝  ╚═╝"
-  [S]="███████╗|██╔════╝|███████╗|╚════██║|███████║|╚══════╝"
-  [T]="████████╗|╚══██╔══╝|   ██║   |   ██║   |   ██║   |   ╚═╝   "
-  [U]="██╗   ██╗|██║   ██║|██║   ██║|██║   ██║|╚██████╔╝| ╚═════╝ "
-  [V]="██╗   ██╗|██║   ██║|██║   ██║|╚██╗ ██╔╝| ╚████╔╝ |  ╚═══╝  "
-  [W]="██╗    ██╗|██║    ██║|██║ █╗ ██║|██║███╗██║|╚███╔███╔╝| ╚══╝╚══╝ "
-  [X]="██╗  ██╗|╚██╗██╔╝| ╚███╔╝ | ██╔██╗ |██╔╝ ██╗|╚═╝  ╚═╝"
-  [Y]="██╗   ██╗|╚██╗ ██╔╝| ╚████╔╝ |  ╚██╔╝  |   ██║   |   ╚═╝   "
-  [Z]="███████╗|╚══███╔╝|  ███╔╝ | ███╔╝  |███████╗|╚══════╝"
-  [0]=" ██████╗ |██╔═████╗|██║██╔██║|████╔╝██║|╚██████╔╝| ╚═════╝ "
-  [1]=" ██╗|███║|╚██║| ██║| ██║| ╚═╝"
-  [2]="██████╗ |╚════██╗| █████╔╝|██╔═══╝ |███████╗|╚══════╝"
-  [3]="██████╗ |╚════██╗| █████╔╝| ╚═══██╗|██████╔╝|╚═════╝ "
-  [4]="██╗  ██╗|██║  ██║|███████║|╚════██║|     ██║|     ╚═╝"
-  [5]="███████╗|██╔════╝|███████╗|╚════██║|███████║|╚══════╝"
-  [6]=" ██████╗ |██╔════╝ |███████╗ |██╔═══██╗|╚██████╔╝| ╚═════╝ "
-  [7]="███████╗|╚════██║|    ██╔╝|   ██╔╝ |   ██║  |   ╚═╝  "
-  [8]=" █████╗ |██╔══██╗|╚█████╔╝|██╔══██╗|╚█████╔╝| ╚════╝ "
-  [9]=" █████╗ |██╔══██╗|╚██████║| ╚═══██║| █████╔╝| ╚════╝ "
-  ["-"]="        |        |█████╗  |╚════╝  |        |        "
-  ["."]="    |    |    |    |██╗ |╚═╝ "
-  ["_"]="        |        |        |        |███████╗|╚══════╝"
-  ["?"]="██████╗ |╚════██╗|  ▄███╔╝|  ▀▀══╝ |  ██╗   |  ╚═╝   "
-)
-
-banner_glyph() {   # carácter -> GROWS[0..5] (rellenas al mismo ancho) y GW
-  local ch=$1 r w=0
-  IFS='|' read -ra GROWS <<< "${SF[$ch]:-${SF[?]}}"
-  for r in 0 1 2 3 4 5; do GROWS[r]=${GROWS[r]:-}; (( ${#GROWS[r]} > w )) && w=${#GROWS[r]}; done
-  for r in 0 1 2 3 4 5; do GROWS[r]+=$(rep ' ' $(( w - ${#GROWS[r]} ))); done
-  GW=$w
-}
-
-banner_width() {   # texto -> REPLY = ancho en columnas
-  local t=${1^^} i x=0
-  for (( i=0; i<${#t}; i++ )); do
-    if [[ ${t:i:1} == ' ' ]]; then x=$(( x + 3 )); else banner_glyph "${t:i:1}"; x=$(( x + GW )); fi
-  done
-  REPLY=$x
-}
-
-banner_split() {   # texto -> BL[] con 1 o 2 líneas; devuelve 1 si no cabe
-  local t=$1 best=-1 bm=9999 i m w1 w2
-  BL=()
-  banner_width "$t"
-  if (( REPLY <= BW )); then BL=("$t"); return 0; fi
-  for (( i=1; i<${#t}-1; i++ )); do
-    [[ ${t:i:1} == ' ' ]] || continue
-    banner_width "${t:0:i}"; w1=$REPLY
-    banner_width "${t:i+1}"; w2=$REPLY
-    (( w1 <= BW && w2 <= BW )) || continue
-    m=$(( w1 > w2 ? w1 : w2 ))
-    if (( m < bm )); then bm=$m; best=$i; fi
-  done
-  (( best < 0 )) && return 1
-  BL=("${t:0:best}" "${t:best+1}")
-  return 0
-}
-
-banner_big() {     # una línea de texto en letras grandes con degradado
-  local t=${1^^} i ch r c cw pad line prev col
-  local -a rows=('' '' '' '' '' '')
-  for (( i=0; i<${#t}; i++ )); do
-    ch=${t:i:1}
-    if [[ $ch == ' ' ]]; then
-      for r in 0 1 2 3 4 5; do rows[r]+='   '; done
-    else
-      banner_glyph "$ch"
-      for r in 0 1 2 3 4 5; do rows[r]+=${GROWS[r]}; done
-    fi
-  done
-  cw=${#rows[0]}
-  mk_grad "$cw"
-  pad=$(( (UW - cw) / 2 )); (( pad < 0 )) && pad=0
-  for r in 0 1 2 3 4 5; do
-    printf -v line '%*s' "$pad" ''
-    prev=''
-    for (( c=0; c<cw; c++ )); do
-      ch=${rows[r]:c:1}
-      if [[ $ch == ' ' ]]; then
-        line+=' '
-      else
-        col=${GC[c]}
-        if [[ $col != "$prev" ]]; then line+=$col; prev=$col; fi
-        line+=$ch
-      fi
-    done
-    printf '%s%s\n' "$line" "$RST"
-  done
-}
-
-banner_compact() { # nombre demasiado largo para las letras grandes: una línea espaciada
-  local t=${1^^} s="" i n pad
-  (( ${#t} > UW / 2 - 1 )) && t=${t:0:$(( UW / 2 - 1 ))}
-  n=${#t}
-  mk_grad "$n"
-  for (( i=0; i<n; i++ )); do s+="${BOLD}${GC[i]}${t:i:1} "; done
-  pad=$(( (UW - (2 * n - 1)) / 2 )); (( pad < 0 )) && pad=0
-  printf '%*s%s%s\n' "$pad" '' "$s" "$RST"
-}
-
-banner_print() {   # nombre
-  local l
-  if (( UTF )) && banner_split "$1"; then
-    for l in "${BL[@]}"; do banner_big "$l"; done
-  else
-    banner_compact "$1"
-  fi
-}
-
-# ------------------------------ Utilidades ----------------------------
-init_fs() {
-  mkdir -p "$BASE"
-  touch "$USERDB" "$V2DB"
-  chmod 600 "$USERDB" "$V2DB"
-}
-
-init_env() {
-  IP=${VPSPANEL_IP:-$(curl -4fsS --max-time 5 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')}
-  OS_NAME=$(grep -m1 '^PRETTY_NAME=' /etc/os-release 2>/dev/null | cut -d'"' -f2)
-  OS_NAME=${OS_NAME:-Linux}
-}
-
-preflight() {
-  [[ $EUID -eq 0 ]] || { echo "Ejecuta como root."; exit 1; }
-  command -v systemctl >/dev/null 2>&1 || { echo "Se requiere systemd."; exit 1; }
-}
-
-apt_i() { spin "Instalando $*" apt-get install -y -qq -o DPkg::Lock::Timeout=120 "$@"; }
-
-vps_name() { cat "$NAME_F" 2>/dev/null; }
-
-# ----------------------- Funciones base (originales) ------------------
 is_on() {
   case $1 in
     openvpn) systemctl is-active --quiet openvpn-server@server || systemctl is-active --quiet openvpn@server ;;
@@ -411,12 +631,11 @@ is_on() {
   esac
 }
 
-
 get_host() { local d; d=$(cat "$DOMAIN_F" 2>/dev/null); echo "${d:-$IP}"; }
 
 valid_name() { [[ $1 =~ ^[a-z_][a-z0-9_-]{2,30}$ ]]; }
 
-rand_pass() { tr -dc 'A-Za-z0-9' </dev/urandom | head -c 10; }
+rand_pass() { tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c 10; }
 
 port_busy() { ss -H -ltn "sport = :$1" 2>/dev/null | grep -q .; }
 
@@ -481,6 +700,7 @@ db_set() { # usuario campo valor  (users.db)
   cat "$t" > "$USERDB"; rm -f "$t"
 }
 
+# ------------------------- Preparación del sistema --------------------
 install_helpers() {
   cat > /usr/local/bin/vps-limiter <<'EOF'
 #!/bin/bash
@@ -554,7 +774,7 @@ ClientAliveInterval 30
 ClientAliveCountMax 3
 MaxSessions 100
 MaxStartups 100:30:200
-Banner $(banner_path)
+Banner $BANNER
 EOF
   if sshd -t 2>/dev/null; then
     systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null
@@ -562,6 +782,19 @@ EOF
     err "Configuración SSH inválida; se revierte."
     rm -f /etc/ssh/sshd_config.d/00-vpspanel.conf
   fi
+}
+
+ensure_base() {
+  [[ -f $BASE/.prep ]] && return 0
+  info "Preparando el sistema..."
+  spin "Actualizando lista de paquetes" apt-get update -qq
+  apt_i curl wget jq git unzip tar openssl iptables ca-certificates cron procps iproute2 python3
+  grep -qx /bin/false /etc/shells || echo /bin/false >> /etc/shells
+  [[ -s $BANNER ]] || printf '%s\n' "${VPS_NAME:-VPS PANEL}" > "$BANNER"
+  install_helpers
+  cfg_ssh
+  touch "$BASE/.prep"
+  ok "Sistema preparado"
 }
 
 # ------------------------------ Instaladores --------------------------
@@ -581,12 +814,8 @@ inst_dropbear() {
   apt_i dropbear || { err "Fallo al instalar dropbear"; return 1; }
   systemctl disable --now dropbear >/dev/null 2>&1
   mkdir -p /etc/dropbear
-  unit_dropbear
-}
-
-unit_dropbear() {   # servicio con el puerto y el banner actuales
   mkunit vps-dropbear "Dropbear SSH" \
-    "$(command -v dropbear) -F -E -R -p $PORT_DROPBEAR $(banner_opt) -K 30"
+    "$(command -v dropbear) -F -E -R -p $PORT_DROPBEAR -b $BANNER -K 30"
   fw_open "$PORT_DROPBEAR" tcp
   verify dropbear Dropbear
 }
@@ -597,10 +826,6 @@ inst_ssl() {
   apt_i stunnel4 || { err "Fallo al instalar stunnel4"; return 1; }
   systemctl disable --now stunnel4 >/dev/null 2>&1
   [[ -s $CERT ]] || mk_selfsigned "$(get_host)"
-  conf_ssl
-}
-
-conf_ssl() {   # configuración y servicio con el puerto actual
   cat > "$BASE/stunnel.conf" <<EOF
 foreground = yes
 pid =
@@ -619,24 +844,25 @@ EOF
   verify ssl "SSL (stunnel)"
 }
 
-inst_badvpn() {
-  ensure_base; need_port badvpn "$PORT_BADVPN" || return 1
-  info "Compilando BadVPN-UDPGW..."
-  apt_i build-essential cmake git || { err "Fallo al instalar dependencias de compilación"; return 1; }
-  local t rc; t=$(mktemp -d)
+build_badvpn() { # directorio temporal
+  local t=$1
   git clone -q --depth 1 "$BADVPN_REPO" "$t/src" \
     && mkdir "$t/build" \
     && (cd "$t/build" \
         && cmake ../src -DBUILD_NOTHING_BY_DEFAULT=1 -DBUILD_UDPGW=1 -DCMAKE_POLICY_VERSION_MINIMUM=3.5 >/dev/null 2>&1 \
         && make -j"$(nproc)" >/dev/null 2>&1) \
     && install -m755 "$t/build/udpgw/badvpn-udpgw" /usr/local/bin/badvpn-udpgw
+}
+
+inst_badvpn() {
+  ensure_base; need_port badvpn "$PORT_BADVPN" || return 1
+  info "Compilando BadVPN-UDPGW..."
+  apt_i build-essential cmake git || { err "Fallo al instalar dependencias de compilación"; return 1; }
+  local t rc; t=$(mktemp -d)
+  spin "Compilando BadVPN-UDPGW (puede tardar)" build_badvpn "$t"
   rc=$?
   rm -rf "$t"
   (( rc == 0 )) || { err "Fallo al compilar badvpn-udpgw"; return 1; }
-  unit_badvpn
-}
-
-unit_badvpn() {
   mkunit vps-badvpn "BadVPN UDPGW" \
     "/usr/local/bin/badvpn-udpgw --listen-addr 127.0.0.1:$PORT_BADVPN --max-clients 1000 --max-connections-for-client 10"
   verify badvpn BadVPN-UDPGW
@@ -761,10 +987,6 @@ if __name__ == "__main__":
     asyncio.run(main())
 PYEOF
   chmod 755 /usr/local/bin/vps-ws.py
-  unit_ws
-}
-
-unit_ws() {
   mkunit vps-ws "Proxy WebSocket a SSH" \
     "$(command -v python3) /usr/local/bin/vps-ws.py $PORT_WS $SSH_PORT $PORT_DROPBEAR"
   fw_open "$PORT_WS" tcp
@@ -775,10 +997,6 @@ inst_squid() {
   ensure_base; need_port squid "$PORT_SQUID" || return 1
   info "Instalando Squid..."
   apt_i squid || { err "Fallo al instalar squid"; return 1; }
-  conf_squid
-}
-
-conf_squid() {
   local ips; ips="127.0.0.1 $IP $(hostname -I)"
   cat > /etc/squid/squid.conf <<EOF
 http_port $PORT_SQUID
@@ -801,7 +1019,7 @@ EOF
 inst_v2ray() {
   ensure_base; need_port v2ray "$PORT_V2RAY" || return 1
   info "Instalando V2Ray..."
-  fetch_run "$V2_INSTALL_URL" >/dev/null 2>&1 || { err "Fallo al instalar V2Ray"; return 1; }
+  spin "Descargando e instalando V2Ray" fetch_run "$V2_INSTALL_URL" || { err "Fallo al instalar V2Ray"; return 1; }
   [[ -x /usr/local/bin/v2ray ]] || { err "No se encontró /usr/local/bin/v2ray"; return 1; }
   mkdir -p "$(dirname "$V2CFG")"
   cat > "$V2CFG" <<EOF
@@ -829,10 +1047,40 @@ EOF
   verify v2ray V2Ray
 }
 
+inst_udp() {
+  ensure_base
+  local f=$BASE/udp.url
+  [[ -z $UDPCUSTOM_URL && -s $f ]] && UDPCUSTOM_URL=$(<"$f")
+  if [[ -z $UDPCUSTOM_URL ]]; then
+    ask UDPCUSTOM_URL "URL del binario udp-custom (linux $(uname -m))"
+  fi
+  [[ $UDPCUSTOM_URL =~ ^https?:// ]] || { err "URL inválida"; return 1; }
+  echo "$UDPCUSTOM_URL" > "$f"
+  info "Descargando UDP Custom..."
+  mkdir -p /etc/udp-custom
+  spin "Descargando UDP Custom" curl -fsSL "$UDPCUSTOM_URL" -o /etc/udp-custom/udp-custom || { err "Descarga fallida"; return 1; }
+  chmod +x /etc/udp-custom/udp-custom
+  cat > /etc/udp-custom/config.json <<EOF
+{
+  "listen": ":$PORT_UDP",
+  "stream_buffer": 33554432,
+  "receive_buffer": 83886080,
+  "auth": { "mode": "passwords" }
+}
+EOF
+  mkunit udp-custom "UDP Custom" \
+    "/etc/udp-custom/udp-custom server -exclude 53,$PORT_SLOWDNS" \
+    "WorkingDirectory=/etc/udp-custom"
+  fw_open "$PORT_UDP" udp
+  verify udp "UDP Custom"
+}
+
+build_dnstt() { (cd /tmp/dnstt/dnstt-server && /usr/local/go/bin/go build -o /usr/local/bin/dnstt-server .); }
+
 inst_slowdns() {
   ensure_base
   local ns ga ipt=/usr/sbin/iptables
-  rd "NameServer (NS) del dominio, ej. ns.midominio.com: " ns
+  ask ns "NameServer (NS) del dominio" "ej. ns.midominio.com"
   [[ $ns =~ ^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]] || { err "NameServer inválido"; return 1; }
   case $(uname -m) in
     x86_64)  ga=amd64 ;;
@@ -841,15 +1089,15 @@ inst_slowdns() {
   esac
   info "Compilando dnstt-server (Go $GO_VERSION)..."
   if [[ ! -x /usr/local/go/bin/go ]]; then
-    curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-${ga}.tar.gz" -o /tmp/go.tgz \
+    spin "Descargando Go $GO_VERSION" curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-${ga}.tar.gz" -o /tmp/go.tgz \
       || { err "No se pudo descargar Go"; return 1; }
     rm -rf /usr/local/go
     tar -C /usr/local -xzf /tmp/go.tgz
     rm -f /tmp/go.tgz
   fi
   rm -rf /tmp/dnstt
-  git clone -q "$DNSTT_REPO" /tmp/dnstt || { err "No se pudo clonar dnstt"; return 1; }
-  (cd /tmp/dnstt/dnstt-server && /usr/local/go/bin/go build -o /usr/local/bin/dnstt-server .) \
+  spin "Clonando dnstt" git clone -q "$DNSTT_REPO" /tmp/dnstt || { err "No se pudo clonar dnstt"; return 1; }
+  spin "Compilando dnstt-server" build_dnstt \
     || { err "Fallo al compilar dnstt-server"; rm -rf /tmp/dnstt; return 1; }
   rm -rf /tmp/dnstt
 
@@ -858,12 +1106,6 @@ inst_slowdns() {
     -privkey-file "$BASE/slowdns/server.key" -pubkey-file "$BASE/slowdns/server.pub" >/dev/null
   echo "$ns" > "$BASE/slowdns/ns"
 
-  unit_slowdns
-}
-
-unit_slowdns() {   # usa el NameServer guardado
-  local ns ipt=/usr/sbin/iptables
-  ns=$(<"$BASE/slowdns/ns")
   mkunit vps-slowdns "SlowDNS (dnstt)" \
     "/usr/local/bin/dnstt-server -udp :$PORT_SLOWDNS -privkey-file $BASE/slowdns/server.key $ns 127.0.0.1:$SSH_PORT" \
     "ExecStartPre=-$ipt -t nat -D PREROUTING -p udp --dport 53 -j REDIRECT --to-ports $PORT_SLOWDNS
@@ -871,22 +1113,53 @@ ExecStartPre=$ipt -t nat -I PREROUTING -p udp --dport 53 -j REDIRECT --to-ports 
 ExecStopPost=-$ipt -t nat -D PREROUTING -p udp --dport 53 -j REDIRECT --to-ports $PORT_SLOWDNS"
   fw_open 53 udp; fw_open "$PORT_SLOWDNS" udp
   verify slowdns SlowDNS || return 1
-  echo "${Y}NameServer :${N} $ns"
-  echo "${Y}Llave pública:${N} $(cat "$BASE/slowdns/server.pub")"
-  echo "Registros DNS: A  ns1.<dominio> -> $IP   |   NS  $ns -> ns1.<dominio>"
+  echo
+  printf '%s%sNameServer%s     %s%s%s\n' "$ML" "$DIM" "$N" "$BD" "$ns" "$N"
+  printf '%s%sLlave pública%s\n' "$ML" "$DIM" "$N"
+  printf '%s%s%s%s\n' "$ML" "$BD" "$(cat "$BASE/slowdns/server.pub")" "$N"
+  echo
+  note "Registros DNS: A ns1.<dominio> -> $IP | NS $ns -> ns1.<dominio>"
 }
 
-# ------------------------- Cuentas SSH (originales) -------------------
+install_all() {
+  ensure_base
+  inst_dropbear; inst_ssl; inst_badvpn; inst_ws; inst_squid; inst_v2ray
+  cfg_bbr
+  [[ -n $UDPCUSTOM_URL ]] && inst_udp
+  echo
+  ok "Instalación completa. Ejecuta: vpspanel"
+}
+
+
+# --------------------------- Cuentas SSH / Dropbear -------------------
+show_ssh_info() { # usuario clave expira limite
+  local host; host=$(get_host)
+  echo
+  box_top "CUENTA SSH CREADA"
+  krow "Host / IP" "$host"
+  krow "Usuario" "$1"
+  krow "Clave" "$2"
+  krow "Expira" "$3"
+  krow "Límite" "$4 conexión(es)"
+  box_blank
+  box_ports "Puertos" "SSH $SSH_PORT" "Dropbear $PORT_DROPBEAR" "SSL $PORT_SSL" "WS $PORT_WS" \
+    "Squid $PORT_SQUID" "UDP Custom $PORT_UDP" "UDPGW 127.0.0.1:$PORT_BADVPN"
+  box_bot
+  echo
+  printf '%s%sPayload WebSocket%s\n' "$ML" "$DIM" "$N"
+  printf '%sGET / HTTP/1.1[crlf]Host: %s[crlf]Upgrade: websocket[crlf][crlf]\n' "$ML" "$host"
+}
+
 ssh_create() {
   local u p d l exp
-  rd "Usuario: " u
+  ask u "Usuario"
   valid_name "$u" || { err "Usuario inválido (3-31 caracteres: a-z 0-9 _ -)"; return 1; }
   if id "$u" >/dev/null 2>&1; then err "El usuario ya existe"; return 1; fi
-  rd "Contraseña [aleatoria]: " p; p=${p:-$(rand_pass)}
+  ask p "Contraseña" "aleatoria si queda vacío"; p=${p:-$(rand_pass)}
   [[ $p != *"|"* && -n $p ]] || { err "La contraseña no puede contener '|'"; return 1; }
-  rd "Días de validez [30]: " d; d=${d:-30}
+  ask d "Días de validez" 30; d=${d:-30}
   [[ $d =~ ^[0-9]+$ ]] || { err "Días inválidos"; return 1; }
-  rd "Límite de conexiones [1]: " l; l=${l:-1}
+  ask l "Límite de conexiones" 1; l=${l:-1}
   [[ $l =~ ^[0-9]+$ ]] || { err "Límite inválido"; return 1; }
   exp=$(date -d "+$d days" +%F)
   useradd -M -s /bin/false -e "$exp" "$u" || { err "No se pudo crear el usuario"; return 1; }
@@ -897,7 +1170,7 @@ ssh_create() {
 
 ssh_delete() {
   local u
-  rd "Usuario a eliminar: " u
+  ask u "Usuario a eliminar"
   valid_name "$u" && grep -q "^${u}|" "$USERDB" || { err "Usuario no encontrado"; return 1; }
   pkill -KILL -u "$u" 2>/dev/null
   userdel -f "$u" 2>/dev/null
@@ -907,9 +1180,9 @@ ssh_delete() {
 
 ssh_renew() {
   local u d exp
-  rd "Usuario a renovar: " u
+  ask u "Usuario a renovar"
   valid_name "$u" && grep -q "^${u}|" "$USERDB" || { err "Usuario no encontrado"; return 1; }
-  rd "Días desde hoy [30]: " d; d=${d:-30}
+  ask d "Días desde hoy" 30; d=${d:-30}
   [[ $d =~ ^[0-9]+$ ]] || { err "Días inválidos"; return 1; }
   exp=$(date -d "+$d days" +%F)
   usermod -e "$exp" "$u" && db_set "$u" 3 "$exp" && ok "$u vence el $exp"
@@ -917,14 +1190,106 @@ ssh_renew() {
 
 ssh_passwd() {
   local u p
-  rd "Usuario: " u
+  ask u "Usuario"
   valid_name "$u" && grep -q "^${u}|" "$USERDB" || { err "Usuario no encontrado"; return 1; }
-  rd "Nueva contraseña [aleatoria]: " p; p=${p:-$(rand_pass)}
+  ask p "Nueva contraseña" "aleatoria si queda vacío"; p=${p:-$(rand_pass)}
   [[ $p != *"|"* && -n $p ]] || { err "La contraseña no puede contener '|'"; return 1; }
   echo "$u:$p" | chpasswd && db_set "$u" 2 "$p" && ok "Nueva contraseña de $u: $p"
 }
 
-# ------------------------- Cuentas V2Ray (originales) -----------------
+ssh_list() {
+  local u p e l i wu=7 wp=5 hdr row lim t0 ts days dcol dtxt
+  local -a US=() PS=() ES=() LS=()
+  while IFS='|' read -r u p e l; do
+    [[ -n $u ]] || continue
+    US+=("$u"); PS+=("$p"); ES+=("$e"); LS+=("$l")
+    (( ${#u} > wu )) && wu=${#u}
+    (( ${#p} > wp )) && wp=${#p}
+  done < "$USERDB"
+  if (( ${#US[@]} == 0 )); then warn "No hay cuentas SSH creadas."; return 0; fi
+  t0=$(date -d "$(date +%F)" +%s)
+  padr USUARIO "$wu"; hdr=$REPLY
+  padr CLAVE "$wp"; hdr+="  $REPLY  EXPIRA      LIM  DIAS"
+  printf '%s%s%s%s\n' "$ML" "$A1$BD" "$hdr" "$N"
+  rep "─" "${#hdr}"; printf '%s%s%s%s\n' "$ML" "$BRD" "$REPLY" "$N"
+  for i in "${!US[@]}"; do
+    padr "${US[i]}" "$wu"; row=$REPLY
+    padr "${PS[i]}" "$wp"; row+="  $REPLY"
+    printf -v lim '%3s' "${LS[i]}"
+    row+="  ${ES[i]}  $lim"
+    if ts=$(date -d "${ES[i]}" +%s 2>/dev/null); then
+      days=$(( (ts - t0) / 86400 ))
+      if (( days < 0 )); then dcol=$RED; dtxt="vencida"
+      elif (( days <= 5 )); then dcol=$YEL; dtxt=$days
+      else dcol=$GRN; dtxt=$days; fi
+    else
+      dcol=$DIM; dtxt="-"
+    fi
+    printf '%s%s%s%s  %s%s%s\n' "$ML" "$WHT" "$row" "$N" "$dcol" "$dtxt" "$N"
+  done
+  echo
+  printf '%s%sTotal:%s %s cuenta(s)\n' "$ML" "$DIM" "$N" "${#US[@]}"
+}
+
+ssh_online() {
+  local u p e l n tot=0 rows=0
+  printf '%s%s%-16s %s%s\n' "$ML" "$A1$BD" USUARIO CONEXIONES "$N"
+  rep "─" 28; printf '%s%s%s%s\n' "$ML" "$BRD" "$REPLY" "$N"
+  while IFS='|' read -r u p e l; do
+    [[ -n $u ]] || continue
+    n=$(ps -u "$u" -o comm= 2>/dev/null | grep -cE '^(sshd|dropbear)$')
+    if (( n > 0 )); then
+      printf '%s%-16s %s%s%s\n' "$ML" "$u" "$GRN" "$n" "$N"
+      tot=$((tot + n)); rows=$((rows + 1))
+    fi
+  done < "$USERDB"
+  (( rows )) || printf '%s%sNadie conectado en este momento.%s\n' "$ML" "$DIM" "$N"
+  echo
+  printf '%s%sTotal conexiones:%s %s\n' "$ML" "$DIM" "$N" "$tot"
+}
+
+menu_ssh() {
+  ensure_base
+  while :; do
+    draw_header
+    section "CUENTAS SSH / DROPBEAR"
+    echo
+    MG_NUM=(01 02 03 04 05 06 07)
+    MG_LAB=("Crear cuenta" "Eliminar cuenta" "Renovar cuenta" "Cambiar contraseña"
+            "Listar cuentas" "Usuarios conectados" "Eliminar expirados")
+    MG_ST=()
+    box_top "ADMINISTRAR"
+    menu_grid
+    box_bot
+    back_line
+    prompt_opt
+    case $O in
+      1) run_screen "CREAR CUENTA SSH" ssh_create ;;
+      2) run_screen "ELIMINAR CUENTA SSH" ssh_delete ;;
+      3) run_screen "RENOVAR CUENTA SSH" ssh_renew ;;
+      4) run_screen "CAMBIAR CONTRASEÑA" ssh_passwd ;;
+      5) run_screen "CUENTAS SSH" ssh_list ;;
+      6) run_screen "USUARIOS CONECTADOS" ssh_online ;;
+      7) run_screen "ELIMINAR EXPIRADOS" ssh_clean ;;
+      0) return ;;
+      *) flash_warn "Opción no válida." ;;
+    esac
+  done
+}
+
+ssh_clean() { /usr/local/bin/vps-cleanup && ok "Cuentas expiradas eliminadas"; }
+
+run_screen() { # título comando [args...]: pantalla con cabecera, ejecuta y espera ENTER
+  local t=$1
+  shift
+  draw_header
+  section "$t"
+  echo
+  "$@"
+  pause
+}
+
+# ------------------------------ Cuentas V2Ray -------------------------
 v2_edit() {
   local t; t=$(mktemp)
   if jq "$@" "$V2CFG" > "$t"; then cat "$t" > "$V2CFG"; rm -f "$t"
@@ -940,11 +1305,37 @@ v2_link() { # nombre uuid
 
 v2_need() { [[ -f $V2CFG ]] || { err "V2Ray no está instalado (Protocolos > V2RAY)."; return 1; }; }
 
+v2_create() {
+  v2_need || return 1
+  local n d id exp
+  ask n "Nombre de la cuenta"
+  valid_name "$n" || { err "Nombre inválido (3-31 caracteres: a-z 0-9 _ -)"; return 1; }
+  if grep -q "^${n}|" "$V2DB"; then err "La cuenta ya existe"; return 1; fi
+  ask d "Días de validez" 30; d=${d:-30}
+  [[ $d =~ ^[0-9]+$ ]] || { err "Días inválidos"; return 1; }
+  id=$(cat /proc/sys/kernel/random/uuid)
+  exp=$(date -d "+$d days" +%F)
+  v2_edit --arg id "$id" --arg em "$n" \
+    '.inbounds[0].settings.clients += [{"id":$id,"alterId":0,"email":$em}]' || return 1
+  echo "$n|$id|$exp" >> "$V2DB"
+  systemctl restart v2ray
+  echo
+  box_top "CUENTA V2RAY CREADA"
+  krow "Cuenta" "$n"
+  krow "Expira" "$exp"
+  krow "UUID" "$id"
+  krow "Puerto" "$PORT_V2RAY"
+  krow "Red / Path" "ws  $V2PATH"
+  box_bot
+  echo
+  printf '%s%sEnlace VMess%s\n' "$ML" "$DIM" "$N"
+  printf '%s%s\n' "$ML" "$(v2_link "$n" "$id")"
+}
 
 v2_delete() {
   v2_need || return 1
   local n
-  rd "Cuenta a eliminar: " n
+  ask n "Cuenta a eliminar"
   valid_name "$n" && grep -q "^${n}|" "$V2DB" || { err "Cuenta no encontrada"; return 1; }
   v2_edit --arg em "$n" '.inbounds[0].settings.clients |= map(select(.email != $em))' || return 1
   sed -i "/^${n}|/d" "$V2DB"
@@ -954,9 +1345,9 @@ v2_delete() {
 
 v2_renew() {
   local n d exp t
-  rd "Cuenta a renovar: " n
+  ask n "Cuenta a renovar"
   valid_name "$n" && grep -q "^${n}|" "$V2DB" || { err "Cuenta no encontrada"; return 1; }
-  rd "Días desde hoy [30]: " d; d=${d:-30}
+  ask d "Días desde hoy" 30; d=${d:-30}
   [[ $d =~ ^[0-9]+$ ]] || { err "Días inválidos"; return 1; }
   exp=$(date -d "+$d days" +%F)
   t=$(mktemp)
@@ -965,7 +1356,45 @@ v2_renew() {
   ok "$n vence el $exp"
 }
 
-# ------------------------- Protocolos / Herramientas ------------------
+v2_list() {
+  local n id e c=0
+  while IFS='|' read -r n id e; do
+    [[ -n $n ]] || continue
+    c=$(( c + 1 ))
+    printf '%s%s%s%s  %sexpira %s%s\n' "$ML" "$A1$BD" "$n" "$N" "$DIM" "$e" "$N"
+    printf '%s%s%s%s\n' "$ML" "$DIM" "$id" "$N"
+    printf '%s%s\n\n' "$ML" "$(v2_link "$n" "$id")"
+  done < "$V2DB"
+  (( c )) || warn "No hay cuentas V2Ray creadas."
+  return 0
+}
+
+menu_v2() {
+  ensure_base
+  while :; do
+    draw_header
+    section "CUENTAS V2RAY"
+    echo
+    MG_NUM=(01 02 03 04)
+    MG_LAB=("Crear cuenta" "Eliminar cuenta" "Renovar cuenta" "Listar y enlaces")
+    MG_ST=()
+    box_top "ADMINISTRAR"
+    menu_grid
+    box_bot
+    back_line
+    prompt_opt
+    case $O in
+      1) run_screen "CREAR CUENTA V2RAY" v2_create ;;
+      2) run_screen "ELIMINAR CUENTA V2RAY" v2_delete ;;
+      3) run_screen "RENOVAR CUENTA V2RAY" v2_renew ;;
+      4) run_screen "CUENTAS V2RAY" v2_list ;;
+      0) return ;;
+      *) flash_warn "Opción no válida." ;;
+    esac
+  done
+}
+
+# ------------------------------ Protocolos ----------------------------
 proto_action() {
   local k=$1
   case $k in
@@ -984,53 +1413,16 @@ proto_action() {
   esac
 }
 
-# El banner SSH viene DESACTIVADO: solo existe si el archivo $BANNER tiene contenido.
-banner_on()   { [[ -s $BANNER ]]; }
-banner_path() { if banner_on; then printf '%s' "$BANNER"; else printf 'none'; fi; }
-banner_opt()  { banner_on && printf -- '-b %s' "$BANNER"; return 0; }
 
-banner_apply() {   # aplica el estado actual a OpenSSH y a Dropbear
-  cfg_ssh
-  apply_proto dropbear
-  return 0
-}
-
-banner_migrate() {   # versiones anteriores creaban un banner con el nombre del VPS
-  [[ -s $BANNER && ! -f $BASE/.banner-off ]] || { touch "$BASE/.banner-off"; return 0; }
-  local b; b=$(<"$BANNER"); b=${b%$'\n'}
-  if [[ $b == "VPS PANEL" || $b == "$(vps_name)" ]]; then
-    rm -f "$BANNER"
-    [[ -f $BASE/.prep ]] && banner_apply >/dev/null 2>&1
-  fi
-  touch "$BASE/.banner-off"
-}
-
+# ------------------------------ Herramientas --------------------------
 cfg_banner() {
   ensure_base
-  local o l txt
-  if banner_on; then
-    info "Banner ${OKC}ACTIVADO${RST}. Contenido actual:"; sed 's/^/        /' "$BANNER"
-  else
-    info "Banner ${DIM}DESACTIVADO${RST}: al conectar no se muestra ningún banner."
-  fi
-  printf '\n  %s01%s  Escribir o cambiar el banner (lo activa)\n' "$ACC" "$RST"
-  printf '  %s02%s  Desactivar el banner\n' "$ACC" "$RST"
-  printf '  %s00%s  Volver\n' "$ACC" "$RST"
-  ask Opción o || return 3
-  [[ $o =~ ^[0-9]+$ ]] && o=$(( 10#$o ))
-  case $o in
-    1) echo "Escribe el banner (HTML permitido). Línea vacía para terminar:"
-       txt=""
-       while IFS= read -r l; do [[ -z $l ]] && break; txt+="$l"$'\n'; done
-       [[ -n $txt ]] || { err "Banner vacío"; return 1; }
-       printf '%s' "$txt" > "$BANNER"
-       banner_apply
-       ok "Banner activado" ;;
-    2) rm -f "$BANNER"
-       banner_apply
-       ok "Banner desactivado" ;;
-    *) return 3 ;;
-  esac
+  note "Escribe el banner SSH (HTML permitido). Una línea vacía termina la escritura."
+  local l txt=""
+  while IFS= read -rp "$ML${A1}›${N} " l; do [[ -z $l ]] && break; txt+="$l"$'\n'; done
+  [[ -n $txt ]] || { err "Banner vacío"; return 1; }
+  printf '%s' "$txt" > "$BANNER"
+  ok "Banner aplicado"
 }
 
 cfg_bbr() {
@@ -1045,7 +1437,7 @@ EOF
 
 cfg_swap() {
   local s
-  rd "Tamaño de swap en MB [1024]: " s; s=${s:-1024}
+  ask s "Tamaño de swap en MB" 1024; s=${s:-1024}
   [[ $s =~ ^[0-9]+$ ]] || { err "Tamaño inválido"; return 1; }
   swapoff /swapfile 2>/dev/null; rm -f /swapfile
   fallocate -l "${s}M" /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count="$s" status=none
@@ -1067,8 +1459,8 @@ cfg_cache() {
 
 cfg_dns() {
   local d1 d2
-  rd "DNS primario [1.1.1.1]: " d1; d1=${d1:-1.1.1.1}
-  rd "DNS secundario [8.8.8.8]: " d2; d2=${d2:-8.8.8.8}
+  ask d1 "DNS primario" 1.1.1.1; d1=${d1:-1.1.1.1}
+  ask d2 "DNS secundario" 8.8.8.8; d2=${d2:-8.8.8.8}
   if systemctl is-active --quiet systemd-resolved; then
     mkdir -p /etc/systemd/resolved.conf.d
     printf '[Resolve]\nDNS=%s %s\n' "$d1" "$d2" > /etc/systemd/resolved.conf.d/vpspanel.conf
@@ -1083,7 +1475,7 @@ cfg_dns() {
 cfg_domain() {
   ensure_base
   local d
-  rd "Dominio (vacío = certificado autofirmado con la IP): " d
+  ask d "Dominio" "vacío = certificado autofirmado con la IP"
   if [[ -z $d ]]; then
     rm -f "$DOMAIN_F"
     mk_selfsigned "$IP"
@@ -1127,66 +1519,29 @@ EOF
 restart_services() {
   local k
   for k in ssh "${PROTO_KEYS[@]}"; do
-    is_on "$k" && systemctl restart "${SVC[$k]}" && echo "  reiniciado: $k"
+    is_on "$k" && systemctl restart "${SVC[$k]}" && ok "Reiniciado: $k"
   done
   ok "Servicios reiniciados"
 }
 
 autostart_on() { grep -q 'vpspanel-autostart' /root/.bashrc 2>/dev/null; }
 
-autostart_enable() {
-  autostart_on || echo '[[ $- == *i* && -z "${VPSPANEL_ACTIVE:-}" ]] && vpspanel # vpspanel-autostart' >> /root/.bashrc
-}
-
 toggle_autostart() {
   if autostart_on; then
     sed -i '/vpspanel-autostart/d' /root/.bashrc
     ok "Auto-inicio desactivado"
   else
-    autostart_enable
+    echo '[[ $- == *i* && -z "${VPSPANEL_ACTIVE:-}" ]] && vpspanel # vpspanel-autostart' >> /root/.bashrc
     ok "Auto-inicio activado"
   fi
 }
 
-autostart_default() {   # primera ejecución: el auto-inicio queda ACTIVADO
-  [[ -f $BASE/.autostart.init ]] && return 0
-  if [[ -s $NAME_F ]]; then touch "$BASE/.autostart.init"; return 0; fi   # panel ya en uso: se respeta tu ajuste
-  if [[ -x /usr/local/bin/vpspanel ]]; then
-    autostart_enable
-    touch "$BASE/.autostart.init"
-  fi
-}
-
-panel_cmd() {   # texto con el que se abre el panel
-  if [[ -x /usr/local/bin/vpspanel ]]; then echo vpspanel
-  else echo "bash $(readlink -f "$0" 2>/dev/null || echo vps-panel.sh)"; fi
-}
-
-show_access() {   # pantalla posterior al primer registro
-  local c; c=$(panel_cmd)
-  cls; gradient_bar; echo
-  printf '  %sREGISTRO COMPLETO%s\n\n' "$HI" "$RST"
-  box_top "ACCESO AL PANEL"
-  if autostart_on; then
-    box_row "${OKC}${GDOT}${RST} ${HI}Auto-inicio ACTIVADO${RST}"
-    box_row "${DIM}Se abre solo al entrar por SSH.${RST}"
-    box_row "${DIM}Si lo desactivas, ábrelo con:${RST}"
-  else
-    box_row "${WRC}${GRING}${RST} ${HI}Auto-inicio DESACTIVADO${RST}"
-    box_row "${DIM}El panel no abre solo. Escribe:${RST}"
-  fi
-  box_row ""
-  box_row "  ${ACC}${ARW}${RST} ${HI}${c}${RST}"
-  box_row ""
-  box_row "${DIM}Cambiar: Herramientas > Auto-inicio${RST}"
-  box_bottom
-  pause
-}
 
 # ------------------------------ Desinstalar ---------------------------
 uninstall_all() {
   local c s u p
-  rd "Escribe SI para eliminar el panel, sus servicios y las cuentas SSH creadas: " c
+  warn "Se eliminarán el panel, sus servicios y las cuentas SSH creadas."
+  ask c "Escribe SI para confirmar"
   [[ $c == SI ]] || return 0
   while IFS='|' read -r u p _; do
     [[ -n $u ]] || continue
@@ -1211,6 +1566,418 @@ uninstall_all() {
 }
 
 
+# ------------------------------ Registro del VPS ----------------------
+NEW_NAME=""; NEW_THEME=1
+
+valid_vps_name() { local re='^[A-Za-z0-9][A-Za-z0-9 ._-]{1,13}$'; [[ $1 =~ $re ]]; }
+
+reg_fmt() { # recalcula los textos derivados del registro
+  VPS_NAME_UP=${VPS_NAME^^}
+  if [[ $VPS_DATE =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+    VPS_DATE_TXT="${VPS_DATE:8:2}/${VPS_DATE:5:2}/${VPS_DATE:0:4}"
+  else
+    VPS_DATE_TXT="-"
+  fi
+  BAN_KEY=''
+}
+
+reg_load() { # lee vps.conf (no se ejecuta como código)
+  local k v n=''
+  VPS_THEME=1; VPS_DATE=''
+  [[ -r $CONF ]] || return 1
+  while IFS='=' read -r k v; do
+    case $k in
+      NAME)  n=$v ;;
+      THEME) [[ $v =~ ^[0-9]{1,3}$ ]] && VPS_THEME=$(( 10#$v )) ;;
+      DATE)  VPS_DATE=$v ;;
+      COLOR) case $v in 24|256|auto) COLOR_MODE=$v ;; esac ;;
+    esac
+  done < "$CONF"
+  set_colormode
+  valid_vps_name "$n" || return 1
+  VPS_NAME=$n
+  reg_fmt
+  return 0
+}
+
+reg_save() {
+  {
+    printf 'NAME=%s\n' "$VPS_NAME"
+    printf 'THEME=%s\n' "$VPS_THEME"
+    printf 'DATE=%s\n' "$VPS_DATE"
+    printf 'COLOR=%s\n' "$COLOR_MODE"
+  } > "$CONF"
+  chmod 600 "$CONF"
+}
+
+reg_sync_banner() { # nombre_anterior: si el banner SSH era el de fábrica, usa el nombre nuevo
+  local old=$1 cur
+  [[ -f $BANNER ]] || return 0
+  cur=$(<"$BANNER")
+  if [[ $cur == "$old" || $cur == "VPS PANEL" ]]; then printf '%s\n' "$VPS_NAME" > "$BANNER"; fi
+  return 0
+}
+
+reg_head() { # paso nombre_para_el_banner
+  VPS_NAME_UP=$2
+  term_size; cls
+  draw_logo 0
+  section "REGISTRO DE VPS" "PASO $1 DE 3"
+  echo
+}
+
+ask_vps_name() { # [nombre_actual] -> NEW_NAME ; con nombre actual, Enter lo conserva
+  local cur=${1:-} n
+  while :; do
+    ask n "Nombre del VPS" "${cur:+Enter = $cur}"
+    trim "$n"; n=$REPLY
+    if [[ -z $n && -n $cur ]]; then NEW_NAME=$cur; return 0; fi
+    if valid_vps_name "$n"; then NEW_NAME=$n; return 0; fi
+    err "Nombre inválido: revisa las reglas de arriba."
+  done
+}
+
+choose_theme() { # -> NEW_THEME ; Enter = tema actual
+  local cur=$VPS_THEME n=${#THEMES[@]} i x sw name mark t
+  for i in "${!THEMES[@]}"; do
+    apply_theme $(( i + 1 )); mkgrad 24
+    sw=''
+    for (( x = 0; x < 24; x++ )); do sw+="${GRAD[x]}█"; done
+    name=${THEMES[i]%%|*}
+    mark=''
+    (( i + 1 == cur )) && mark="  ${DIM}(actual)${N}"
+    padr "$name" 10
+    printf '%s%s%02d%s  %s%s%s  %s%s%s\n' "$ML" "$A1$BD" $(( i + 1 )) "$N" "$WHT" "$REPLY" "$N" "$sw" "$N" "$mark"
+  done
+  apply_theme "$cur"
+  echo
+  while :; do
+    ask t "Número de tema" "1-$n, Enter = actual"
+    if [[ -z $t ]]; then NEW_THEME=$cur; return 0; fi
+    if [[ $t =~ ^[0-9]{1,3}$ ]]; then
+      t=$(( 10#$t ))
+      if (( t >= 1 && t <= n )); then NEW_THEME=$t; return 0; fi
+    fi
+    err "Elige un número entre 1 y $n."
+  done
+}
+
+register_vps() { # new | edit
+  local mode=${1:-new} old=$VPS_NAME ans
+  [[ $mode == edit ]] || VPS_THEME=1
+  apply_theme "$VPS_THEME"
+  while :; do
+    reg_head 1 "$VPS_NAME_UP"
+    note "Antes de entrar al panel, registra este VPS."
+    note "El nombre se dibuja como banner en cada pantalla."
+    echo
+    note "Reglas: de 2 a 14 caracteres. Se permiten letras, números, espacio, punto, guion (-) y guion bajo (_). Sin tildes ni eñes."
+    echo
+    ask_vps_name "$VPS_NAME"
+    VPS_NAME=$NEW_NAME; reg_fmt
+    reg_head 2 "$VPS_NAME_UP"
+    note "Así se verá tu banner. Elige el tema de color."
+    echo
+    choose_theme
+    apply_theme "$NEW_THEME"
+    reg_head 3 "$VPS_NAME_UP"
+    [[ -n $VPS_DATE ]] || VPS_DATE=$(date +%F)
+    reg_fmt
+    box_top "RESUMEN DEL REGISTRO"
+    krow "Nombre" "$VPS_NAME"
+    krow "Tema" "$TH_NAME"
+    krow "IP" "${IP:0:30}"
+    krow "Sistema" "$OS_NAME"
+    krow "Fecha" "$VPS_DATE_TXT"
+    box_bot
+    echo
+    ask ans "¿Guardar el registro?" "S/n"
+    [[ $ans == [nN]* ]] || break
+  done
+  reg_save
+  reg_sync_banner "$old"
+  echo
+  ok "VPS registrado como $VPS_NAME"
+  pause
+}
+
+menu_register() {
+  local old
+  while :; do
+    draw_header
+    section "REGISTRO DEL VPS"
+    echo
+    box_top "DATOS REGISTRADOS"
+    krow "Nombre" "$VPS_NAME"
+    krow "Tema" "$TH_NAME"
+    krow "Registrado" "$VPS_DATE_TXT"
+    krow "IP" "${IP:0:30}"
+    box_bot
+    echo
+    tstate_color
+    MG_NUM=(01 02 03); MG_LAB=("Cambiar nombre" "Cambiar tema de color" "Colores de 24 bits")
+    MG_ST=("" "" "$REPLY")
+    box_top "ACCIONES"
+    menu_grid
+    box_bot
+    echo
+    note "Si el degradado se ve en bandas, activa los colores de 24 bits. Si los colores salen raros, desactívalos."
+    back_line
+    prompt_opt
+    case $O in
+      1) echo
+         old=$VPS_NAME
+         ask_vps_name "$VPS_NAME"
+         if [[ $NEW_NAME != "$VPS_NAME" ]]; then
+           VPS_NAME=$NEW_NAME; reg_fmt; reg_save; reg_sync_banner "$old"
+           flash_ok "Nombre actualizado."
+         fi ;;
+      2) draw_header; section "TEMA DE COLOR"; echo
+         choose_theme
+         if (( NEW_THEME != VPS_THEME )); then
+           apply_theme "$NEW_THEME"; reg_save
+           flash_ok "Tema actualizado."
+         fi ;;
+      3) if (( TRUECOLOR )); then COLOR_MODE=256; else COLOR_MODE=24; fi
+         set_colormode; apply_theme "$VPS_THEME"; reg_save
+         if (( TRUECOLOR )); then flash_ok "Colores de 24 bits activados."; else flash_ok "Modo de 256 colores activado."; fi ;;
+      0) return ;;
+      *) flash_warn "Opción no válida." ;;
+    esac
+  done
+}
+
+tstate_color() { if (( TRUECOLOR )); then REPLY=on; else REPLY=off; fi; }
+
+ui_start() {
+  load_fonts
+  term_size
+  if reg_load; then apply_theme "$VPS_THEME"; else register_vps new; fi
+  if (( FORCE_REG )); then register_vps edit; fi
+}
+
+# ------------------------------ Estado de servicios -------------------
+declare -A ST=()
+
+svc_state() { # clave -> REPLY: on | off (instalado, detenido) | none (no instalado)
+  local k=$1
+  if is_on "$k"; then REPLY=on; return 0; fi
+  case $k in
+    openvpn)   if [[ -f /etc/openvpn/server/server.conf || -f /etc/openvpn/server.conf ]]; then REPLY=off; else REPLY=none; fi ;;
+    wireguard) if [[ -f /etc/wireguard/wg0.conf ]]; then REPLY=off; else REPLY=none; fi ;;
+    ssh)       REPLY=off ;;
+    *)         if systemctl cat "${SVC[$k]}" >/dev/null 2>&1; then REPLY=off; else REPLY=none; fi ;;
+  esac
+}
+
+refresh_states() {
+  local k
+  for k in "${!SVC[@]}"; do svc_state "$k"; ST[$k]=$REPLY; done
+}
+
+# ------------------------------ Recursos del sistema ------------------
+cpu_pct() { # -> REPLY (uso de CPU en %, medido en 0,15 s)
+  local u n s i w q sq st t1 i1 t2 i2
+  read -r _ u n s i w q sq st _ < /proc/stat
+  t1=$(( u + n + s + i + w + q + sq + st )); i1=$(( i + w ))
+  sleep 0.15
+  read -r _ u n s i w q sq st _ < /proc/stat
+  t2=$(( u + n + s + i + w + q + sq + st )); i2=$(( i + w ))
+  if (( t2 > t1 )); then REPLY=$(( 100 * ((t2 - t1) - (i2 - i1)) / (t2 - t1) )); else REPLY=0; fi
+}
+
+fmt_mb() { local m=$1; if (( m >= 1024 )); then REPLY="$(( m / 1024 )).$(( m % 1024 * 10 / 1024 ))G"; else REPLY="${m}M"; fi; }
+
+gather_sys() {
+  local mt mu dt du up
+  cpu_pct; CPU_PCT=$REPLY
+  read -r mt mu < <(free -m | awk '/^Mem:/{print $2, $3}')
+  mt=${mt:-0}; mu=${mu:-0}
+  RAM_PCT=$(( mt > 0 ? mu * 100 / mt : 0 ))
+  read -r dt du < <(df -P -m / | awk 'NR==2{print $2, $3}')
+  dt=${dt:-0}; du=${du:-0}
+  DSK_PCT=$(( dt > 0 ? du * 100 / dt : 0 ))
+  read -r up _ < /proc/uptime; up=${up%.*}
+  UP_TXT="$(( up / 86400 ))d $(( up % 86400 / 3600 ))h $(( up % 3600 / 60 ))m"
+  read -r LOAD _ < /proc/loadavg
+  N_SSH=$(grep -c . "$USERDB" 2>/dev/null); N_SSH=${N_SSH:-0}
+  N_V2=$(grep -c . "$V2DB" 2>/dev/null); N_V2=${N_V2:-0}
+}
+
+sys_card() {
+  local p l r
+  gather_sys
+  box_top "RECURSOS"
+  bar "$CPU_PCT" 10; printf -v p '%3d%%' "$CPU_PCT"; kv "CPU" "$REPLY ${WHT}${p}${N}"; l=$REPLY
+  bar "$RAM_PCT" 10; printf -v p '%3d%%' "$RAM_PCT"; kv "RAM" "$REPLY ${WHT}${p}${N}"; r=$REPLY
+  pair_row "$l" "$r"
+  bar "$DSK_PCT" 10; printf -v p '%3d%%' "$DSK_PCT"; kv "DISCO" "$REPLY ${WHT}${p}${N}"; l=$REPLY
+  kv "UPTIME" "${WHT}${UP_TXT}${N}"; r=$REPLY
+  pair_row "$l" "$r"
+  kv "CUENTAS" "${WHT}SSH ${A1}${N_SSH}${N}${WHT}  V2RAY ${A1}${N_V2}${N}"; l=$REPLY
+  kv "CARGA" "${WHT}${LOAD}${N}"; r=$REPLY
+  pair_row "$l" "$r"
+  box_bot
+}
+
+svc_card() {
+  local -a items=("SSH:ssh:$SSH_PORT" "DROPBEAR:dropbear:$PORT_DROPBEAR" "SSL:ssl:$PORT_SSL"
+                  "WS:ws:$PORT_WS" "SQUID:squid:$PORT_SQUID" "V2RAY:v2ray:$PORT_V2RAY"
+                  "BADVPN:badvpn:$PORT_BADVPN" "UDPCUSTOM:udp:$PORT_UDP" "SLOWDNS:slowdns:53")
+  local cols sw n i j lab k port dot lc cellstr row=''
+  if (( IW >= 54 )); then cols=3; else cols=2; fi
+  sw=$(( (IW - 2 * (cols - 1)) / cols ))
+  n=${#items[@]}
+  box_top "SERVICIOS"
+  for (( i = 0; i < n; i++ )); do
+    IFS=: read -r lab k port <<< "${items[i]}"
+    case ${ST[$k]-none} in
+      on)  dot="${GRN}●${N}"; lc=$WHT ;;
+      off) dot="${RED}●${N}"; lc=$WHT ;;
+      *)   dot="${BRD}○${N}"; lc=$DIM ;;
+    esac
+    padr "$lab" 9
+    printf -v port '%5s' "$port"
+    cellstr="$dot ${lc}${REPLY}${N} ${DIM}${port}${N}"
+    padv "$cellstr" "$sw"; cellstr=$REPLY
+    j=$(( i % cols ))
+    if (( j > 0 )); then row+="  "; fi
+    row+=$cellstr
+    if (( j == cols - 1 || i == n - 1 )); then box_row "$row"; row=''; fi
+  done
+  box_bot
+}
+
+# ------------------------------ Protocolos ----------------------------
+menu_protocols() {
+  local i k nn
+  while :; do
+    refresh_states
+    draw_header
+    section "PROTOCOLOS"
+    echo
+    MG_NUM=(); MG_LAB=(); MG_ST=()
+    for i in "${!PROTO_KEYS[@]}"; do
+      k=${PROTO_KEYS[i]}
+      printf -v nn '%02d' $(( i + 1 ))
+      MG_NUM+=("$nn"); MG_LAB+=("${PROTO_LABELS[i]}"); MG_ST+=("${ST[$k]-none}")
+    done
+    box_top "INSTALAR / ACTIVAR / DETENER"
+    menu_grid
+    box_bot
+    printf '\n%s%s●%s %sactivo%s   %s●%s %sdetenido%s   %s○%s %sno instalado%s\n' \
+      "$ML" "$GRN" "$N" "$DIM" "$N" "$RED" "$N" "$DIM" "$N" "$BRD" "$N" "$DIM" "$N"
+    note "Elige un número: instala si falta, activa o detiene."
+    back_line
+    prompt_opt
+    if [[ $O == 0 ]]; then return; fi
+    if [[ $O =~ ^[0-9]+$ ]] && (( O >= 1 && O <= ${#PROTO_KEYS[@]} )); then
+      run_screen "${PROTO_LABELS[O-1]}" proto_action "${PROTO_KEYS[O-1]}"
+    else
+      flash_warn "Opción no válida."
+    fi
+  done
+}
+
+# ------------------------------ Herramientas --------------------------
+bbr_on()  { [[ $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null) == bbr ]]; }
+swap_on() { [[ -n $(swapon --noheadings --show=NAME 2>/dev/null) ]]; }
+root_on() { [[ -f /etc/ssh/sshd_config.d/01-vpspanel-root.conf ]]; }
+dom_on()  { [[ -s $DOMAIN_F ]]; }
+tstate()  { if "$@"; then REPLY=on; else REPLY=off; fi; }
+
+menu_tools() {
+  local s2 s3 s6 s7 s9
+  while :; do
+    tstate bbr_on; s2=$REPLY
+    tstate swap_on; s3=$REPLY
+    tstate dom_on; s6=$REPLY
+    tstate root_on; s7=$REPLY
+    tstate autostart_on; s9=$REPLY
+    draw_header
+    section "HERRAMIENTAS Y AJUSTES"
+    echo
+    MG_NUM=(01 02 03 04 05 06 07 08 09)
+    MG_LAB=("Banner SSH" "TCP BBR" "Memoria swap" "Limpiar caché y logs" "Configurar DNS"
+            "Dominio / SSL" "Acceso root" "Reiniciar servicios" "Auto-iniciar panel")
+    MG_ST=("" "$s2" "$s3" "" "" "$s6" "$s7" "" "$s9")
+    box_top "AJUSTES"
+    menu_grid
+    box_bot
+    back_line
+    prompt_opt
+    case $O in
+      1) run_screen "BANNER SSH" cfg_banner ;;
+      2) run_screen "ACELERACIÓN TCP BBR" cfg_bbr ;;
+      3) run_screen "MEMORIA SWAP" cfg_swap ;;
+      4) run_screen "LIMPIAR CACHÉ Y LOGS" cfg_cache ;;
+      5) run_screen "CONFIGURAR DNS" cfg_dns ;;
+      6) run_screen "DOMINIO / CERTIFICADO SSL" cfg_domain ;;
+      7) run_screen "CLAVE Y ACCESO ROOT" cfg_root ;;
+      8) run_screen "REINICIAR SERVICIOS" restart_services ;;
+      9) run_screen "AUTO-INICIO DEL PANEL" toggle_autostart ;;
+      0) return ;;
+      *) flash_warn "Opción no válida." ;;
+    esac
+  done
+}
+
+# ---------------------------------- Menú ------------------------------
+mrow() { # num etiqueta descripción [danger]
+  local nc=$A1 lc=$WHT lab desc='' lw=24 dw
+  (( lw > IW - 4 )) && lw=$(( IW - 4 ))
+  dw=$(( IW - 4 - lw ))
+  if [[ ${4:-} == danger ]]; then nc=$RED; lc=$RED; fi
+  padr "$2" "$lw"; lab=$REPLY
+  (( dw >= 22 )) && desc="${DIM}${3:0:dw}${N}"
+  box_row "${nc}${BD}$1${N}  ${lc}${lab}${N}${desc}"
+}
+
+main_box() {
+  box_top "MENÚ PRINCIPAL"
+  mrow 01 "Cuentas SSH / Dropbear" "Crear, renovar, borrar"
+  mrow 02 "Cuentas V2Ray" "Cuentas VMess con enlace"
+  mrow 03 "Protocolos" "Instalar, activar, parar"
+  mrow 04 "Herramientas y ajustes" "BBR, swap, DNS, root"
+  mrow 05 "Instalación completa" "Protocolos base y BBR"
+  mrow 06 "Registro del VPS" "Nombre y tema del banner"
+  mrow 07 "Reiniciar VPS" "Reinicio del servidor"
+  mrow 08 "Desinstalar panel" "Borra panel y cuentas" danger
+  box_bot
+}
+
+reboot_vps() {
+  local c
+  ask c "¿Reiniciar el VPS ahora?" "s/N"
+  [[ $c == [sS]* ]] && reboot
+  return 0
+}
+
+main_menu() {
+  while :; do
+    refresh_states
+    draw_header
+    echo
+    if (( T_ROWS >= 28 )); then sys_card; echo; fi
+    if (( T_ROWS >= 36 )); then svc_card; echo; fi
+    main_box
+    back_line "Salir"
+    prompt_opt
+    case $O in
+      1) menu_ssh ;;
+      2) menu_v2 ;;
+      3) ensure_base; menu_protocols ;;
+      4) menu_tools ;;
+      5) run_screen "INSTALACIÓN COMPLETA" install_all ;;
+      6) menu_register ;;
+      7) run_screen "REINICIAR VPS" reboot_vps ;;
+      8) run_screen "DESINSTALAR PANEL" uninstall_all ;;
+      0) printf '\n%s%sHasta pronto.%s\n\n' "$ML" "$DIM" "$N"; exit 0 ;;
+      *) flash_warn "Opción no válida." ;;
+    esac
+  done
+}
+
 self_install() {
   local me; me=$(readlink -f "$0" 2>/dev/null)
   if [[ -f $me && $me != /usr/local/bin/vpspanel ]]; then
@@ -1218,685 +1985,26 @@ self_install() {
   fi
 }
 
+FORCE_REG=0
 
-# ------------------------- Registro del VPS ---------------------------
-name_check() {   # nombre -> 0 si sirve; si no, deja el motivo en MSG
-  local t=$1 re='^[A-Za-z0-9._ -]+$'
-  if [[ -z $t ]]; then MSG="Escribe un nombre."; return 1; fi
-  if ! [[ $t =~ $re ]]; then MSG="Usa solo letras, números, espacio, punto, guion y guion bajo."; return 1; fi
-  if ! banner_split "$t"; then
-    MSG="No cabe en el banner. Máximo $(( BW / 9 )) letras, o dos palabras de ese largo."
-    return 1
-  fi
+cleanup() { # al salir: detiene tareas en segundo plano y devuelve el cursor
+  local j
+  j=$(jobs -p 2>/dev/null)
+  # shellcheck disable=SC2086
+  [[ -n $j ]] && kill $j 2>/dev/null
+  if (( UI_COLOR )); then printf '\e[?25h'; fi
   return 0
 }
+trap cleanup EXIT
 
-register_vps() {
-  local cur name ans first=0 w
-  cur=$(vps_name); [[ -n $cur ]] || first=1
-  while :; do
-    cls; gradient_bar; echo
-    printf '  %sREGISTRO DE VPS%s\n' "$HI" "$RST"
-    if (( first )); then
-      printf '  %sRegistra este servidor: su nombre aparecerá como banner del panel.%s\n' "$DIM" "$RST"
-    else
-      printf '  %sNombre actual: %s  (ENTER para conservarlo)%s\n' "$DIM" "$cur" "$RST"
-    fi
-    printf '  %sMáximo %d letras, o dos palabras de ese largo.%s\n\n' "$DIM" "$(( BW / 9 ))" "$RST"
-    rd "Nombre del VPS: " name || { err "No hay entrada disponible"; return 1; }
-    read -ra w <<< "$name"; name="${w[*]:-}"            # quita espacios sobrantes
-    if [[ -z $name && -n $cur ]]; then return 0; fi
-    if ! name_check "$name"; then
-      warn "$MSG"; sleep 2; continue
-    fi
-    cls; gradient_bar; echo
-    banner_print "$name"
-    echo
-    rd "¿Confirmar este nombre? [S/n]: " ans || return 1
-    [[ $ans == [nN]* ]] && continue
-    printf '%s\n' "$name" > "$NAME_F"
-    [[ -s $REG_F ]] || date +%d/%m/%Y > "$REG_F"
-    echo
-    ok "VPS registrado como $name"
-    sleep 1
-    (( first )) && show_access
-    return 0
-  done
-}
-
-default_name() {   # sin interacción: usa el hostname
-  [[ -s $NAME_F ]] && return 0
-  local h; h=$(hostname 2>/dev/null | tr -cd 'A-Za-z0-9._-' | cut -c1-9)
-  printf '%s\n' "${h:-VPS}" > "$NAME_F"
-  [[ -s $REG_F ]] || date +%d/%m/%Y > "$REG_F"
-}
-
-cfg_vpsname() { register_vps; }
-
-# ------------------------- Preparación del sistema --------------------
-ensure_base() {
-  [[ -f $BASE/.prep ]] && return 0
-  info "Preparando el sistema..."
-  spin "Actualizando lista de paquetes" apt-get update -qq
-  apt_i curl wget jq git unzip tar openssl iptables ca-certificates cron procps iproute2 python3
-  grep -qx /bin/false /etc/shells || echo /bin/false >> /etc/shells
-  install_helpers
-  cfg_ssh
-  touch "$BASE/.prep"
-}
-
-# ------------------------------ UDP Custom ----------------------------
-# Instalación 100% automática: descarga el binario, lo verifica, crea la
-# configuración y el servicio. No hay que copiar ni pegar ningún enlace.
-inst_udp() {
-  ensure_base
-  if ! is_on udp && ss -H -lun "sport = :$PORT_UDP" 2>/dev/null | grep -q .; then
-    err "El puerto UDP $PORT_UDP ya está en uso"; return 1
-  fi
-  case $(uname -m) in
-    x86_64|amd64) ;;
-    *) err "UDP Custom solo tiene binario para x86_64 (este servidor es $(uname -m))"; return 1 ;;
-  esac
-
-  local dir=/etc/udp-custom tmp url=${UDPCUSTOM_URL:-$UDP_BIN_URL} sum excl
-  tmp=$(mktemp)
-  if ! spin "Descargando UDP Custom" \
-       curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 180 -o "$tmp" "$url"; then
-    err "No se pudo descargar UDP Custom. Revisa la conexión del VPS."
-    rm -f "$tmp"; return 1
-  fi
-  if [[ $(head -c4 "$tmp" | od -An -tx1 | tr -d ' \n') != 7f454c46 ]]; then
-    err "El archivo descargado no es un ejecutable válido."
-    rm -f "$tmp"; return 1
-  fi
-  if [[ -z $UDPCUSTOM_URL ]]; then
-    sum=$(sha256sum "$tmp" | awk '{print $1}')
-    if [[ $sum != "$UDP_BIN_SHA256" ]]; then
-      err "La verificación SHA256 falló: el archivo no es el esperado. No se instaló."
-      rm -f "$tmp"; return 1
-    fi
-    ok "Binario verificado (SHA256)"
-  else
-    warn "Se usa una URL personalizada: el binario no se pudo verificar"
-  fi
-
-  mkdir -p "$dir"
-  systemctl stop udp-custom >/dev/null 2>&1
-  install -m755 "$tmp" "$dir/udp-custom"
-  rm -f "$tmp"
-  conf_udp || return 1
-  info "En HTTP Custom: modo UDP Custom, host $(get_host), puerto $PORT_UDP"
-}
-
-conf_udp() {   # configuración y servicio de UDP Custom con el puerto actual
-  local dir=/etc/udp-custom excl
-  cat > "$dir/config.json" <<EOF
-{
-  "listen": ":$PORT_UDP",
-  "stream_buffer": 33554432,
-  "receive_buffer": 83886080,
-  "auth": { "mode": "passwords" }
-}
-EOF
-  # Puertos UDP que udp-custom NO debe tomar (DNS, SlowDNS, OpenVPN, WireGuard)
-  excl="53,$PORT_SLOWDNS,1194,51820"
-  mkunit udp-custom "UDP Custom" "$dir/udp-custom server -exclude $excl" "WorkingDirectory=$dir"
-  fw_open "$PORT_UDP" udp
-  verify udp "UDP Custom"
-}
-
-show_ports_plan() {
-  box_top "PUERTOS A USAR"
-  grid row "$(pcell DROPBEAR "$PORT_DROPBEAR")"   "$(pcell SSL "$PORT_SSL")" \
-           "$(pcell WEBSOCKET "$PORT_WS")"        "$(pcell SQUID "$PORT_SQUID")" \
-           "$(pcell V2RAY "$PORT_V2RAY")"         "$(pcell BADVPN "$PORT_BADVPN")" \
-           "$(pcell 'UDP CUSTOM' "$PORT_UDP")"
-  box_bottom
-}
-
-install_all() {
-  ensure_base
-  local item n=0 total=7 a
-  # Con --install-all (o sin teclado) todo es automático con los puertos actuales
-  if [[ -z ${INSTALL_AUTO:-} && -t 0 ]]; then
-    show_ports_plan
-    while :; do
-      printf '\n  %sENTER%s instalar ahora   %sP%s cambiar puertos   %s0%s cancelar\n' "$ACC" "$RST" "$ACC" "$RST" "$ACC" "$RST"
-      rd "Opción: " a || return 1
-      case ${a,,} in
-        "") break ;;
-        p)  sub_header "CAMBIAR PUERTOS"; ports_wizard; echo; show_ports_plan ;;
-        0)  return 0 ;;
-      esac
-    done
-  fi
-  for item in "inst_dropbear:Dropbear" "inst_ssl:SSL (stunnel)" "inst_badvpn:BadVPN UDPGW" \
-              "inst_ws:WebSocket" "inst_squid:Squid" "inst_v2ray:V2Ray" "inst_udp:UDP Custom"; do
-    n=$(( n + 1 ))
-    printf '\n  %s[%d/%d]%s %s%s%s\n' "$ACC2" "$n" "$total" "$RST" "$HI" "${item#*:}" "$RST"
-    "${item%%:*}" || warn "${item#*:} no se pudo instalar; se continúa con el resto"
-  done
-  echo
-  cfg_bbr
-  echo
-  ok "Instalación completa. Abre el panel con: $(panel_cmd)"
-}
-
-# --------------------------- Cuentas SSH / Dropbear -------------------
-show_ssh_info() { # usuario clave expira limite
-  local h; h=$(get_host); h=${h:0:$(( IW - 9 ))}
-  echo
-  box_top "CUENTA SSH"
-  box_row "$(kv Host "$h")"
-  box_row "$(kv Usuario "$1")"
-  box_row "$(kv Clave "$2")"
-  box_cols "$(kv Expira "$3")" "$(kv Limite "$4")"
-  box_bottom
-  box_top "PUERTOS"
-  grid row "$(pcell SSH "$SSH_PORT")" "$(pcell Dropbear "$PORT_DROPBEAR")" \
-           "$(pcell SSL "$PORT_SSL")" "$(pcell WebSocket "$PORT_WS")" \
-           "$(pcell Squid "$PORT_SQUID")" "$(pcell 'UDP Custom' "$PORT_UDP")"
-  box_bottom
-  printf '\n  %sUDPGW%s   127.0.0.1:%s\n' "$DIM" "$RST" "$PORT_BADVPN"
-  printf '  %sPayload WS%s\n  GET / HTTP/1.1[crlf]Host: %s[crlf]Upgrade: websocket[crlf][crlf]\n' "$DIM" "$RST" "$(get_host)"
-}
-
-ssh_list() {
-  local u p e l n=0 today col
-  today=$(date +%F)
-  printf '  %s%-16s %-12s %-11s %s%s\n' "$HI" USUARIO CLAVE EXPIRA LIM "$RST"
-  printf '  %s%s%s\n' "$DIM" "$(rep "$GH" $(( UW - 4 )))" "$RST"
-  while IFS='|' read -r u p e l; do
-    [[ -n $u ]] || continue
-    if [[ $e < $today ]]; then col=$ERC; else col=$TXT; fi
-    printf '  %s%-16s %-12s %-11s %-3s%s\n' "$col" "$u" "$p" "$e" "$l" "$RST"
-    n=$(( n + 1 ))
-  done < "$USERDB"
-  (( n )) || printf '  %s(sin cuentas)%s\n' "$DIM" "$RST"
-  printf '\n  %sTotal: %d   (en rojo: vencidas)%s\n' "$DIM" "$n" "$RST"
-}
-
-ssh_online() {
-  local u p e l n tot=0
-  printf '  %s%-16s %s%s\n' "$HI" USUARIO CONEXIONES "$RST"
-  printf '  %s%s%s\n' "$DIM" "$(rep "$GH" $(( UW - 4 )))" "$RST"
-  while IFS='|' read -r u p e l; do
-    [[ -n $u ]] || continue
-    n=$(ps -u "$u" -o comm= 2>/dev/null | grep -cE '^(sshd|dropbear)$')
-    if (( n > 0 )); then printf '  %s%-16s%s %s%s%s\n' "$TXT" "$u" "$RST" "$OKC" "$n" "$RST"; tot=$(( tot + n )); fi
-  done < "$USERDB"
-  printf '\n  %sTotal conexiones: %d%s\n' "$DIM" "$tot" "$RST"
-}
-
-menu_ssh() {
-  ensure_base
-  local o n
-  while :; do
-    n=$(grep -c . "$USERDB" 2>/dev/null); n=${n:-0}
-    sub_header "CUENTAS SSH / DROPBEAR"
-    box_top "ACCIONES  ($n cuentas)"
-    grid col "$(mcell 01 'Crear cuenta')" "$(mcell 02 'Eliminar cuenta')" \
-             "$(mcell 03 'Renovar cuenta')" "$(mcell 04 'Cambiar clave')" \
-             "$(mcell 05 'Listar cuentas')" "$(mcell 06 'Conectados')" \
-             "$(mcell 07 'Limpiar vencidas')" "$(mcell 00 'Volver')"
-    box_bottom
-    ask Opción o || return
-    [[ $o =~ ^[0-9]+$ ]] && o=$(( 10#$o ))
-    case $o in
-      1) sub_header "CREAR CUENTA SSH";      ssh_create ;;
-      2) sub_header "ELIMINAR CUENTA SSH";   ssh_delete ;;
-      3) sub_header "RENOVAR CUENTA SSH";    ssh_renew ;;
-      4) sub_header "CAMBIAR CLAVE";         ssh_passwd ;;
-      5) sub_header "CUENTAS SSH";           ssh_list ;;
-      6) sub_header "USUARIOS CONECTADOS";   ssh_online ;;
-      7) sub_header "LIMPIAR VENCIDAS";      /usr/local/bin/vps-cleanup && ok "Cuentas expiradas eliminadas" ;;
-      0) return ;;
-      *) continue ;;
-    esac
-    pause
-  done
-}
-
-# ------------------------------ Cuentas V2Ray -------------------------
-v2_create() {
-  v2_need || return 1
-  local n d id exp
-  rd "Nombre de la cuenta: " n
-  valid_name "$n" || { err "Nombre inválido (3-31 caracteres: a-z 0-9 _ -)"; return 1; }
-  if grep -q "^${n}|" "$V2DB"; then err "La cuenta ya existe"; return 1; fi
-  rd "Días de validez [30]: " d; d=${d:-30}
-  [[ $d =~ ^[0-9]+$ ]] || { err "Días inválidos"; return 1; }
-  id=$(cat /proc/sys/kernel/random/uuid)
-  exp=$(date -d "+$d days" +%F)
-  v2_edit --arg id "$id" --arg em "$n" \
-    '.inbounds[0].settings.clients += [{"id":$id,"alterId":0,"email":$em}]' || return 1
-  echo "$n|$id|$exp" >> "$V2DB"
-  systemctl restart v2ray
-  echo
-  box_top "CUENTA V2RAY"
-  box_row "$(kv Cuenta "$n")"
-  box_cols "$(kv Expira "$exp")" "$(kv Puerto "$PORT_V2RAY")"
-  box_cols "$(kv Red ws)" "$(kv Path "$V2PATH")"
-  box_bottom
-  printf '\n  %sUUID%s\n  %s\n' "$DIM" "$RST" "$id"
-  printf '\n  %sEnlace%s\n  %s\n' "$DIM" "$RST" "$(v2_link "$n" "$id")"
-}
-
-v2_list() {
-  local n id e c=0 today col
-  today=$(date +%F)
-  while IFS='|' read -r n id e; do
-    [[ -n $n ]] || continue
-    if [[ $e < $today ]]; then col=$ERC; else col=$OKC; fi
-    printf '  %s%s%s   %sexpira %s%s%s\n' "$HI" "$n" "$RST" "$DIM" "$col" "$e" "$RST"
-    printf '  %s%s%s\n\n' "$DIM" "$(v2_link "$n" "$id")" "$RST"
-    c=$(( c + 1 ))
-  done < "$V2DB"
-  (( c )) || printf '  %s(sin cuentas)%s\n' "$DIM" "$RST"
-  printf '  %sTotal: %d%s\n' "$DIM" "$c" "$RST"
-}
-
-menu_v2() {
-  ensure_base
-  local o n
-  while :; do
-    n=$(grep -c . "$V2DB" 2>/dev/null); n=${n:-0}
-    sub_header "CUENTAS V2RAY"
-    box_top "ACCIONES  ($n cuentas)"
-    grid col "$(mcell 01 'Crear cuenta')" "$(mcell 02 'Eliminar cuenta')" \
-             "$(mcell 03 'Renovar cuenta')" "$(mcell 04 'Listar / enlaces')" \
-             "$(mcell 00 'Volver')"
-    box_bottom
-    ask Opción o || return
-    [[ $o =~ ^[0-9]+$ ]] && o=$(( 10#$o ))
-    case $o in
-      1) sub_header "CREAR CUENTA V2RAY";    v2_create ;;
-      2) sub_header "ELIMINAR CUENTA V2RAY"; v2_delete ;;
-      3) sub_header "RENOVAR CUENTA V2RAY";  v2_renew ;;
-      4) sub_header "CUENTAS V2RAY";         v2_list ;;
-      0) return ;;
-      *) continue ;;
-    esac
-    pause
-  done
-}
-
-# ------------------------------ Protocolos ----------------------------
-pget() { local v=${PVAR[$1]}; printf '%s' "${!v}"; }
-
-proto_installed() { systemctl cat "${SVC[$1]}" >/dev/null 2>&1; }
-
-save_ports() {
-  local k
-  {
-    for k in "${PORT_KEYS[@]}"; do echo "${PVAR[$k]}=$(pget "$k")"; done
-    echo "V2PATH=$V2PATH"
-  } > "$BASE/ports.conf"
-}
-
-load_ports() {   # lee /etc/vpspanel/ports.conf validando cada línea
-  local l k v
-  [[ -f $BASE/ports.conf ]] || return 0
-  while IFS= read -r l; do
-    k=${l%%=*}; v=${l#*=}
-    case $k in
-      PORT_DROPBEAR|PORT_SSL|PORT_BADVPN|PORT_WS|PORT_SQUID|PORT_V2RAY|PORT_UDP|PORT_SLOWDNS)
-        if [[ $v =~ ^[0-9]{1,5}$ ]] && (( 10#$v >= 1 && 10#$v <= 65535 )); then
-          printf -v "$k" '%s' "$(( 10#$v ))"
-        fi ;;
-      V2PATH) [[ $v =~ ^/[A-Za-z0-9._~/-]{1,40}$ ]] && V2PATH=$v ;;
-    esac
-  done < "$BASE/ports.conf"
-  return 0
-}
-
-is_udp_key() { [[ $1 == udp || $1 == slowdns ]]; }
-
-port_check() {   # clave puerto -> 0 si sirve (deja el número en PCHK); si no, el motivo en MSG
-  local k=$1 p=$2 o
-  if ! [[ $p =~ ^[0-9]{1,5}$ ]] || (( 10#$p < 1 || 10#$p > 65535 )); then MSG="Puerto inválido (1-65535)."; return 1; fi
-  p=$(( 10#$p ))
-  for o in "${PORT_KEYS[@]}"; do
-    [[ $o == "$k" ]] && continue
-    if { is_udp_key "$o" && is_udp_key "$k"; } || { ! is_udp_key "$o" && ! is_udp_key "$k"; }; then
-      if (( $(pget "$o") == p )); then MSG="Ya lo usa ${o^^} en este panel."; return 1; fi
-    fi
-  done
-  if ! is_udp_key "$k" && (( p == SSH_PORT )); then MSG="Es el puerto SSH del servidor."; return 1; fi
-  PCHK=$p
-  (( p == $(pget "$k") )) && return 0                       # sin cambios
-  if is_udp_key "$k"; then
-    if ss -H -lun "sport = :$p" 2>/dev/null | grep -q .; then MSG="El puerto UDP $p ya está en uso."; return 1; fi
-  elif port_busy "$p"; then
-    MSG="El puerto $p ya está en uso por otro programa."; return 1
-  fi
-  return 0
-}
-
-port_set() { printf -v "${PVAR[$1]}" '%s' "$2"; save_ports; }
-
-v2_apply() {   # puerto y path de V2Ray en su config (sin tocar las cuentas)
-  [[ -f $V2CFG ]] || return 0
-  local t; t=$(mktemp)
-  if jq --argjson p "$PORT_V2RAY" --arg w "$V2PATH" \
-       '.inbounds[0].port=$p | .inbounds[0].streamSettings.wsSettings.path=$w' "$V2CFG" > "$t"; then
-    cat "$t" > "$V2CFG"
-  fi
-  rm -f "$t"
-  systemctl restart v2ray
-  fw_open "$PORT_V2RAY" tcp
-  verify v2ray V2Ray
-}
-
-apply_proto() {   # clave -> reescribe su configuración con los puertos actuales (solo si está instalado)
-  local k=$1 was=1
-  proto_installed "$k" || return 0
-  is_on "$k" || was=0
-  case $k in
-    dropbear) unit_dropbear ;;
-    ssl)      conf_ssl ;;
-    badvpn)   unit_badvpn ;;
-    ws)       unit_ws ;;
-    squid)    conf_squid ;;
-    v2ray)    v2_apply ;;
-    udp)      conf_udp ;;
-    slowdns)  [[ -s $BASE/slowdns/ns ]] && unit_slowdns ;;
-    *)        return 0 ;;
-  esac
-  (( was )) || systemctl disable --now "${SVC[$k]}" >/dev/null 2>&1
-  return 0
-}
-
-apply_chain() {   # clave -> la aplica y también a los que dependen de su puerto
-  local d
-  apply_proto "$1"
-  case $1 in
-    dropbear) for d in ws squid; do apply_proto "$d"; done ;;
-    ws)       apply_proto squid ;;
-  esac
-  return 0
-}
-
-proto_port() {   # clave
-  local k=$1 v cur; cur=$(pget "$k")
-  rd "Nuevo puerto para ${k^^} [$cur]: " v || return 1
-  [[ -z $v ]] && { info "Sin cambios"; return 0; }
-  port_check "$k" "$v" || { err "$MSG"; return 1; }
-  [[ $PCHK == "$cur" ]] && { info "Sin cambios"; return 0; }
-  port_set "$k" "$PCHK"
-  ok "Puerto de ${k^^}: $PCHK"
-  if proto_installed "$k"; then info "Aplicando (se reinician los servicios afectados)..."; apply_chain "$k"; fi
-}
-
-ports_wizard() {   # pregunta el puerto de cada protocolo; ENTER conserva el actual
-  local k v cur
-  local -a ch=()
-  printf '\n  %sENTER = conservar el valor actual.%s\n\n' "$DIM" "$RST"
-  for k in "${PORT_KEYS[@]}"; do
-    cur=$(pget "$k")
-    while :; do
-      rd "$(printf '%-10s' "${k^^}") [$cur]: " v || return 1
-      [[ -z $v ]] && break
-      if port_check "$k" "$v"; then
-        [[ $PCHK != "$cur" ]] && { port_set "$k" "$PCHK"; cur=$PCHK; ch+=("$k"); }
-        break
-      fi
-      warn "$MSG"
-    done
-  done
-  ok "Puertos guardados"
-  for k in "${ch[@]}"; do apply_chain "$k"; done
-  return 0
-}
-
-ports_reset() {
-  local k c
-  rd "¿Restaurar los puertos por defecto? (s/N): " c
-  [[ $c == [sS] ]] || return 0
-  for k in "${PORT_KEYS[@]}"; do printf -v "${PVAR[$k]}" '%s' "${PDEF[$k]}"; done
-  V2PATH=/v2ray
-  save_ports
-  ok "Puertos restaurados"
-  for k in dropbear ws squid ssl v2ray badvpn udp slowdns; do apply_proto "$k"; done
-}
-
-v2_path_set() {
-  local p
-  proto_installed v2ray || { err "V2Ray no está instalado."; return 1; }
-  rd "Nuevo path de V2Ray [$V2PATH]: " p
-  [[ -z $p ]] && { info "Sin cambios"; return 0; }
-  [[ $p == /* ]] || p="/$p"
-  [[ $p =~ ^/[A-Za-z0-9._~/-]{1,40}$ ]] || { err "Path inválido (letras, números y . _ ~ - /)"; return 1; }
-  V2PATH=$p; save_ports
-  ok "Path de V2Ray: $V2PATH"
-  apply_proto v2ray
-  info "Vuelve a copiar los enlaces: Cuentas V2Ray > Listar."
-}
-
-slowdns_ns() {
-  local ns
-  [[ -x /usr/local/bin/dnstt-server ]] || { err "SlowDNS no está instalado."; return 1; }
-  info "NameServer actual: $(cat "$BASE/slowdns/ns" 2>/dev/null || echo -)"
-  rd "Nuevo NameServer (NS), ej. ns.midominio.com: " ns
-  [[ $ns =~ ^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]] || { err "NameServer inválido"; return 1; }
-  echo "$ns" > "$BASE/slowdns/ns"
-  unit_slowdns
-}
-
-proto_menu() {   # clave nombre
-  local k=$1 nm=$2 o lbl st
-  case $k in openvpn|wireguard) sub_header "$nm"; proto_action "$k"; pause; return ;; esac
-  while :; do
-    if is_on "$k"; then st="${OKC}${GDOT} ACTIVO${RST}"; lbl=Detener
-    elif proto_installed "$k"; then st="${DIM}${GRING} DETENIDO${RST}"; lbl=Activar
-    else st="${DIM}${GRING} NO INSTALADO${RST}"; lbl=Instalar; fi
-    sub_header "$nm"
-    box_top "ESTADO"
-    box_cols "$(kv Estado "$st")" "$(kv Puerto "$(pget "$k")")"
-    [[ $k == v2ray ]]   && box_row "$(kv Path "$V2PATH")"
-    [[ $k == slowdns ]] && box_row "$(kv NS "$(cat "$BASE/slowdns/ns" 2>/dev/null || echo -)")"
-    box_bottom
-    box_top "ACCIONES"
-    case $k in
-      v2ray)   grid col "$(mcell 01 "$lbl")" "$(mcell 02 'Cambiar puerto')" "$(mcell 03 'Cambiar path')" "$(mcell 00 Volver)" ;;
-      slowdns) grid col "$(mcell 01 "$lbl")" "$(mcell 02 'Cambiar puerto')" "$(mcell 03 'Cambiar NameServer')" "$(mcell 00 Volver)" ;;
-      *)       grid col "$(mcell 01 "$lbl")" "$(mcell 02 'Cambiar puerto')" "$(mcell 00 Volver)" ;;
-    esac
-    box_bottom
-    ask Opción o || return
-    [[ $o =~ ^[0-9]+$ ]] && o=$(( 10#$o ))
-    case $o in
-      1) proto_action "$k" ;;
-      2) proto_port "$k" ;;
-      3) case $k in v2ray) v2_path_set ;; slowdns) slowdns_ns ;; *) continue ;; esac ;;
-      0) return ;;
-      *) continue ;;
-    esac
-    pause
-  done
-}
-
-menu_protocols() {
-  local i k n stt prt
-  local -a cells
-  while :; do
-    cells=()
-    for i in "${!PROTO_KEYS[@]}"; do
-      k=${PROTO_KEYS[i]}
-      if is_on "$k"; then stt="${OKC}${GDOT} ON ${RST}"; else stt="${DIM}${GRING} OFF${RST}"; fi
-      prt=''; [[ -n ${PVAR[$k]:-} ]] && prt=":$(pget "$k")"
-      cells+=( "$(printf '%s%02d%s  %s%-10s%s %s %s%s%s' "$ACC" $(( i + 1 )) "$RST" "$TXT" "${PROTO_NAMES[i]}" "$RST" "$stt" "$DIM" "$prt" "$RST")" )
-    done
-    sub_header "PROTOCOLOS"
-    box_top "ESTADO Y PUERTOS"
-    grid col "${cells[@]}"
-    box_bottom
-    box_top "OPCIONES"
-    box_row "$(mcell 11 'Cambiar todos los puertos')"
-    box_row "$(mcell 12 'Restaurar puertos por defecto')"
-    box_row "$(mcell 00 Volver)"
-    box_bottom
-    printf '\n  %sElige un protocolo para activarlo, detenerlo o personalizarlo.%s\n' "$DIM" "$RST"
-    ask Opción n || return
-    [[ $n =~ ^[0-9]+$ ]] && n=$(( 10#$n ))
-    case $n in
-      0)  return ;;
-      11) sub_header "CAMBIAR PUERTOS"; ports_wizard; pause ;;
-      12) sub_header "RESTAURAR PUERTOS"; ports_reset; pause ;;
-      *)  if [[ $n =~ ^[0-9]+$ ]] && (( n >= 1 && n <= ${#PROTO_KEYS[@]} )); then
-            proto_menu "${PROTO_KEYS[n-1]}" "${PROTO_NAMES[n-1]}"
-          fi ;;
-    esac
-  done
-}
-
-# ------------------------------ Herramientas --------------------------
-menu_tools() {
-  local o a b
-  while :; do
-    if banner_on; then b="${OKC}${GDOT} ON${RST}"; else b="${DIM}${GRING} OFF${RST}"; fi
-    if autostart_on; then a="${OKC}${GDOT} ON${RST}"; else a="${DIM}${GRING} OFF${RST}"; fi
-    sub_header "HERRAMIENTAS Y AJUSTES"
-    box_top "AJUSTES"
-    grid col "$(mcell 01 'Banner SSH') $b" "$(mcell 02 'Aceleración BBR')" \
-             "$(mcell 03 'Memoria swap')" "$(mcell 04 'Limpiar caché')" \
-             "$(mcell 05 'Configurar DNS')" "$(mcell 06 'Dominio / SSL')" \
-             "$(mcell 07 'Clave root')" "$(mcell 08 'Reiniciar servicios')" \
-             "$(mcell 09 'Auto-inicio') $a" "$(mcell 10 'Nombre del VPS')"
-    box_bottom
-    printf '\n  %s00%s  Volver\n' "$ACC" "$RST"
-    ask Opción o || return
-    [[ $o =~ ^[0-9]+$ ]] && o=$(( 10#$o ))
-    case $o in
-      1)  sub_header "BANNER SSH"; cfg_banner; [[ $? == 3 ]] && continue ;;
-      2)  sub_header "ACELERACION BBR";       cfg_bbr ;;
-      3)  sub_header "MEMORIA SWAP";          cfg_swap ;;
-      4)  sub_header "LIMPIAR CACHE Y LOGS";  cfg_cache ;;
-      5)  sub_header "CONFIGURAR DNS";        cfg_dns ;;
-      6)  sub_header "DOMINIO Y CERTIFICADO"; cfg_domain ;;
-      7)  sub_header "CLAVE Y ACCESO ROOT";   cfg_root ;;
-      8)  sub_header "REINICIAR SERVICIOS";   restart_services ;;
-      9)  toggle_autostart ;;
-      10) cfg_vpsname; continue ;;
-      0)  return ;;
-      *)  continue ;;
-    esac
-    pause
-  done
-}
-
-# ---------------------------------- Menú ------------------------------
-fmt_mb() { local m=$1; if (( m >= 1024 )); then printf '%d.%dG' $(( m / 1024 )) $(( (m % 1024) * 10 / 1024 )); else printf '%dM' "$m"; fi; }
-
-sys_stats() {
-  local l1 n mt mu dt du up d h m
-  read -r l1 _ < /proc/loadavg
-  n=$(nproc 2>/dev/null || echo 1)
-  CPU_P=$(awk -v l="$l1" -v n="$n" 'BEGIN{p=l/n*100; if(p>100)p=100; printf "%d", p}')
-  CPU_X="carga $l1"
-  read -r mt mu < <(free -m | awk '/^Mem:/{print $2, $3}')
-  mt=${mt:-0}; mu=${mu:-0}
-  RAM_P=$(( mt > 0 ? mu * 100 / mt : 0 ))
-  RAM_X="$(fmt_mb "$mu")/$(fmt_mb "$mt")"
-  read -r dt du < <(df -Pm / | awk 'NR==2{print $2, $3}')
-  dt=${dt:-0}; du=${du:-0}
-  DSK_P=$(( dt > 0 ? du * 100 / dt : 0 ))
-  DSK_X="$(fmt_mb "$du")/$(fmt_mb "$dt")"
-  up=$(cut -d. -f1 /proc/uptime); d=$(( up / 86400 )); h=$(( up % 86400 / 3600 )); m=$(( up % 3600 / 60 ))
-  if (( d > 0 )); then UPT="${d}d ${h}h ${m}m"; else UPT="${h}h ${m}m"; fi
-}
-
-res_line() {   # etiqueta porcentaje detalle
-  local bw=$(( IW - 28 )); (( bw < 6 )) && bw=6
-  box_row "$(printf '%s%-6s%s ' "$DIM" "$1" "$RST")$(bar "$2" "$bw") $(printf '%s%3d%%%s %s%s%s' "$HI" "$2" "$RST" "$DIM" "$3" "$RST")"
-}
-
-svc_cell() {   # clave etiqueta puerto
-  local dot col
-  if is_on "$1"; then dot=$GDOT; col=$OKC; else dot=$GRING; col=$DIM; fi
-  printf '%s%s%s %s%-10s%s %s%s%s' "$col" "$dot" "$RST" "$TXT" "$2" "$RST" "$DIM" "$3" "$RST"
-}
-
-header() {
-  local name reg sub sp
-  name=$(vps_name); reg=$(cat "$REG_F" 2>/dev/null)
-  cls
-  gradient_bar
-  echo
-  banner_print "${name:-VPS PANEL}"
-  echo
-  sub="ADMINISTRADOR DE VPS  ${SEP}  v${VERSION}"
-  sp=$(( (UW - ${#sub}) / 2 )); (( sp < 1 )) && sp=1
-  printf '%*s%sADMINISTRADOR DE VPS%s  %s%s%s  %sv%s%s\n\n' "$sp" '' "$HI" "$RST" "$DIM" "$SEP" "$RST" "$ACC2" "$VERSION" "$RST"
-  sys_stats
-  box_top "SERVIDOR"
-  box_cols "$(kv IP "$IP" "$IPC")" "$(kv Hora "$(date +%H:%M:%S)")"
-  box_row "$(kv Sistema "${OS_NAME:0:$(( IW - 9 ))}")"
-  box_cols "$(kv Registro "${reg:--}")" "$(kv Activo "$UPT")"
-  box_row ""
-  res_line CPU   "$CPU_P" "$CPU_X"
-  res_line RAM   "$RAM_P" "$RAM_X"
-  res_line DISCO "$DSK_P" "$DSK_X"
-  box_bottom
-  echo
-  box_top "SERVICIOS"
-  grid row "$(svc_cell ssh SSH "$SSH_PORT")"            "$(svc_cell dropbear DROPBEAR "$PORT_DROPBEAR")" \
-           "$(svc_cell ssl SSL "$PORT_SSL")"            "$(svc_cell ws WEBSOCKET "$PORT_WS")" \
-           "$(svc_cell squid SQUID "$PORT_SQUID")"      "$(svc_cell v2ray V2RAY "$PORT_V2RAY")" \
-           "$(svc_cell badvpn BADVPN "$PORT_BADVPN")"   "$(svc_cell udp 'UDP CUSTOM' "$PORT_UDP")" \
-           "$(svc_cell slowdns SLOWDNS "$PORT_SLOWDNS")" "$(svc_cell openvpn OPENVPN -)" \
-           "$(svc_cell wireguard WIREGUARD -)"
-  box_bottom
-  echo
-  box_top "MENÚ"
-  grid col "$(mcell 01 'Cuentas SSH')" "$(mcell 02 'Cuentas V2Ray')" \
-           "$(mcell 03 'Protocolos')" "$(mcell 04 'Herramientas')" \
-           "$(mcell 05 'Instalar todo')" "$(mcell 06 'Desinstalar' "$ERC")" \
-           "$(mcell 07 'Reiniciar VPS')" "$(mcell 00 'Salir')"
-  box_bottom
-}
-
-main_menu() {
-  local o c
-  while :; do
-    header
-    ask Opción o || exit 0
-    [[ $o =~ ^[0-9]+$ ]] && o=$(( 10#$o ))
-    case $o in
-      1) menu_ssh ;;
-      2) menu_v2 ;;
-      3) ensure_base; menu_protocols ;;
-      4) menu_tools ;;
-      5) sub_header "INSTALACION COMPLETA"; install_all; pause ;;
-      6) sub_header "DESINSTALAR PANEL"; uninstall_all; pause ;;
-      7) rd "¿Reiniciar el VPS ahora? (s/N): " c; [[ $c == [sS] ]] && reboot ;;
-      0) cls; exit 0 ;;
-    esac
-  done
-}
-
-usage() { echo "Uso: $0 [--install-all]"; }
-
-main() {
-  preflight
-  init_fs
-  load_ports
-  init_ui
-  trap 'printf "\e[?25h\e[0m"' EXIT
-  init_env
-  self_install
-  autostart_default
-  banner_migrate
-  case "${1:-}" in
-    --install-all) default_name; INSTALL_AUTO=1; install_all; exit 0 ;;
-    -h|--help)     usage; exit 0 ;;
-    "") ;;
-    *) usage; exit 1 ;;
-  esac
-  if [[ ! -s $NAME_F ]]; then
-    if [[ -t 0 && -t 1 ]]; then register_vps || exit 1; else default_name; fi
-  fi
-  main_menu
-}
-
-if [[ -z ${VPSPANEL_SOURCE_ONLY:-} ]]; then main "$@"; fi
+self_install
+reg_load >/dev/null 2>&1 || true
+apply_theme "$VPS_THEME"
+case "${1:-}" in
+  --install-all) install_all; exit 0 ;;
+  --register)    FORCE_REG=1 ;;
+  "") ;;
+  *) echo "Uso: $0 [--install-all|--register]"; exit 1 ;;
+esac
+ui_start
+main_menu
