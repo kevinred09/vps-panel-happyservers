@@ -101,112 +101,89 @@ PROTO_NAMES=("DROPBEAR" "SSL" "BADVPN" "WEBSOCKET" "SQUID"
              "V2RAY" "UDP CUSTOM" "SLOWDNS" "OPENVPN" "WIREGUARD")
 
 # ------------------------------ Interfaz ------------------------------
-# Todo el aspecto visual vive en este bloque: colores, secciones, logo, entrada y spinner.
-# Estilo: texto blanco, títulos verdes, etiquetas azules, separadores y marcas en rojo,
-# secciones con datos rotulados (S.O.:, IP:, RAM:...) y menú "[1] > opción".
-# No se cambia el fondo del terminal (VPSPANEL_THEME=1 lo pone oscuro si lo prefieres).
-RAMP=(222 216 215 215 209 209 208 202 166)   # degradado ámbar -> naranja (modo compacto)
-GC=()                                  # colores del degradado (se rellena con mk_grad)
-ROWC=()                                # color de cada fila del logo
+# Todo el aspecto visual vive en este bloque: colores, líneas, secciones, entrada y spinner.
+# Estilo clásico de panel: líneas "=" rojas, títulos verdes, etiquetas azules, menú "[N] > OPCIÓN",
+# barra inferior de botones y prompt naranja con cursor verde.
 SEC_N=0                                # secciones ya impresas en la pantalla actual
-ASK_HINT=volver                        # texto de "0 ..." bajo el campo de entrada
 THEME=0                                # 1 = fondo y cursor del terminal ajustados (OSC 11/12)
 
 init_ui() {
   local cols
   cols=$(tput cols 2>/dev/null); [[ $cols =~ ^[0-9]+$ ]] || cols=${COLUMNS:-56}
-  (( cols > 66 )) && cols=66
+  (( cols > 56 )) && cols=56
   (( cols < 40 )) && cols=40
   UW=$cols                 # ancho total de la interfaz
-  MG='   '                 # margen izquierdo
-  HW=$(( UW - 6 ))         # ancho de líneas y del campo de entrada
-  TW=$(( UW - 8 ))         # ancho útil del texto (margen + 2 de sangría)
-  BW=$HW                   # ancho máximo del logo
-  IW=$TW
-  if (( UW >= 66 )); then NC=3; elif (( UW >= 50 )); then NC=2; else NC=1; fi   # columnas según el ancho
-  if (( NC >= 2 )); then TWO=1; else TWO=0; fi
+  MG=''                    # sin margen izquierdo
+  HW=$UW; TW=$UW; IW=$UW   # ancho de líneas y del texto
+  if (( UW >= 44 )); then NC=2; else NC=1; fi   # columnas para cuadrículas
 
   if [[ ( -t 1 || -n ${VPSPANEL_COLOR:-} ) && -z ${NO_COLOR:-} && ${TERM:-dumb} != dumb ]]; then
-    BOLD=$'\e[1m'
+    RST=$'\e[0m\e[38;5;255m'; BOLD=$'\e[1m'
+    HI=$'\e[1;38;5;255m';  WH=$'\e[38;5;255m';  TXT=$'\e[38;5;255m'
+    DIM=$'\e[38;5;255m';   DG=$'\e[38;5;243m'        # texto blanco; gris para líneas y valores apagados
     # Color verdadero (24 bits) por defecto; VPSPANEL_COLORS=256 fuerza la paleta de 256 colores
     if [[ ${VPSPANEL_COLORS:-} != 256 && ${TERM:-} != linux ]]; then
-      WH=$'\e[38;2;255;255;255m'                                  # blanco puro
-      ERC=$'\e[38;2;255;85;85m';   OKC=$'\e[38;2;52;190;125m'     # rojo / verde
-      BLC=$'\e[38;2;66;150;255m';  PKC=$'\e[38;2;224;92;164m'     # azul (etiquetas) / rosa (IP)
-      WRC=$'\e[38;2;255;184;77m';  DG=$'\e[38;2;120;120;120m'     # ámbar (pregunta) / gris (solo líneas finas)
-      SHC=$'\e[38;2;122;62;44m'
-      ROWC=($'\e[38;2;247;183;111m' $'\e[38;2;244;164;96m' $'\e[38;2;240;145;84m'
-            $'\e[38;2;234;125;75m' $'\e[38;2;226;108;66m' $'\e[38;2;217;92;58m')
+      ACC=$'\e[38;2;247;163;66m';  ACC2=$'\e[38;2;247;183;111m'                  # naranja (prompt, spinner)
+      ERC=$'\e[38;2;232;78;78m';   WRC=$'\e[38;2;247;183;111m';  OKC=$'\e[38;2;42;167;109m'
+      BLU=$'\e[38;2;66;135;245m';  PNK=$'\e[38;2;214;84;150m'
+      BGG=$'\e[48;2;139;146;163m'; BGR=$'\e[48;2;239;83;80m';    BGB=$'\e[48;2;21;101;160m'
     else
-      WH=$'\e[38;5;231m'
-      ERC=$'\e[38;5;203m';  OKC=$'\e[38;5;78m'
-      BLC=$'\e[38;5;75m';   PKC=$'\e[38;5;168m'
-      WRC=$'\e[38;5;215m';  DG=$'\e[38;5;243m'
-      SHC=$'\e[38;5;95m'
-      ROWC=($'\e[38;5;216m' $'\e[38;5;215m' $'\e[38;5;209m' $'\e[38;5;208m' $'\e[38;5;202m' $'\e[38;5;166m')
+      ACC=$'\e[38;5;215m';  ACC2=$'\e[38;5;215m'
+      ERC=$'\e[38;5;203m';  WRC=$'\e[38;5;215m';  OKC=$'\e[38;5;35m'
+      BLU=$'\e[38;5;33m';   PNK=$'\e[38;5;168m'
+      BGG=$'\e[48;5;103m';  BGR=$'\e[48;5;203m';  BGB=$'\e[48;5;25m'
     fi
-    RST=$'\e[0m'$WH; HI=$BOLD$WH; TXT=$WH; DIM=$WH          # todo el texto en blanco
-    ACC=$ERC; ACC2=$WRC; IPC=$BOLD$PKC; BRD=$DG
-    # Por defecto NO se toca el fondo ni el cursor del terminal (VPSPANEL_THEME=1 usa un fondo oscuro)
-    if [[ -t 1 && ${VPSPANEL_THEME:-0} == 1 && ${TERM:-} != linux ]]; then THEME=1; else THEME=0; fi
+    GRN=$OKC; IPC=$'\e[1m'$PNK
+    # Fondo azul marino y cursor verde mientras el panel está abierto (VPSPANEL_THEME=0 lo desactiva)
+    if [[ -t 1 && ${VPSPANEL_THEME:-1} != 0 && ${TERM:-} != linux ]]; then THEME=1; else THEME=0; fi
   else
-    RST='' BOLD='' ACC='' ACC2='' HI='' WH='' TXT='' DIM='' DG='' OKC='' ERC='' WRC='' BRD='' SHC='' IPC='' BLC='' PKC=''
-    ROWC=('' '' '' '' '' '')
+    RST='' BOLD='' ACC='' ACC2='' HI='' WH='' TXT='' DIM='' DG='' OKC='' ERC='' WRC=''
+    BLU='' PNK='' BGG='' BGR='' BGB='' GRN='' IPC=''
     THEME=0
   fi
 
   if (( UTF )); then
-    GH='─' GHD='═' GV='│' GTL='╭' GTR='╮' GBL='╰' GBR='╯'
-    GDOT='●' GRING='○' GFUL='━' GEMP='─' GBAR='━' GBLK='█' ARW='❯' SEP='·'
-    GSTAR='✻' GSQ='▪' GRET='↵' GOK='✔' GERR='✘' GWARN='▲'
+    GDOT='●' GRING='○' GOK='✔' GERR='✘' GWARN='▲' GRET='↵' SEP='·'
     SPIN=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
   else
-    GH='-' GHD='=' GV='|' GTL='+' GTR='+' GBL='+' GBR='+'
-    GDOT='*' GRING='o' GFUL='#' GEMP='.' GBAR='=' GBLK='#' ARW='>' SEP='-'
-    GSTAR='*' GSQ='#' GRET='>' GOK='OK' GERR='X' GWARN='!'
+    GDOT='*' GRING='o' GOK='OK' GERR='X' GWARN='!' GRET='>' SEP='-'
     SPIN=('|' '/' '-' '\')
   fi
+  GH='-' GEQ='=' ARW='>'
 
   # Alias de colores usados por los instaladores
-  R=$ERC; G=$OKC; Y=$WRC; M=$PKC; C=$BLC; W=$HI; N=$RST; LINE=
+  R=$ERC; G=$OKC; Y=$WRC; M=$ACC2; C=$ACC; W=$HI; N=$RST; LINE=
 }
 
 rep() { local s; printf -v s '%*s' "$2" ''; printf '%s' "${s// /$1}"; }   # carácter n_veces
 
 vlen_set() { local s=${1//$'\e['*([0-9;])m/}; VL=${#s}; }                  # largo visible (sin colores)
 
-mk_grad() {   # ancho -> rellena GC[] con un color por columna
-  local w=$1 i k n=${#RAMP[@]}
-  GC=()
-  for (( i=0; i<w; i++ )); do
-    if [[ -n $RST ]]; then k=$(( i * n / w )); printf -v "GC[$i]" '\e[38;5;%sm' "${RAMP[k]}"; else GC[i]=; fi
-  done
-}
+padto() { local s=$1 w=$2; vlen_set "$s"; printf '%s%*s' "$s" $(( w > VL ? w - VL : 0 )) ''; }   # texto relleno hasta w columnas
 
 cls() { SEC_N=0; [[ -t 1 ]] && printf '\e[H\e[2J\e[3J%s' "$TXT"; return 0; }
 
-theme_on()  { (( THEME )) && printf '\e]11;#141211\a\e]12;#ec804a\a'; return 0; }
-theme_off() { (( THEME )) && printf '\e]111\a\e]112\a'; return 0; }
+theme_on()  { (( THEME )) && printf '\e]11;#131527\a\e]12;#2aa76d\a\e[2 q'; return 0; }
+theme_off() { (( THEME )) && printf '\e]111\a\e]112\a\e[0 q'; return 0; }
 
-hr()  { printf '%s%s%s%s\n' "$MG" "$ERC" "$(rep "$GHD" "$HW")" "$RST"; }   # separador de secciones (rojo)
-hrt() { printf '%s%s%s%s\n' "$MG" "$DG" "$(rep "$GH" "$HW")" "$RST"; }     # línea fina gris (entre grupos)
+hr()  { printf '%s%s%s\n' "$ERC" "$(rep "$GEQ" "$UW")" "$RST"; }   # línea roja  =====
+hrd() { printf '%s%s%s\n' "$DG"  "$(rep "$GH"  "$UW")" "$RST"; }   # línea gris  -----
 
 # ---- Secciones -----------------------------------------------------
-sec_start() { (( SEC_N > 0 )) && hr; SEC_N=$(( SEC_N + 1 )); return 0; }   # línea roja entre secciones
-
 box_top() {   # titulo [texto a la derecha] [color]
-  local t=$1 r=${2:-} rc=${3:-$HI} n m pad
-  sec_start
+  local t=$1 r=${2:-} rc=${3:-$GRN} n m pad
+  (( SEC_N > 0 )) && hr
+  SEC_N=$(( SEC_N + 1 ))
   vlen_set "$t"; n=$VL; vlen_set "$r"; m=$VL
-  pad=$(( HW - 2 - n - m )); (( pad < 1 )) && pad=1
-  printf '%s  %s%s%s%s' "$MG" "$OKC" "$BOLD" "$t" "$RST"
+  pad=$(( UW - n - m )); (( pad < 1 )) && pad=1
+  printf '%s%s%s%s' "$GRN" "$BOLD" "$t" "$RST"
   [[ -n $r ]] && printf '%*s%s%s%s' "$pad" '' "$rc" "$r" "$RST"
   printf '\n'
 }
 
 box_row() {   # texto (puede llevar colores)
   [[ -n $1 ]] || { echo; return 0; }
-  printf '%s  %s%s\n' "$MG" "$1" "$RST"
+  printf '%s%s\n' "$1" "$RST"
 }
 
 box_bottom() { :; }
@@ -228,7 +205,7 @@ grid() {      # modo(col|row) celda...   reparte celdas en columnas según el an
   local -a c=("$@")
   local n=${#c[@]} cols maxw=0 colw rows i j k line pad
   for (( i=0; i<n; i++ )); do vlen_set "${c[i]}"; (( VL > maxw )) && maxw=$VL; done
-  if [[ $mode == col ]]; then (( NC >= 2 )) && cols=2 || cols=1; else cols=$NC; fi
+  if [[ $mode == col ]]; then (( NC >= 2 && n >= 8 )) && cols=2 || cols=1; else cols=$NC; fi
   while :; do
     colw=$(( (TW - 2 * (cols - 1)) / cols ))
     (( maxw <= colw || cols == 1 )) && break
@@ -250,9 +227,10 @@ grid() {      # modo(col|row) celda...   reparte celdas en columnas según el an
   done
 }
 
-kv()    { printf '%s%-9s%s %s%s%s' "$BLC$BOLD" "$1:" "$RST" "${3:-$HI}" "$2" "$RST"; }                                # etiqueta valor [color]
-mcell() { printf '%s[%s]%s %s>%s %s%s%s' "$OKC$BOLD" "$1" "$RST" "$ERC$BOLD" "$RST" "${3:-$HI}" "$2" "$RST"; }         # [NN] > etiqueta [color]
-pcell() { printf '%s%-12s%s %s%s%s' "$ERC$BOLD" "$1:" "$RST" "$OKC" "$2" "$RST"; }                                    # ETIQUETA: puerto
+kv()    { printf '%s%-9s%s %s%s%s' "$BLU" "${1^^}:" "$RST" "${3:-$HI}" "$2" "$RST"; }                       # etiqueta valor [color]
+mcell() { local l=$2; [[ $l == *$'\e'* ]] || l=${l^^}
+          printf '%s[%s]%s %s%s%s %s%s%s' "$GRN" "$1" "$RST" "$ERC" "$ARW" "$RST" "${3:-$HI}" "$l" "$RST"; }   # N etiqueta [color]
+pcell() { printf '%s%s:%s %s%s%s' "$ERC" "${1^^}" "$RST" "$GRN" "$2" "$RST"; }                               # etiqueta puerto
 
 # ---- Mensajes y entrada --------------------------------------------
 info() { printf '  %s%s%s  %s\n' "$ACC" "$ARW" "$RST" "$*"; }
@@ -263,11 +241,17 @@ pause() { local _; printf '\n'; read -rp "  ${DIM}${GRET} Presiona ENTER para co
 
 rd()  { local __p; printf -v __p '  %s%s%s %s' "$ACC" "$ARW" "$RST" "$1"; shift; read -rp "$__p" "$@"; }   # pregunta
 
-ask() {       # etiqueta variable -> pregunta de opción del menú (como "Seleccione una opción:")
+ask() {       # etiqueta variable -> línea roja + "Seleccione una Opción:" (naranja) con cursor verde
   local rc=0 __p
-  printf -v __p '\n  %s%sSeleccione una opción:%s %s' "$WRC" "$BOLD" "$RST" "$WH"
-  read -rp "$__p" "$2" || rc=1
-  printf '%s' "$RST"
+  hr
+  if [[ -t 1 ]]; then
+    printf '%s%sSeleccione una Opción:%s %s' "$ACC" "$BOLD" "$RST" "$WH"
+    read -r "$2" || rc=1
+    printf '%s' "$RST"
+  else
+    printf -v __p '%s: ' "$1"
+    read -rp "$__p" "$2" || rc=1
+  fi
   return $rc
 }
 
@@ -286,148 +270,22 @@ spin() {      # mensaje comando [args...]  -> ejecuta el comando mostrando un sp
   return $rc
 }
 
+title_line() { # nombre -> "NOMBRE · ADMINISTRADOR DE VPS · v2.1" centrado
+  local nm=${1:0:$(( UW - 8 ))} full=1 vis pad
+  nm=${nm^^}
+  vis="$nm $SEP ADMINISTRADOR DE VPS $SEP v$VERSION"
+  if (( ${#vis} > UW )); then full=0; vis="$nm $SEP v$VERSION"; fi
+  pad=$(( (UW - ${#vis}) / 2 )); (( pad < 0 )) && pad=0
+  printf '%*s%s%s%s%s' "$pad" '' "$ACC" "$BOLD" "$nm" "$RST"
+  (( full )) && printf ' %s%s%s %s%s%s' "$DG" "$SEP" "$RST" "$HI" "ADMINISTRADOR DE VPS" "$RST"
+  printf ' %s%s%s %sv%s%s\n' "$DG" "$SEP" "$RST" "$BLU" "$VERSION" "$RST"
+}
+
 sub_header() { # titulo de la pantalla
   local n; n=$(vps_name_shown)
   cls
-  echo
-  printf '%s%s%s%s %s%s%s %s%s%s %s%s%s%s\n' "$MG" "$ACC" "$GSTAR" "$RST" "$HI" "${n:-VPS PANEL}" "$RST" "$ACC" "$ARW" "$RST" "$OKC" "$BOLD" "$1" "$RST"
+  printf '%s%s%s%s %s%s%s %s%s%s\n' "$ACC" "$BOLD" "${n:-VPS PANEL}" "$RST" "$ERC" "$ARW" "$RST" "$HI" "$1" "$RST"
   hr
-  echo
-}
-
-# ---- Banner grande -------------------------------------------------
-# Fuente "ANSI Shadow": cada letra tiene 6 filas (separadas por |) y su propio ancho.
-declare -A SF=(
-  [A]=" █████╗ |██╔══██╗|███████║|██╔══██║|██║  ██║|╚═╝  ╚═╝"
-  [B]="██████╗ |██╔══██╗|██████╔╝|██╔══██╗|██████╔╝|╚═════╝ "
-  [C]=" ██████╗|██╔════╝|██║     |██║     |╚██████╗| ╚═════╝"
-  [D]="██████╗ |██╔══██╗|██║  ██║|██║  ██║|██████╔╝|╚═════╝ "
-  [E]="███████╗|██╔════╝|█████╗  |██╔══╝  |███████╗|╚══════╝"
-  [F]="███████╗|██╔════╝|█████╗  |██╔══╝  |██║     |╚═╝     "
-  [G]=" ██████╗ |██╔════╝ |██║  ███╗|██║   ██║|╚██████╔╝| ╚═════╝ "
-  [H]="██╗  ██╗|██║  ██║|███████║|██╔══██║|██║  ██║|╚═╝  ╚═╝"
-  [I]="██╗|██║|██║|██║|██║|╚═╝"
-  [J]="     ██╗|     ██║|     ██║|██   ██║|╚█████╔╝| ╚════╝ "
-  [K]="██╗  ██╗|██║ ██╔╝|█████╔╝ |██╔═██╗ |██║  ██╗|╚═╝  ╚═╝"
-  [L]="██╗     |██║     |██║     |██║     |███████╗|╚══════╝"
-  [M]="███╗   ███╗|████╗ ████║|██╔████╔██║|██║╚██╔╝██║|██║ ╚═╝ ██║|╚═╝     ╚═╝"
-  [N]="███╗   ██╗|████╗  ██║|██╔██╗ ██║|██║╚██╗██║|██║ ╚████║|╚═╝  ╚═══╝"
-  [O]=" ██████╗ |██╔═══██╗|██║   ██║|██║   ██║|╚██████╔╝| ╚═════╝ "
-  [P]="██████╗ |██╔══██╗|██████╔╝|██╔═══╝ |██║     |╚═╝     "
-  [Q]=" ██████╗ |██╔═══██╗|██║   ██║|██║▄▄ ██║|╚██████╔╝| ╚══▀▀═╝ "
-  [R]="██████╗ |██╔══██╗|██████╔╝|██╔══██╗|██║  ██║|╚═╝  ╚═╝"
-  [S]="███████╗|██╔════╝|███████╗|╚════██║|███████║|╚══════╝"
-  [T]="████████╗|╚══██╔══╝|   ██║   |   ██║   |   ██║   |   ╚═╝   "
-  [U]="██╗   ██╗|██║   ██║|██║   ██║|██║   ██║|╚██████╔╝| ╚═════╝ "
-  [V]="██╗   ██╗|██║   ██║|██║   ██║|╚██╗ ██╔╝| ╚████╔╝ |  ╚═══╝  "
-  [W]="██╗    ██╗|██║    ██║|██║ █╗ ██║|██║███╗██║|╚███╔███╔╝| ╚══╝╚══╝ "
-  [X]="██╗  ██╗|╚██╗██╔╝| ╚███╔╝ | ██╔██╗ |██╔╝ ██╗|╚═╝  ╚═╝"
-  [Y]="██╗   ██╗|╚██╗ ██╔╝| ╚████╔╝ |  ╚██╔╝  |   ██║   |   ╚═╝   "
-  [Z]="███████╗|╚══███╔╝|  ███╔╝ | ███╔╝  |███████╗|╚══════╝"
-  [0]=" ██████╗ |██╔═████╗|██║██╔██║|████╔╝██║|╚██████╔╝| ╚═════╝ "
-  [1]=" ██╗|███║|╚██║| ██║| ██║| ╚═╝"
-  [2]="██████╗ |╚════██╗| █████╔╝|██╔═══╝ |███████╗|╚══════╝"
-  [3]="██████╗ |╚════██╗| █████╔╝| ╚═══██╗|██████╔╝|╚═════╝ "
-  [4]="██╗  ██╗|██║  ██║|███████║|╚════██║|     ██║|     ╚═╝"
-  [5]="███████╗|██╔════╝|███████╗|╚════██║|███████║|╚══════╝"
-  [6]=" ██████╗ |██╔════╝ |███████╗ |██╔═══██╗|╚██████╔╝| ╚═════╝ "
-  [7]="███████╗|╚════██║|    ██╔╝|   ██╔╝ |   ██║  |   ╚═╝  "
-  [8]=" █████╗ |██╔══██╗|╚█████╔╝|██╔══██╗|╚█████╔╝| ╚════╝ "
-  [9]=" █████╗ |██╔══██╗|╚██████║| ╚═══██║| █████╔╝| ╚════╝ "
-  ["-"]="        |        |█████╗  |╚════╝  |        |        "
-  ["."]="    |    |    |    |██╗ |╚═╝ "
-  ["_"]="        |        |        |        |███████╗|╚══════╝"
-  ["?"]="██████╗ |╚════██╗|  ▄███╔╝|  ▀▀══╝ |  ██╗   |  ╚═╝   "
-)
-
-banner_glyph() {   # carácter -> GROWS[0..5] (rellenas al mismo ancho) y GW
-  local ch=$1 r w=0
-  IFS='|' read -ra GROWS <<< "${SF[$ch]:-${SF[?]}}"
-  for r in 0 1 2 3 4 5; do GROWS[r]=${GROWS[r]:-}; (( ${#GROWS[r]} > w )) && w=${#GROWS[r]}; done
-  for r in 0 1 2 3 4 5; do GROWS[r]+=$(rep ' ' $(( w - ${#GROWS[r]} ))); done
-  GW=$w
-}
-
-banner_width() {   # texto -> REPLY = ancho en columnas
-  local t=${1^^} i x=0
-  for (( i=0; i<${#t}; i++ )); do
-    if [[ ${t:i:1} == ' ' ]]; then x=$(( x + 3 )); else banner_glyph "${t:i:1}"; x=$(( x + GW )); fi
-  done
-  REPLY=$x
-}
-
-banner_split() {   # texto -> BL[] con 1 o 2 líneas; devuelve 1 si no cabe
-  local t=$1 best=-1 bm=9999 i m w1 w2
-  BL=()
-  banner_width "$t"
-  if (( REPLY <= BW )); then BL=("$t"); return 0; fi
-  for (( i=1; i<${#t}-1; i++ )); do
-    [[ ${t:i:1} == ' ' ]] || continue
-    banner_width "${t:0:i}"; w1=$REPLY
-    banner_width "${t:i+1}"; w2=$REPLY
-    (( w1 <= BW && w2 <= BW )) || continue
-    m=$(( w1 > w2 ? w1 : w2 ))
-    if (( m < bm )); then bm=$m; best=$i; fi
-  done
-  (( best < 0 )) && return 1
-  BL=("${t:0:best}" "${t:best+1}")
-  return 0
-}
-
-banner_big() {     # una línea de texto en letras grandes: degradado por filas y sombra gris
-  local t=${1^^} i ch r c cw pad line prev col
-  local -a rows=('' '' '' '' '' '')
-  for (( i=0; i<${#t}; i++ )); do
-    ch=${t:i:1}
-    if [[ $ch == ' ' ]]; then
-      for r in 0 1 2 3 4 5; do rows[r]+='   '; done
-    else
-      banner_glyph "$ch"
-      for r in 0 1 2 3 4 5; do rows[r]+=${GROWS[r]}; done
-    fi
-  done
-  cw=${#rows[0]}
-  pad=$(( (UW - cw) / 2 )); (( pad < 0 )) && pad=0
-  for r in 0 1 2 3 4 5; do
-    printf -v line '%*s' "$pad" ''
-    prev=''
-    for (( c=0; c<cw; c++ )); do
-      ch=${rows[r]:c:1}
-      if [[ $ch == ' ' ]]; then
-        line+=' '
-      else
-        if [[ -z $RST ]]; then col=''
-        else
-          case $ch in
-            ╔|╗|╚|╝|║|═) col=$SHC ;;
-            *)           col=${ROWC[r]} ;;
-          esac
-        fi
-        if [[ $col != "$prev" ]]; then line+=$col; prev=$col; fi
-        line+=$ch
-      fi
-    done
-    printf '%s%s\n' "$line" "$RST"
-  done
-}
-
-banner_compact() { # nombre demasiado largo para las letras grandes: una línea espaciada
-  local t=${1^^} s="" i n pad
-  (( ${#t} > UW / 2 - 1 )) && t=${t:0:$(( UW / 2 - 1 ))}
-  n=${#t}
-  mk_grad "$n"
-  for (( i=0; i<n; i++ )); do s+="${BOLD}${GC[i]}${t:i:1} "; done
-  pad=$(( (UW - (2 * n - 1)) / 2 )); (( pad < 0 )) && pad=0
-  printf '%*s%s%s\n' "$pad" '' "$s" "$RST"
-}
-
-banner_print() {   # nombre
-  local l
-  if (( UTF )) && banner_split "$1"; then
-    for l in "${BL[@]}"; do banner_big "$l"; done
-  else
-    banner_compact "$1"
-  fi
 }
 
 # ------------------------------ Utilidades ----------------------------
@@ -962,10 +820,10 @@ pick_account() {   # archivo
   done < "$db"
   if (( ${#names[@]} == 0 )); then warn "No hay cuentas creadas"; return 1; fi
   printf '  %s%-4s %-16s %s%s\n' "$HI" '#' USUARIO EXPIRA "$RST"
-  printf '  %s%s%s\n' "$DG" "$(rep "$GH" $(( UW - 4 )))" "$RST"
+  printf '  %s%s%s\n' "$DIM" "$(rep "$GH" $(( UW - 4 )))" "$RST"
   for (( i=0; i<${#names[@]}; i++ )); do
     if [[ ${exps[i]} < $today ]]; then col=$ERC; tag='  vencida'; else col=$TXT; tag=''; fi
-    printf '  %s%-4s%s %s%-16s %s%s%s\n' "$OKC$BOLD" "$(( i + 1 ))" "$RST" "$col" "${names[i]}" "${exps[i]}" "$tag" "$RST"
+    printf '  %s%-4s%s %s%-16s %s%s%s\n' "$ACC$BOLD" "$(( i + 1 ))" "$RST" "$col" "${names[i]}" "${exps[i]}" "$tag" "$RST"
   done
   printf '\n  %sTotal: %d   (en rojo: vencidas)%s\n\n' "$DIM" "${#names[@]}" "$RST"
   rd "Número o nombre (0 = cancelar): " sel || return 3
@@ -1110,9 +968,9 @@ cfg_banner() {
     info "Banner ${DIM}DESACTIVADO${RST}: al conectar no se muestra ningún banner."
   fi
   echo
-  box_row "$(mcell 01 'Escribir o cambiar el banner (lo activa)')"
-  box_row "$(mcell 02 'Desactivar el banner')"
-  box_row "$(mcell 00 'Volver')"
+  box_row "$(mcell 1 'Escribir o cambiar el banner (lo activa)')"
+  box_row "$(mcell 2 'Desactivar el banner')"
+  box_row "$(mcell 0 'Volver')"
   echo
   ask Opción o || return 3
   [[ $o =~ ^[0-9]+$ ]] && o=$(( 10#$o ))
@@ -1321,10 +1179,7 @@ name_check() {   # nombre -> 0 si sirve; si no, deja el motivo en MSG
   local t=$1 re='^[A-Za-z0-9._ -]+$'
   if [[ -z $t ]]; then MSG="Escribe un nombre."; return 1; fi
   if ! [[ $t =~ $re ]]; then MSG="Usa solo letras, números, espacio, punto, guion y guion bajo."; return 1; fi
-  if ! banner_split "$t"; then
-    MSG="No cabe en el banner. Máximo $(( BW / 9 )) letras, o dos palabras de ese largo."
-    return 1
-  fi
+  if (( ${#t} > 24 )); then MSG="Es muy largo. Máximo 24 caracteres."; return 1; fi
   return 0
 }
 
@@ -1334,19 +1189,20 @@ register_vps() {
   while :; do
     sub_header "REGISTRO DE VPS"
     if (( first )); then
-      printf '  %sRegistra este servidor: su nombre aparecerá como banner del panel.%s\n' "$DIM" "$RST"
+      printf '  %sRegistra este servidor: su nombre aparecerá en el título del panel.%s\n' "$DIM" "$RST"
     else
       printf '  %sNombre actual: %s  (ENTER para conservarlo)%s\n' "$DIM" "$cur" "$RST"
     fi
-    printf '  %sMáximo %d letras, o dos palabras de ese largo.%s\n\n' "$DIM" "$(( BW / 9 ))" "$RST"
+    printf '  %sMáximo 24 caracteres.%s\n\n' "$DIM" "$RST"
     rd "Nombre del VPS: " name || { err "No hay entrada disponible"; return 1; }
     read -ra w <<< "$name"; name="${w[*]:-}"            # quita espacios sobrantes
     if [[ -z $name && -n $cur ]]; then return 0; fi
     if ! name_check "$name"; then
       warn "$MSG"; sleep 2; continue
     fi
-    cls; echo
-    banner_print "$name"
+    cls
+    title_line "$name"
+    hr
     echo
     rd "¿Confirmar este nombre? [S/n]: " ans || return 1
     [[ $ans == [nN]* ]] && continue
@@ -1457,7 +1313,7 @@ install_all() {
   if [[ -z ${INSTALL_AUTO:-} && -t 0 ]]; then
     show_ports_plan
     while :; do
-      printf '\n  %sENTER%s instalar ahora   %sP%s cambiar puertos   %s0%s cancelar\n' "$OKC" "$RST" "$OKC" "$RST" "$OKC" "$RST"
+      printf '\n  %sENTER%s instalar ahora   %sP%s cambiar puertos   %s0%s cancelar\n' "$ACC" "$RST" "$ACC" "$RST" "$ACC" "$RST"
       rd "Opción: " a || return 1
       case ${a,,} in
         "") break ;;
@@ -1480,8 +1336,7 @@ install_all() {
 
 # --------------------------- Cuentas SSH / Dropbear -------------------
 show_ssh_info() { # usuario clave expira limite
-  local h; h=$(get_host); h=${h:0:$(( IW - 10 ))}
-  echo
+  local h; h=$(get_host); h=${h:0:$(( IW - 9 ))}
   box_top "CUENTA SSH"
   box_row "$(kv Host "$h")"
   box_row "$(kv Usuario "$1")"
@@ -1501,7 +1356,7 @@ ssh_list() {
   local u p e l n=0 today col
   today=$(date +%F)
   printf '  %s%-16s %-12s %-11s %s%s\n' "$HI" USUARIO CLAVE EXPIRA LIM "$RST"
-  printf '  %s%s%s\n' "$DG" "$(rep "$GH" $(( UW - 4 )))" "$RST"
+  printf '  %s%s%s\n' "$DIM" "$(rep "$GH" $(( UW - 4 )))" "$RST"
   while IFS='|' read -r u p e l; do
     [[ -n $u ]] || continue
     if [[ $e < $today ]]; then col=$ERC; else col=$TXT; fi
@@ -1515,7 +1370,7 @@ ssh_list() {
 ssh_online() {
   local u p e l n tot=0
   printf '  %s%-16s %s%s\n' "$HI" USUARIO CONEXIONES "$RST"
-  printf '  %s%s%s\n' "$DG" "$(rep "$GH" $(( UW - 4 )))" "$RST"
+  printf '  %s%s%s\n' "$DIM" "$(rep "$GH" $(( UW - 4 )))" "$RST"
   while IFS='|' read -r u p e l; do
     [[ -n $u ]] || continue
     n=$(ps -u "$u" -o comm= 2>/dev/null | grep -cE '^(sshd|dropbear)$')
@@ -1531,10 +1386,10 @@ menu_ssh() {
     n=$(grep -c . "$USERDB" 2>/dev/null); n=${n:-0}
     sub_header "CUENTAS SSH / DROPBEAR"
     box_top "ACCIONES  ($n cuentas)"
-    grid col "$(mcell 01 'Crear cuenta')" "$(mcell 02 'Eliminar cuenta')" \
-             "$(mcell 03 'Renovar cuenta')" "$(mcell 04 'Cambiar clave')" \
-             "$(mcell 05 'Listar cuentas')" "$(mcell 06 'Conectados')" \
-             "$(mcell 07 'Limpiar vencidas')" "$(mcell 00 'Volver')"
+    grid col "$(mcell 1 'Crear cuenta')" "$(mcell 2 'Eliminar cuenta')" \
+             "$(mcell 3 'Renovar cuenta')" "$(mcell 4 'Cambiar clave')" \
+             "$(mcell 5 'Listar cuentas')" "$(mcell 6 'Conectados')" \
+             "$(mcell 7 'Limpiar vencidas')" "$(mcell 0 'Volver')"
     box_bottom
     ask Opción o || return
     [[ $o =~ ^[0-9]+$ ]] && o=$(( 10#$o ))
@@ -1599,9 +1454,9 @@ menu_v2() {
     n=$(grep -c . "$V2DB" 2>/dev/null); n=${n:-0}
     sub_header "CUENTAS V2RAY"
     box_top "ACCIONES  ($n cuentas)"
-    grid col "$(mcell 01 'Crear cuenta')" "$(mcell 02 'Eliminar cuenta')" \
-             "$(mcell 03 'Renovar cuenta')" "$(mcell 04 'Listar / enlaces')" \
-             "$(mcell 00 'Volver')"
+    grid col "$(mcell 1 'Crear cuenta')" "$(mcell 2 'Eliminar cuenta')" \
+             "$(mcell 3 'Renovar cuenta')" "$(mcell 4 'Listar / enlaces')" \
+             "$(mcell 0 'Volver')"
     box_bottom
     ask Opción o || return
     [[ $o =~ ^[0-9]+$ ]] && o=$(( 10#$o ))
@@ -1794,9 +1649,9 @@ proto_menu() {   # clave nombre
     box_bottom
     box_top "ACCIONES"
     case $k in
-      v2ray)   grid col "$(mcell 01 "$lbl")" "$(mcell 02 'Cambiar puerto')" "$(mcell 03 'Cambiar path')" "$(mcell 00 Volver)" ;;
-      slowdns) grid col "$(mcell 01 "$lbl")" "$(mcell 02 'Cambiar puerto')" "$(mcell 03 'Cambiar NameServer')" "$(mcell 00 Volver)" ;;
-      *)       grid col "$(mcell 01 "$lbl")" "$(mcell 02 'Cambiar puerto')" "$(mcell 00 Volver)" ;;
+      v2ray)   grid col "$(mcell 1 "$lbl")" "$(mcell 2 'Cambiar puerto')" "$(mcell 3 'Cambiar path')" "$(mcell 0 Volver)" ;;
+      slowdns) grid col "$(mcell 1 "$lbl")" "$(mcell 2 'Cambiar puerto')" "$(mcell 3 'Cambiar NameServer')" "$(mcell 0 Volver)" ;;
+      *)       grid col "$(mcell 1 "$lbl")" "$(mcell 2 'Cambiar puerto')" "$(mcell 0 Volver)" ;;
     esac
     box_bottom
     ask Opción o || return
@@ -1819,7 +1674,7 @@ menu_protocols() {
     cells=()
     for i in "${!PROTO_KEYS[@]}"; do
       k=${PROTO_KEYS[i]}
-      if is_on "$k"; then stt="${OKC}${GDOT}${RST}"; else stt="${ERC}${GRING}${RST}"; fi
+      if is_on "$k"; then stt="${OKC}${GDOT} ON ${RST}"; else stt="${ERC}${GRING} OFF${RST}"; fi
       prt=''; [[ -n ${PVAR[$k]:-} ]] && prt=":$(pget "$k")"
       cells+=( "$(mcell "$(printf '%02d' $(( i + 1 )))" "$(printf '%-10s %s %s%s%s' "${PROTO_NAMES[i]}" "$stt" "$DIM" "$prt" "$RST")")" )
     done
@@ -1832,7 +1687,8 @@ menu_protocols() {
     box_row "$(mcell 12 'Restaurar puertos por defecto')"
     box_row "$(mcell 00 Volver)"
     box_bottom
-    box_row "${OKC}${GDOT}${RST} activo   ${ERC}${GRING}${RST} detenido     ${DIM}Elige un número de la lista.${RST}"
+    box_row "${DIM}Elige un protocolo para activarlo, detenerlo o personalizarlo.${RST}"
+    echo
     ask Opción n || return
     [[ $n =~ ^[0-9]+$ ]] && n=$(( 10#$n ))
     case $n in
@@ -1856,10 +1712,10 @@ menu_view() {   # mostrar u ocultar: nombre, servidor y servicios de la pantalla
   while :; do
     sub_header "VISTA DEL PANEL"
     box_top "PANTALLA PRINCIPAL"
-    grid col "$(mcell 01 'Nombre') $(view_state name)" \
-             "$(mcell 02 'Servidor') $(view_state server)" \
-             "$(mcell 03 'Servicios') $(view_state services)" \
-             "$(mcell 00 'Volver')"
+    grid col "$(mcell 1 'Nombre') $(view_state name)" \
+             "$(mcell 2 'Servidor') $(view_state server)" \
+             "$(mcell 3 'Servicios') $(view_state services)" \
+             "$(mcell 0 'Volver')"
     box_bottom
     ask Opción o || return
     [[ $o =~ ^[0-9]+$ ]] && o=$(( 10#$o ))
@@ -1911,61 +1767,49 @@ menu_tools() {
 fmt_mb() { local m=$1; if (( m >= 1024 )); then printf '%d.%dG' $(( m / 1024 )) $(( (m % 1024) * 10 / 1024 )); else printf '%dM' "$m"; fi; }
 
 sys_stats() {
-  local l1 n mt mu dt du up d h m
+  local l1 n mt mu ma dt du up d h m
   read -r l1 _ < /proc/loadavg
   n=$(nproc 2>/dev/null || echo 1)
+  CPU_N=$n; CPU_L=$l1
   CPU_P=$(awk -v l="$l1" -v n="$n" 'BEGIN{p=l/n*100; if(p>100)p=100; printf "%d", p}')
-  CPU_X="carga $l1"; CPU_N=$n; CPU_L=$l1
-  read -r mt mu < <(free -m | awk '/^Mem:/{print $2, $3}')
-  mt=${mt:-0}; mu=${mu:-0}
+  read -r mt mu ma < <(free -m | awk '/^Mem:/{print $2, $3, ($7 != "" ? $7 : $4)}')
+  mt=${mt:-0}; mu=${mu:-0}; ma=${ma:-0}
+  RAM_T=$(fmt_mb "$mt"); RAM_U=$(fmt_mb "$mu"); RAM_F=$(fmt_mb "$ma")
   RAM_P=$(( mt > 0 ? mu * 100 / mt : 0 ))
-  RAM_X="$(fmt_mb "$mu")/$(fmt_mb "$mt")"
-  RAM_T=$(fmt_mb "$mt"); RAM_U=$(fmt_mb "$mu"); RAM_F=$(fmt_mb $(( mt > mu ? mt - mu : 0 )))
   read -r dt du < <(df -Pm / | awk 'NR==2{print $2, $3}')
   dt=${dt:-0}; du=${du:-0}
-  DSK_P=$(( dt > 0 ? du * 100 / dt : 0 ))
   DSK_X="$(fmt_mb "$du")/$(fmt_mb "$dt")"
   up=$(cut -d. -f1 /proc/uptime); d=$(( up / 86400 )); h=$(( up % 86400 / 3600 )); m=$(( up % 3600 / 60 ))
   if (( d > 0 )); then UPT="${d}d ${h}h ${m}m"; else UPT="${h}h ${m}m"; fi
 }
 
-pct_color() { if (( $1 >= 85 )); then printf '%s' "$ERC"; else printf '%s' "$OKC"; fi; }   # verde; rojo desde 85%
+gt()   { printf '%s%s%s%s' "$GRN" "$BOLD" "$1" "$RST"; }                                           # título de columna (verde)
+vlft() { printf '%s%s:%s %s%s%s' "$BLU" "$1" "$RST" "${3:-$HI}" "$2" "$RST"; }                    # ETIQUETA: valor
+vrow() { local gap=$(( $3 - ${#1} - 1 - ${#2} )); (( gap < 1 )) && gap=1                            # ETIQUETA:      valor (alineado a la derecha)
+         printf '%s%s:%s%*s%s%s%s' "$BLU" "$1" "$RST" "$gap" '' "${4:-$GRN}" "$2" "$RST"; }
+pcol() { if (( $1 >= 85 )); then printf '%s' "$ERC"; else printf '%s' "$GRN"; fi; }               # verde; rojo desde 85%
 
-lv() {   # etiqueta valor [color del valor] [ancho de la etiqueta]   ->  "RAM:   3.8G"
-  printf '%s%-*s%s %s%s%s' "$BLC$BOLD" "${4:-6}" "$1" "$RST" "${3:-$HI}" "$2" "$RST"
+pitem() {      # etiqueta puerto clave   (usa ON[] calculado en header)
+  local pc=$DG
+  [[ -n ${ON[$3]:-} ]] && pc=$GRN
+  printf '%s%s:%s %s%s%s' "$ERC" "$1" "$RST" "$pc" "$2" "$RST"
 }
 
-row3() {   # col1 col2 col3 ancho1 ancho2   (una fila de tres columnas)
-  local a b
-  vlen_set "$1"; a=$(( $4 - VL )); (( a < 1 )) && a=1
-  vlen_set "$2"; b=$(( $5 - VL )); (( b < 1 )) && b=1
-  box_row "$1$(rep ' ' "$a")$2$(rep ' ' "$b")$3"
+mi() {         # número texto [hl]  ->  [N] > TEXTO
+  local l=$2
+  if [[ ${3:-} == hl ]]; then l="${BGG}${HI}${l}${RST}"; else l="${HI}${l}${RST}"; fi
+  printf '%s[%s]%s %s%s%s %s\n' "$GRN" "$1" "$RST" "$ERC" "$ARW" "$RST" "$l"
 }
 
-svc_cell() {   # clave etiqueta puerto   (usa ON[] calculado en header)
-  local dot dc nc pc
-  if [[ -n ${ON[$1]:-} ]]; then dot=$GDOT; dc=$OKC; nc=$HI; pc=$OKC; else dot=$GRING; dc=$ERC; nc=$ERC; pc=$ERC; fi
-  printf '%s%s%s %s%-11s%s %s%-5.5s%s' "$dc" "$dot" "$RST" "$nc" "$2:" "$RST" "$pc" "$3" "$RST"
-}
-
-mitem() {      # número etiqueta "descripción larga|corta" [peligro|suave]
-  local nc=$OKC$BOLD lc=$HI dw=$(( TW - 22 )) d=${3%%|*} sh=${3##*|}
-  case ${4:-} in
-    peligro) nc=$ERC$BOLD; lc=$ERC$BOLD ;;
-    suave)   nc=$ERC$BOLD; lc=$HI ;;
-  esac
-  if (( ${#d} > dw )); then d=$sh; fi
-  (( dw < 29 )) && d=''     # sin espacio para todas las descripciones: ninguna
-  printf '%s[%s]%s %s>%s %s%-15s%s' "$nc" "$1" "$RST" "$ERC$BOLD" "$RST" "$lc" "$2" "$RST"
-  [[ -n $d ]] && printf ' %s%s%s' "$WH" "$d" "$RST"
-  return 0
+btn() {        # número texto fondo  ->  N) TEXTO (botón con fondo de color)
+  printf '%s%s)%s %s%s%s%s' "$GRN" "$1" "$RST" "$3" "$HI" "$2" "$RST"
 }
 
 header() {
-  local name reg sub sp k on=0 now dt sc i x t1 t2 t3 os
+  local name reg k on=0 now i nm os dt
   local -A ON=()
-  local -a c1 c2 c3
-  local h_name=0 h_srv=0 h_svc=0
+  local -a C1 C2 C3 cells
+  local h_name=0 h_srv=0 h_svc=0 sep=0
   is_hidden name && h_name=1
   is_hidden server && h_srv=1
   is_hidden services && h_svc=1
@@ -1978,71 +1822,69 @@ header() {
   (( h_srv )) || sys_stats
   now=$(date +%H:%M:%S); dt=$(date +%d/%m/%y)
   cls
-  echo
+
+  # --- Título (se oculta en Herramientas > Vista del panel > Nombre) ---
   if (( ! h_name )); then
-    banner_print "${name:-VPS PANEL}"
-    echo
+    title_line "${name:-VPS PANEL}"
+    sep=1
   fi
-  sub="$GSTAR ADMINISTRADOR DE VPS $SEP v$VERSION"
-  sp=$(( (UW - ${#sub}) / 2 )); (( sp < 1 )) && sp=1
-  printf '%*s%s%s%s %s%s%s %s%s%s %sv%s%s\n' "$sp" '' "$ACC" "$GSTAR" "$RST" "$HI" "ADMINISTRADOR DE VPS" "$RST" "$DG" "$SEP" "$RST" "$WH" "$VERSION" "$RST"
-  hr
 
+  # --- SISTEMA / MEMORIA / PROCESADOR ---
   if (( ! h_srv )); then
-    sec_start
-    t1="${OKC}${BOLD}SISTEMA${RST}"; t2="${OKC}${BOLD}MEMORIA${RST}"; t3="${OKC}${BOLD}PROCESADOR${RST}"
-    os=${OS_NAME/ GNU\/Linux/}; os=${os%% \(*}     # "Debian GNU/Linux 12 (bookworm)" -> "Debian 12"
-    c1=("$(lv 'S.O.:' "${os:0:$(( NC == 3 ? 18 : TW - 8 ))}")" "$(lv 'IP:' "$IP" "$IPC")" \
-        "$(lv 'FECHA:' "$dt")" "$(lv 'HORA:' "$now")")
-    c2=("$(lv 'RAM:' "$RAM_T" "$OKC")" "$(lv 'USADA:' "$RAM_U" "$OKC")" "$(lv 'LIBRE:' "$RAM_F" "$OKC")" \
-        "$(lv 'USO:' "${RAM_P}%" "$(pct_color "$RAM_P")")")
-    c3=("$(lv 'CPU:' "$CPU_N")" "$(lv 'USO:' "${CPU_P}%" "$(pct_color "$CPU_P")")" \
-        "$(lv 'CARGA:' "$CPU_L")" "$(lv 'DISCO:' "${DSK_X:0:12}" "$(pct_color "$DSK_P")")")
-    if (( NC == 3 )); then
-      row3 "$t1" "$t2" "$t3" 27 14
-      for i in 0 1 2 3; do row3 "${c1[i]}" "${c2[i]}" "${c3[i]}" 27 14; done
-    else
-      box_row "$t1"; for x in "${c1[@]}"; do box_row "$x"; done
-      box_row "$t2"; for x in "${c2[@]}"; do box_row "$x"; done
-      box_row "$t3"; for x in "${c3[@]}"; do box_row "$x"; done
-    fi
-    box_row "$(lv 'ACTIVO:' "$UPT" "$HI" 0)   $(lv 'REGISTRO:' "${reg:--}" "$HI" 0)"
-    box_bottom
+    (( sep )) && hr; sep=1
+    os=${OS_NAME% LTS}; os=${os/ GNU\/Linux/}; os=${os%% \(*}; os=${os:0:15}
+    C1=( "$(gt SISTEMA)" "$(vlft S.O. "$os")" "$(vlft IP "$IP" "$IPC")" "$(vlft FECHA "$dt")" "$(vlft HORA "$now")" )
+    C2=( "$(gt MEMORIA)" "$(vrow RAM "$RAM_T" 14)" "$(vrow USADA "$RAM_U" 14)" "$(vrow LIBRE "$RAM_F" 14)" "$(vrow 'EN USO' "$RAM_P%" 14 "$(pcol "$RAM_P")")" )
+    C3=( "$(gt PROCESADOR)" "$(vrow CPU "$CPU_N" 18)" "$(vrow 'EN USO' "$CPU_P%" 18 "$(pcol "$CPU_P")")" "$(vrow CARGA "$CPU_L" 18)" "$(vrow DISCO "$DSK_X" 18)" )
+    for i in 0 1 2 3 4; do
+      if (( UW >= 56 )); then
+        printf '%s%s%s\n' "$(padto "${C1[i]}" 22)" "$(padto "${C2[i]}" 16)" "${C3[i]}"
+      else
+        printf '%s%s\n' "$(padto "${C1[i]}" 22)" "${C2[i]}"
+      fi
+    done
+    if (( UW < 56 )); then for i in 0 1 2 3 4; do printf '%s\n' "${C3[i]}"; done; fi
+    printf '%s   %s\n' "$(vlft ACTIVO "$UPT")" "$(vlft REGISTRO "${reg:--}")"
   fi
 
+  # --- Puertos (rojo = servicio, verde = activo, gris = apagado) ---
   if (( ! h_svc )); then
-    if (( on > 0 )); then sc=$OKC; else sc=$ERC; fi
-    box_top "SERVICIOS" "$on/11 activos" "$sc"
-    grid col "$(svc_cell ssh SSH "$SSH_PORT")"            "$(svc_cell dropbear DROPBEAR "$PORT_DROPBEAR")" \
-             "$(svc_cell ssl SSL "$PORT_SSL")"            "$(svc_cell ws WEBSOCKET "$PORT_WS")" \
-             "$(svc_cell squid SQUID "$PORT_SQUID")"      "$(svc_cell v2ray V2RAY "$PORT_V2RAY")" \
-             "$(svc_cell badvpn BADVPN "$PORT_BADVPN")"   "$(svc_cell udp 'UDP CUSTOM' "$PORT_UDP")" \
-             "$(svc_cell slowdns SLOWDNS "$PORT_SLOWDNS")" "$(svc_cell openvpn OPENVPN -)" \
-             "$(svc_cell wireguard WIREGUARD -)"
-    box_bottom
+    (( sep )) && hr; sep=1
+    cells=( "$(pitem SSH "$SSH_PORT" ssh)"         "$(pitem DROPBEAR "$PORT_DROPBEAR" dropbear)" \
+            "$(pitem SSL "$PORT_SSL" ssl)"         "$(pitem WEBSOCKET "$PORT_WS" ws)" \
+            "$(pitem SQUID "$PORT_SQUID" squid)"   "$(pitem V2RAY "$PORT_V2RAY" v2ray)" \
+            "$(pitem BADVPN "$PORT_BADVPN" badvpn)" "$(pitem UDPCUSTOM "$PORT_UDP" udp)" \
+            "$(pitem SLOWDNS "$PORT_SLOWDNS" slowdns)" )
+    [[ -n ${ON[openvpn]:-} ]]   && cells+=( "$(pitem OPENVPN - openvpn)" )
+    [[ -n ${ON[wireguard]:-} ]] && cells+=( "$(pitem WIREGUARD - wireguard)" )
+    for (( i=0; i<${#cells[@]}; i+=2 )); do
+      printf '%s%s\n' "$(padto "${cells[i]}" 20)" "${cells[i+1]:-}"
+    done
   fi
 
-  box_top "MENÚ"
-  box_row "$(mitem 1 'Cuentas SSH'   'crear, renovar y eliminar usuarios|crear, renovar, eliminar')"
-  box_row "$(mitem 2 'Cuentas V2Ray' 'administrar usuarios V2Ray')"
-  hrt
-  box_row "$(mitem 3 'Protocolos'    'instalar, estado y puertos')"
-  box_row "$(mitem 4 'Herramientas'  'BBR, swap, DNS, dominio y más')"
-  box_row "$(mitem 5 'Instalar todo' 'instalar todos los protocolos')"
-  hrt
-  box_row "$(mitem 6 'Desinstalar'   'eliminar el panel y sus servicios|eliminar panel y servicios' peligro)"
-  box_row "$(mitem 7 'Reiniciar VPS' 'reiniciar el servidor')"
-  box_row "$(mitem 0 'Salir'         'cerrar el panel' suave)"
-  box_bottom
+  # --- Menú ---
+  (( sep )) && hr
+  mi 1 'ADMINISTRAR CUENTAS (SSH)'
+  mi 2 'ADMINISTRAR CUENTAS (V2RAY)'
+  hrd
+  mi 3 'PROTOCOLOS (INSTALAR/PUERTOS)' hl
+  hrd
+  mi 4 'HERRAMIENTAS (BBR/SWAP/DNS)'
+  hrd
+  mi 5 'INSTALAR TODOS LOS PROTOCOLOS'
+  hr
+  if (( UW >= 52 )); then
+    printf '%s  %s  %s\n' "$(btn 0 'SALIR DEL PANEL' "$BGG")" "$(btn 6 'DESINSTALAR PANEL' "$BGR")" "$(btn 7 'REBOOT VPS' "$BGB")"
+  else
+    printf '%s  %s  %s\n' "$(btn 0 'SALIR' "$BGG")" "$(btn 6 'DESINSTALAR' "$BGR")" "$(btn 7 'REBOOT' "$BGB")"
+  fi
 }
 
 main_menu() {
   local o c
   while :; do
     header
-    ASK_HINT=salir
     ask Opción o || exit 0
-    ASK_HINT=volver
     [[ $o =~ ^[0-9]+$ ]] && o=$(( 10#$o ))
     case $o in
       1) menu_ssh ;;
