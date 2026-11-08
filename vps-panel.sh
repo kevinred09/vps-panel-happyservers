@@ -111,11 +111,11 @@ init_ui() {
   (( cols < 40 )) && cols=40
   UW=$cols                 # ancho total de la interfaz
   BW=$(( UW - 2 ))         # ancho de cada marco (1 espacio de margen a la izquierda)
-  IW=$(( BW - 4 ))         # ancho útil dentro de un marco
+  IW=$(( BW - 5 ))         # ancho útil dentro de un marco (2 espacios a la izquierda)
   if (( UW >= 52 )); then TWO=1; else TWO=0; fi   # dos columnas solo si hay espacio
 
   if [[ ( -t 1 || -n ${VPSPANEL_COLOR:-} ) && -z ${NO_COLOR:-} && ${TERM:-dumb} != dumb ]]; then
-    RST=$'\e[0m';           BOLD=$'\e[1m'
+    RST=$'\e[0m\e[38;5;252m'; BOLD=$'\e[1m'
     ACC=$'\e[38;5;45m';     ACC2=$'\e[38;5;141m'
     HI=$'\e[1;38;5;255m';   TXT=$'\e[38;5;252m';  DIM=$'\e[38;5;245m'
     OKC=$'\e[38;5;87m';      ERC=$'\e[38;5;203m';  WRC=$'\e[38;5;221m'
@@ -157,7 +157,7 @@ gradient_bar() {
   printf '%s%s\n' "$s" "$RST"
 }
 
-cls() { [[ -t 1 ]] && printf '\e[H\e[2J\e[3J'; return 0; }
+cls() { [[ -t 1 ]] && printf '\e[H\e[2J\e[3J%s' "$TXT"; return 0; }
 
 # ---- Marcos --------------------------------------------------------
 box_top() {   # titulo
@@ -169,8 +169,8 @@ box_top() {   # titulo
 
 box_row() {   # texto (puede llevar colores)
   local t=$1 pad
-  vlen_set "$t"; pad=$(( BW - 4 - VL )); (( pad < 0 )) && pad=0
-  printf ' %s%s%s %s%*s %s%s%s\n' "$BRD" "$GV" "$RST" "$t" "$pad" '' "$BRD" "$GV" "$RST"
+  vlen_set "$t"; pad=$(( IW - VL )); (( pad < 0 )) && pad=0
+  printf ' %s%s%s  %s%*s %s%s%s\n' "$BRD" "$GV" "$RST" "$t" "$pad" '' "$BRD" "$GV" "$RST"
 }
 
 box_bottom() { printf ' %s%s%s%s%s\n' "$BRD" "$GBL" "$(rep "$GH" $(( BW - 2 )))" "$GBR" "$RST"; }
@@ -252,34 +252,62 @@ sub_header() { # titulo de la pantalla
 }
 
 # ---- Banner grande -------------------------------------------------
-# Fuente de 5x5; cada letra ocupa 6 columnas (5 + separación), el espacio 3.
-declare -A FONT=(
-  [A]="01110 10001 11111 10001 10001"  [B]="11110 10001 11110 10001 11110"
-  [C]="01111 10000 10000 10000 01111"  [D]="11110 10001 10001 10001 11110"
-  [E]="11111 10000 11110 10000 11111"  [F]="11111 10000 11110 10000 10000"
-  [G]="01111 10000 10011 10001 01111"  [H]="10001 10001 11111 10001 10001"
-  [I]="11111 00100 00100 00100 11111"  [J]="00111 00010 00010 10010 01100"
-  [K]="10001 10010 11100 10010 10001"  [L]="10000 10000 10000 10000 11111"
-  [M]="10001 11011 10101 10001 10001"  [N]="10001 11001 10101 10011 10001"
-  [O]="01110 10001 10001 10001 01110"  [P]="11110 10001 11110 10000 10000"
-  [Q]="01110 10001 10101 10010 01101"  [R]="11110 10001 11110 10010 10001"
-  [S]="01111 10000 01110 00001 11110"  [T]="11111 00100 00100 00100 00100"
-  [U]="10001 10001 10001 10001 01110"  [V]="10001 10001 10001 01010 00100"
-  [W]="10001 10001 10101 11011 10001"  [X]="10001 01010 00100 01010 10001"
-  [Y]="10001 01010 00100 00100 00100"  [Z]="11111 00010 00100 01000 11111"
-  [0]="01110 10011 10101 11001 01110"  [1]="00100 01100 00100 00100 01110"
-  [2]="01110 10001 00010 00100 11111"  [3]="11110 00001 01110 00001 11110"
-  [4]="10010 10010 11111 00010 00010"  [5]="11111 10000 11110 00001 11110"
-  [6]="01110 10000 11110 10001 01110"  [7]="11111 00001 00010 00100 00100"
-  [8]="01110 10001 01110 10001 01110"  [9]="01110 10001 01111 00001 01110"
-  ["-"]="00000 00000 01110 00000 00000" ["_"]="00000 00000 00000 00000 11111"
-  ["."]="00000 00000 00000 00000 00100" ["?"]="01110 10001 00110 00000 00100"
+# Fuente "ANSI Shadow": cada letra tiene 6 filas (separadas por |) y su propio ancho.
+declare -A SF=(
+  [A]=" █████╗ |██╔══██╗|███████║|██╔══██║|██║  ██║|╚═╝  ╚═╝"
+  [B]="██████╗ |██╔══██╗|██████╔╝|██╔══██╗|██████╔╝|╚═════╝ "
+  [C]=" ██████╗|██╔════╝|██║     |██║     |╚██████╗| ╚═════╝"
+  [D]="██████╗ |██╔══██╗|██║  ██║|██║  ██║|██████╔╝|╚═════╝ "
+  [E]="███████╗|██╔════╝|█████╗  |██╔══╝  |███████╗|╚══════╝"
+  [F]="███████╗|██╔════╝|█████╗  |██╔══╝  |██║     |╚═╝     "
+  [G]=" ██████╗ |██╔════╝ |██║  ███╗|██║   ██║|╚██████╔╝| ╚═════╝ "
+  [H]="██╗  ██╗|██║  ██║|███████║|██╔══██║|██║  ██║|╚═╝  ╚═╝"
+  [I]="██╗|██║|██║|██║|██║|╚═╝"
+  [J]="     ██╗|     ██║|     ██║|██   ██║|╚█████╔╝| ╚════╝ "
+  [K]="██╗  ██╗|██║ ██╔╝|█████╔╝ |██╔═██╗ |██║  ██╗|╚═╝  ╚═╝"
+  [L]="██╗     |██║     |██║     |██║     |███████╗|╚══════╝"
+  [M]="███╗   ███╗|████╗ ████║|██╔████╔██║|██║╚██╔╝██║|██║ ╚═╝ ██║|╚═╝     ╚═╝"
+  [N]="███╗   ██╗|████╗  ██║|██╔██╗ ██║|██║╚██╗██║|██║ ╚████║|╚═╝  ╚═══╝"
+  [O]=" ██████╗ |██╔═══██╗|██║   ██║|██║   ██║|╚██████╔╝| ╚═════╝ "
+  [P]="██████╗ |██╔══██╗|██████╔╝|██╔═══╝ |██║     |╚═╝     "
+  [Q]=" ██████╗ |██╔═══██╗|██║   ██║|██║▄▄ ██║|╚██████╔╝| ╚══▀▀═╝ "
+  [R]="██████╗ |██╔══██╗|██████╔╝|██╔══██╗|██║  ██║|╚═╝  ╚═╝"
+  [S]="███████╗|██╔════╝|███████╗|╚════██║|███████║|╚══════╝"
+  [T]="████████╗|╚══██╔══╝|   ██║   |   ██║   |   ██║   |   ╚═╝   "
+  [U]="██╗   ██╗|██║   ██║|██║   ██║|██║   ██║|╚██████╔╝| ╚═════╝ "
+  [V]="██╗   ██╗|██║   ██║|██║   ██║|╚██╗ ██╔╝| ╚████╔╝ |  ╚═══╝  "
+  [W]="██╗    ██╗|██║    ██║|██║ █╗ ██║|██║███╗██║|╚███╔███╔╝| ╚══╝╚══╝ "
+  [X]="██╗  ██╗|╚██╗██╔╝| ╚███╔╝ | ██╔██╗ |██╔╝ ██╗|╚═╝  ╚═╝"
+  [Y]="██╗   ██╗|╚██╗ ██╔╝| ╚████╔╝ |  ╚██╔╝  |   ██║   |   ╚═╝   "
+  [Z]="███████╗|╚══███╔╝|  ███╔╝ | ███╔╝  |███████╗|╚══════╝"
+  [0]=" ██████╗ |██╔═████╗|██║██╔██║|████╔╝██║|╚██████╔╝| ╚═════╝ "
+  [1]=" ██╗|███║|╚██║| ██║| ██║| ╚═╝"
+  [2]="██████╗ |╚════██╗| █████╔╝|██╔═══╝ |███████╗|╚══════╝"
+  [3]="██████╗ |╚════██╗| █████╔╝| ╚═══██╗|██████╔╝|╚═════╝ "
+  [4]="██╗  ██╗|██║  ██║|███████║|╚════██║|     ██║|     ╚═╝"
+  [5]="███████╗|██╔════╝|███████╗|╚════██║|███████║|╚══════╝"
+  [6]=" ██████╗ |██╔════╝ |███████╗ |██╔═══██╗|╚██████╔╝| ╚═════╝ "
+  [7]="███████╗|╚════██║|    ██╔╝|   ██╔╝ |   ██║  |   ╚═╝  "
+  [8]=" █████╗ |██╔══██╗|╚█████╔╝|██╔══██╗|╚█████╔╝| ╚════╝ "
+  [9]=" █████╗ |██╔══██╗|╚██████║| ╚═══██║| █████╔╝| ╚════╝ "
+  ["-"]="        |        |█████╗  |╚════╝  |        |        "
+  ["."]="    |    |    |    |██╗ |╚═╝ "
+  ["_"]="        |        |        |        |███████╗|╚══════╝"
+  ["?"]="██████╗ |╚════██╗|  ▄███╔╝|  ▀▀══╝ |  ██╗   |  ╚═╝   "
 )
 
-banner_width() {   # texto -> REPLY = ancho mínimo en columnas (letra de 8 + 1 de separación)
+banner_glyph() {   # carácter -> GROWS[0..5] (rellenas al mismo ancho) y GW
+  local ch=$1 r w=0
+  IFS='|' read -ra GROWS <<< "${SF[$ch]:-${SF[?]}}"
+  for r in 0 1 2 3 4 5; do GROWS[r]=${GROWS[r]:-}; (( ${#GROWS[r]} > w )) && w=${#GROWS[r]}; done
+  for r in 0 1 2 3 4 5; do GROWS[r]+=$(rep ' ' $(( w - ${#GROWS[r]} ))); done
+  GW=$w
+}
+
+banner_width() {   # texto -> REPLY = ancho en columnas
   local t=${1^^} i x=0
   for (( i=0; i<${#t}; i++ )); do
-    if [[ ${t:i:1} == ' ' ]]; then x=$(( x + 5 )); else x=$(( x + 9 )); fi
+    if [[ ${t:i:1} == ' ' ]]; then x=$(( x + 3 )); else banner_glyph "${t:i:1}"; x=$(( x + GW )); fi
   done
   REPLY=$x
 }
@@ -303,40 +331,31 @@ banner_split() {   # texto -> BL[] con 1 o 2 líneas; devuelve 1 si no cabe
 }
 
 banner_big() {     # una línea de texto en letras grandes con degradado
-  local t=${1^^} i ch g r c x=0 oc lw gap sp cw pad line q='?' src prev col
-  local -A lit=()
-  local -a bits cmap
-  banner_width "$t"
-  # Cada columna de la fuente 5x5 se ensancha: letras de 8 columnas, o de 10 si el nombre es corto
-  if (( REPLY * 4 / 3 <= BW )); then cmap=(0 0 1 1 2 2 3 3 4 4); gap=2; sp=6
-  else                               cmap=(0 0 1 2 2 3 4 4);     gap=1; sp=5; fi
-  lw=${#cmap[@]}
+  local t=${1^^} i ch r c cw pad line prev col
+  local -a rows=('' '' '' '' '' '')
   for (( i=0; i<${#t}; i++ )); do
     ch=${t:i:1}
-    if [[ $ch == ' ' ]]; then x=$(( x + sp )); continue; fi
-    g=${FONT[$ch]:-${FONT[$q]}}
-    read -ra bits <<< "$g"
-    for (( r=0; r<5; r++ )); do
-      for (( oc=0; oc<lw; oc++ )); do
-        src=${cmap[oc]}
-        [[ ${bits[r]:src:1} == 1 ]] && lit[$r,$(( x + oc ))]=1
-      done
-    done
-    x=$(( x + lw + gap ))
+    if [[ $ch == ' ' ]]; then
+      for r in 0 1 2 3 4 5; do rows[r]+='   '; done
+    else
+      banner_glyph "$ch"
+      for r in 0 1 2 3 4 5; do rows[r]+=${GROWS[r]}; done
+    fi
   done
-  cw=$(( x - gap )); (( cw < 1 )) && cw=1
+  cw=${#rows[0]}
   mk_grad "$cw"
   pad=$(( (UW - cw) / 2 )); (( pad < 0 )) && pad=0
-  for (( r=0; r<5; r++ )); do
+  for r in 0 1 2 3 4 5; do
     printf -v line '%*s' "$pad" ''
     prev=''
     for (( c=0; c<cw; c++ )); do
-      if [[ -n ${lit[$r,$c]:-} ]]; then
+      ch=${rows[r]:c:1}
+      if [[ $ch == ' ' ]]; then
+        line+=' '
+      else
         col=${GC[c]}
         if [[ $col != "$prev" ]]; then line+=$col; prev=$col; fi
-        line+=$GBLK
-      else
-        line+=' '
+        line+=$ch
       fi
     done
     printf '%s%s\n' "$line" "$RST"
@@ -355,7 +374,7 @@ banner_compact() { # nombre demasiado largo para las letras grandes: una línea 
 
 banner_print() {   # nombre
   local l
-  if banner_split "$1"; then
+  if (( UTF )) && banner_split "$1"; then
     for l in "${BL[@]}"; do banner_big "$l"; done
   else
     banner_compact "$1"
@@ -1814,10 +1833,12 @@ header() {
   box_cols "$(kv IP "$IP" "$IPC")" "$(kv Hora "$(date +%H:%M:%S)")"
   box_row "$(kv Sistema "${OS_NAME:0:$(( IW - 9 ))}")"
   box_cols "$(kv Registro "${reg:--}")" "$(kv Activo "$UPT")"
+  box_row ""
   res_line CPU   "$CPU_P" "$CPU_X"
   res_line RAM   "$RAM_P" "$RAM_X"
   res_line DISCO "$DSK_P" "$DSK_X"
   box_bottom
+  echo
   box_top "SERVICIOS"
   grid row "$(svc_cell ssh SSH "$SSH_PORT")"            "$(svc_cell dropbear DROPBEAR "$PORT_DROPBEAR")" \
            "$(svc_cell ssl SSL "$PORT_SSL")"            "$(svc_cell ws WEBSOCKET "$PORT_WS")" \
@@ -1826,7 +1847,8 @@ header() {
            "$(svc_cell slowdns SLOWDNS "$PORT_SLOWDNS")" "$(svc_cell openvpn OPENVPN -)" \
            "$(svc_cell wireguard WIREGUARD -)"
   box_bottom
-  box_top "MENU"
+  echo
+  box_top "MENÚ"
   grid col "$(mcell 01 'Cuentas SSH')" "$(mcell 02 'Cuentas V2Ray')" \
            "$(mcell 03 'Protocolos')" "$(mcell 04 'Herramientas')" \
            "$(mcell 05 'Instalar todo')" "$(mcell 06 'Desinstalar' "$ERC")" \
@@ -1860,7 +1882,7 @@ main() {
   init_fs
   load_ports
   init_ui
-  trap 'printf "\e[?25h"' EXIT
+  trap 'printf "\e[?25h\e[0m"' EXIT
   init_env
   self_install
   autostart_default
