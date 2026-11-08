@@ -36,6 +36,7 @@ CERT=$BASE/cert.pem
 DOMAIN_F=$BASE/domain
 NAME_F=$BASE/vps.name
 REG_F=$BASE/vps.reg
+HIDE_F=$BASE/hide.conf     # partes del panel ocultas (una por línea: name, server, services)
 V2CFG=/usr/local/etc/v2ray/config.json
 V2PATH=/v2ray
 
@@ -301,7 +302,7 @@ spin() {      # mensaje comando [args...]  -> ejecuta el comando mostrando un sp
 }
 
 sub_header() { # titulo de la pantalla
-  local n; n=$(vps_name)
+  local n; n=$(vps_name_shown)
   cls
   echo
   printf '%s%s%s%s %s%s%s %s%s%s %s%s%s\n' "$MG" "$ACC" "$GSTAR" "$RST" "$HI" "${n:-VPS PANEL}" "$RST" "$DG" "$ARW" "$RST" "$ACC" "$1" "$RST"
@@ -465,6 +466,11 @@ preflight() {
 apt_i() { spin "Instalando $*" apt-get install -y -qq -o DPkg::Lock::Timeout=120 "$@"; }
 
 vps_name() { cat "$NAME_F" 2>/dev/null; }
+
+# Vista del panel: el nombre, el bloque SERVIDOR y el bloque SERVICIOS se pueden ocultar.
+is_hidden()   { grep -qx "$1" "$HIDE_F" 2>/dev/null; }            # name | server | services
+toggle_hide() { if is_hidden "$1"; then sed -i "/^$1\$/d" "$HIDE_F"; else echo "$1" >> "$HIDE_F"; fi; }
+vps_name_shown() { is_hidden name || vps_name; }                  # vacío si el nombre está oculto
 
 # ----------------------- Funciones base (originales) ------------------
 is_on() {
@@ -958,10 +964,47 @@ ssh_create() {
   show_ssh_info "$u" "$p" "$exp" "$l"
 }
 
+# Lista numerada de las cuentas de un archivo (users.db o v2ray.db) y deja la elegida en PICK.
+# Se elige por número o escribiendo el nombre. Devuelve 3 si se cancela (el menú no pide ENTER).
+pick_account() {   # archivo
+  local db=$1 i n e today col tag sel
+  local -a names=() exps=()
+  PICK=
+  today=$(date +%F)
+  while IFS='|' read -r n _ e _; do
+    [[ -n $n ]] || continue
+    names+=("$n"); exps+=("$e")
+  done < "$db"
+  if (( ${#names[@]} == 0 )); then warn "No hay cuentas creadas"; return 1; fi
+  printf '  %s%-4s %-16s %s%s\n' "$HI" '#' USUARIO EXPIRA "$RST"
+  printf '  %s%s%s\n' "$DIM" "$(rep "$GH" $(( UW - 4 )))" "$RST"
+  for (( i=0; i<${#names[@]}; i++ )); do
+    if [[ ${exps[i]} < $today ]]; then col=$ERC; tag='  vencida'; else col=$TXT; tag=''; fi
+    printf '  %s%-4s%s %s%-16s %s%s%s\n' "$ACC$BOLD" "$(( i + 1 ))" "$RST" "$col" "${names[i]}" "${exps[i]}" "$tag" "$RST"
+  done
+  printf '\n  %sTotal: %d   (en rojo: vencidas)%s\n\n' "$DIM" "${#names[@]}" "$RST"
+  rd "Número o nombre (0 = cancelar): " sel || return 3
+  sel=${sel//[[:space:]]/}
+  [[ -n $sel && $sel != 0 ]] || return 3
+  if [[ $sel =~ ^[0-9]+$ ]]; then
+    sel=$(( 10#$sel ))
+    (( sel == 0 )) && return 3
+    (( sel <= ${#names[@]} )) || { err "El número $sel no está en la lista"; return 1; }
+    PICK=${names[sel-1]}
+  else
+    for n in "${names[@]}"; do [[ $n == "$sel" ]] && { PICK=$n; break; }; done
+    [[ -n $PICK ]] || { err "Cuenta no encontrada"; return 1; }
+  fi
+  return 0
+}
+
 ssh_delete() {
-  local u
-  rd "Usuario a eliminar: " u
+  local u c
+  pick_account "$USERDB" || return $?
+  u=$PICK
   valid_name "$u" && grep -q "^${u}|" "$USERDB" || { err "Usuario no encontrado"; return 1; }
+  rd "¿Eliminar la cuenta $u? (s/N): " c
+  [[ $c == [sS]* ]] || return 3
   pkill -KILL -u "$u" 2>/dev/null
   userdel -f "$u" 2>/dev/null
   sed -i "/^${u}|/d" "$USERDB"
@@ -970,9 +1013,10 @@ ssh_delete() {
 
 ssh_renew() {
   local u d exp
-  rd "Usuario a renovar: " u
+  pick_account "$USERDB" || return $?
+  u=$PICK
   valid_name "$u" && grep -q "^${u}|" "$USERDB" || { err "Usuario no encontrado"; return 1; }
-  rd "Días desde hoy [30]: " d; d=${d:-30}
+  rd "Días desde hoy para $u [30]: " d; d=${d:-30}
   [[ $d =~ ^[0-9]+$ ]] || { err "Días inválidos"; return 1; }
   exp=$(date -d "+$d days" +%F)
   usermod -e "$exp" "$u" && db_set "$u" 3 "$exp" && ok "$u vence el $exp"
@@ -1006,9 +1050,12 @@ v2_need() { [[ -f $V2CFG ]] || { err "V2Ray no está instalado (Protocolos > V2R
 
 v2_delete() {
   v2_need || return 1
-  local n
-  rd "Cuenta a eliminar: " n
+  local n c
+  pick_account "$V2DB" || return $?
+  n=$PICK
   valid_name "$n" && grep -q "^${n}|" "$V2DB" || { err "Cuenta no encontrada"; return 1; }
+  rd "¿Eliminar la cuenta $n? (s/N): " c
+  [[ $c == [sS]* ]] || return 3
   v2_edit --arg em "$n" '.inbounds[0].settings.clients |= map(select(.email != $em))' || return 1
   sed -i "/^${n}|/d" "$V2DB"
   systemctl restart v2ray
@@ -1017,9 +1064,10 @@ v2_delete() {
 
 v2_renew() {
   local n d exp t
-  rd "Cuenta a renovar: " n
+  pick_account "$V2DB" || return $?
+  n=$PICK
   valid_name "$n" && grep -q "^${n}|" "$V2DB" || { err "Cuenta no encontrada"; return 1; }
-  rd "Días desde hoy [30]: " d; d=${d:-30}
+  rd "Días desde hoy para $n [30]: " d; d=${d:-30}
   [[ $d =~ ^[0-9]+$ ]] || { err "Días inválidos"; return 1; }
   exp=$(date -d "+$d days" +%F)
   t=$(mktemp)
@@ -1507,8 +1555,8 @@ menu_ssh() {
     [[ $o =~ ^[0-9]+$ ]] && o=$(( 10#$o ))
     case $o in
       1) sub_header "CREAR CUENTA SSH";      ssh_create ;;
-      2) sub_header "ELIMINAR CUENTA SSH";   ssh_delete ;;
-      3) sub_header "RENOVAR CUENTA SSH";    ssh_renew ;;
+      2) sub_header "ELIMINAR CUENTA SSH";   ssh_delete; [[ $? == 3 ]] && continue ;;
+      3) sub_header "RENOVAR CUENTA SSH";    ssh_renew;  [[ $? == 3 ]] && continue ;;
       4) sub_header "CAMBIAR CLAVE";         ssh_passwd ;;
       5) sub_header "CUENTAS SSH";           ssh_list ;;
       6) sub_header "USUARIOS CONECTADOS";   ssh_online ;;
@@ -1574,8 +1622,8 @@ menu_v2() {
     [[ $o =~ ^[0-9]+$ ]] && o=$(( 10#$o ))
     case $o in
       1) sub_header "CREAR CUENTA V2RAY";    v2_create ;;
-      2) sub_header "ELIMINAR CUENTA V2RAY"; v2_delete ;;
-      3) sub_header "RENOVAR CUENTA V2RAY";  v2_renew ;;
+      2) sub_header "ELIMINAR CUENTA V2RAY"; v2_delete; [[ $? == 3 ]] && continue ;;
+      3) sub_header "RENOVAR CUENTA V2RAY";  v2_renew;  [[ $? == 3 ]] && continue ;;
       4) sub_header "CUENTAS V2RAY";         v2_list ;;
       0) return ;;
       *) continue ;;
@@ -1815,6 +1863,31 @@ menu_protocols() {
 }
 
 # ------------------------------ Herramientas --------------------------
+view_state() {   # clave -> "● VISIBLE" / "○ OCULTO"
+  if is_hidden "$1"; then printf '%s%s OCULTO%s' "$DIM" "$GRING" "$RST"; else printf '%s%s VISIBLE%s' "$ACC" "$GDOT" "$RST"; fi
+}
+
+menu_view() {   # mostrar u ocultar: nombre, servidor y servicios de la pantalla principal
+  local o
+  while :; do
+    sub_header "VISTA DEL PANEL"
+    box_top "PANTALLA PRINCIPAL"
+    grid col "$(mcell 01 'Nombre') $(view_state name)" \
+             "$(mcell 02 'Servidor') $(view_state server)" \
+             "$(mcell 03 'Servicios') $(view_state services)" \
+             "$(mcell 00 'Volver')"
+    box_bottom
+    ask Opción o || return
+    [[ $o =~ ^[0-9]+$ ]] && o=$(( 10#$o ))
+    case $o in
+      1) toggle_hide name ;;
+      2) toggle_hide server ;;
+      3) toggle_hide services ;;
+      0) return ;;
+    esac
+  done
+}
+
 menu_tools() {
   local o a b
   while :; do
@@ -1827,7 +1900,7 @@ menu_tools() {
              "$(mcell 05 'Configurar DNS')" "$(mcell 06 'Dominio / SSL')" \
              "$(mcell 07 'Clave root')" "$(mcell 08 'Reiniciar servicios')" \
              "$(mcell 09 'Auto-inicio') $a" "$(mcell 10 'Nombre del VPS')" \
-             "$(mcell 00 'Volver')"
+             "$(mcell 11 'Vista del panel')" "$(mcell 00 'Volver')"
     box_bottom
     ask Opción o || return
     [[ $o =~ ^[0-9]+$ ]] && o=$(( 10#$o ))
@@ -1842,6 +1915,7 @@ menu_tools() {
       8)  sub_header "REINICIAR SERVICIOS";   restart_services ;;
       9)  toggle_autostart ;;
       10) cfg_vpsname; continue ;;
+      11) menu_view; continue ;;
       0)  return ;;
       *)  continue ;;
     esac
@@ -1914,21 +1988,30 @@ mitem() {      # número etiqueta "descripción larga|corta" [peligro|suave]
 header() {
   local name reg sub sp k on=0 now
   local -A ON=()
+  local h_name=0 h_srv=0 h_svc=0
+  is_hidden name && h_name=1
+  is_hidden server && h_srv=1
+  is_hidden services && h_svc=1
   name=$(vps_name); reg=$(cat "$REG_F" 2>/dev/null)
-  for k in ssh dropbear ssl ws squid v2ray badvpn udp slowdns openvpn wireguard; do
-    if is_on "$k"; then ON[$k]=1; on=$(( on + 1 )); fi
-  done
-  sys_stats
+  if (( ! h_svc )); then
+    for k in ssh dropbear ssl ws squid v2ray badvpn udp slowdns openvpn wireguard; do
+      if is_on "$k"; then ON[$k]=1; on=$(( on + 1 )); fi
+    done
+  fi
+  (( h_srv )) || sys_stats
   now=$(date +%H:%M:%S)
   cls
   echo
-  banner_print "${name:-VPS PANEL}"
-  echo
+  if (( ! h_name )); then
+    banner_print "${name:-VPS PANEL}"
+    echo
+  fi
   sub="$GSTAR ADMINISTRADOR DE VPS $SEP v$VERSION"
   sp=$(( (UW - ${#sub}) / 2 )); (( sp < 1 )) && sp=1
   printf '%*s%s%s%s %s%s%s %s%s%s %sv%s%s\n\n' "$sp" '' "$ACC" "$GSTAR" "$RST" "$HI" "ADMINISTRADOR DE VPS" "$RST" "$DG" "$SEP" "$RST" "$DIM" "$VERSION" "$RST"
   hr; echo
 
+  if (( ! h_srv )); then
   box_top "SERVIDOR"
   if (( NC == 3 )); then
     box_row "$(printf '%s%-23.23s%s%s%-*.*s%s%s%10s%s' "$IPC" "$IP" "$RST" "$WH" $(( TW - 33 )) $(( TW - 33 )) "$OS_NAME" "$RST" "$HI" "$now" "$RST")"
@@ -1940,7 +2023,9 @@ header() {
   box_row ""
   metrics
   box_bottom
+  fi
 
+  if (( ! h_svc )); then
   box_top "SERVICIOS" "$on/11 activos" "$ACC"
   grid row "$(svc_cell ssh SSH "$SSH_PORT")"            "$(svc_cell dropbear DROPBEAR "$PORT_DROPBEAR")" \
            "$(svc_cell ssl SSL "$PORT_SSL")"            "$(svc_cell ws WEBSOCKET "$PORT_WS")" \
@@ -1949,6 +2034,7 @@ header() {
            "$(svc_cell slowdns SLOWDNS "$PORT_SLOWDNS")" "$(svc_cell openvpn OPENVPN -)" \
            "$(svc_cell wireguard WIREGUARD -)"
   box_bottom
+  fi
 
   box_top "MENÚ"
   box_row "$(mitem 1 'Cuentas SSH'   'crear, renovar y eliminar usuarios|crear, renovar, eliminar')"
