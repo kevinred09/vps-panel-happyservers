@@ -108,6 +108,7 @@ GC=()                                  # colores del degradado (se rellena con m
 ROWC=()                                # color de cada fila del logo
 SEC_N=0                                # secciones ya impresas en la pantalla actual
 ASK_HINT=volver                        # texto de "0 ..." bajo el campo de entrada
+THEME=0                                # 1 = fondo y cursor del terminal ajustados (OSC 11/12)
 
 init_ui() {
   local cols
@@ -124,10 +125,11 @@ init_ui() {
   if (( NC >= 2 )); then TWO=1; else TWO=0; fi
 
   if [[ ( -t 1 || -n ${VPSPANEL_COLOR:-} ) && -z ${NO_COLOR:-} && ${TERM:-dumb} != dumb ]]; then
-    RST=$'\e[0m\e[38;5;252m'; BOLD=$'\e[1m'
-    HI=$'\e[1;38;5;255m';  WH=$'\e[38;5;255m';  TXT=$'\e[38;5;252m'
-    DIM=$'\e[38;5;245m';   DG=$'\e[38;5;239m'
-    if [[ ${COLORTERM:-} == *truecolor* || ${COLORTERM:-} == *24bit* ]]; then
+    RST=$'\e[0m\e[38;5;255m'; BOLD=$'\e[1m'
+    HI=$'\e[1;38;5;255m';  WH=$'\e[38;5;255m';  TXT=$'\e[38;5;255m'
+    DIM=$'\e[38;5;255m';   DG=$'\e[38;5;243m'        # texto siempre blanco; gris solo en líneas
+    # Color verdadero (24 bits) por defecto; VPSPANEL_COLORS=256 fuerza la paleta de 256 colores
+    if [[ ${VPSPANEL_COLORS:-} != 256 && ${TERM:-} != linux ]]; then
       ACC=$'\e[38;2;236;128;74m';  ACC2=$'\e[38;2;247;183;111m'
       ERC=$'\e[38;2;214;84;70m';   WRC=$'\e[38;2;247;183;111m';  OKC=$'\e[38;2;132;196;120m'
       SHC=$'\e[38;2;122;62;44m'
@@ -140,9 +142,12 @@ init_ui() {
       ROWC=($'\e[38;5;216m' $'\e[38;5;215m' $'\e[38;5;209m' $'\e[38;5;208m' $'\e[38;5;202m' $'\e[38;5;166m')
     fi
     IPC=$'\e[1m'$ACC; BRD=$DG
+    # Fondo negro cálido y cursor naranja mientras el panel está abierto (VPSPANEL_THEME=0 lo desactiva)
+    if [[ -t 1 && ${VPSPANEL_THEME:-1} != 0 && ${TERM:-} != linux ]]; then THEME=1; else THEME=0; fi
   else
     RST='' BOLD='' ACC='' ACC2='' HI='' WH='' TXT='' DIM='' DG='' OKC='' ERC='' WRC='' BRD='' SHC='' IPC=''
     ROWC=('' '' '' '' '' '')
+    THEME=0
   fi
 
   if (( UTF )); then
@@ -174,6 +179,9 @@ mk_grad() {   # ancho -> rellena GC[] con un color por columna
 }
 
 cls() { SEC_N=0; [[ -t 1 ]] && printf '\e[H\e[2J\e[3J%s' "$TXT"; return 0; }
+
+theme_on()  { (( THEME )) && printf '\e]11;#141211\a\e]12;#ec804a\a'; return 0; }
+theme_off() { (( THEME )) && printf '\e]111\a\e]112\a'; return 0; }
 
 hr() { printf '%s%s%s%s\n' "$MG" "$DG" "$(rep "$GH" "$HW")" "$RST"; }   # línea fina
 
@@ -235,7 +243,7 @@ grid() {      # modo(col|row) celda...   reparte celdas en columnas según el an
   done
 }
 
-kv()    { printf '%s%-8s%s %s%s%s' "$DIM" "$1" "$RST" "${3:-$WH}" "$2" "$RST"; }                          # etiqueta valor [color]
+kv()    { printf '%s%-8s%s %s%s%s' "$DIM" "$1" "$RST" "${3:-$HI}" "$2" "$RST"; }                          # etiqueta valor [color]
 mcell() { printf '%s%s%s %s%s%s %s%s%s' "$ACC$BOLD" "$1" "$RST" "$DG" "$GV" "$RST" "${3:-$TXT}" "$2" "$RST"; }  # NN etiqueta [color]
 pcell() { printf '%s%-11s%s %s%s%s' "$DIM" "$1" "$RST" "$WH" "$2" "$RST"; }                               # etiqueta puerto
 
@@ -1886,15 +1894,15 @@ metrics() {    # CPU / RAM / DISCO: tres columnas (bloque de 3 filas) o filas si
 
 svc_cell() {   # clave etiqueta puerto   (usa ON[] calculado en header)
   local dot dc nc pc
-  if [[ -n ${ON[$1]:-} ]]; then dot=$GDOT; dc=$ACC; nc=$WH; pc=$DIM; else dot=$GRING; dc=$DG; nc=$DIM; pc=$DG; fi
+  if [[ -n ${ON[$1]:-} ]]; then dot=$GDOT; dc=$ACC; nc=$HI; pc=$DIM; else dot=$GRING; dc=$WH; nc=$WH; pc=$DIM; fi
   printf '%s%s%s %s%-10s%s %s%-5.5s%s' "$dc" "$dot" "$RST" "$nc" "$2" "$RST" "$pc" "$3" "$RST"
 }
 
 mitem() {      # número etiqueta "descripción larga|corta" [peligro|suave]
-  local nc=$ACC$BOLD lc=$WH dw=$(( TW - 21 )) d=${3%%|*} sh=${3##*|}
+  local nc=$ACC$BOLD lc=$HI dw=$(( TW - 21 )) d=${3%%|*} sh=${3##*|}
   case ${4:-} in
     peligro) nc=$ERC$BOLD; lc=$ERC ;;
-    suave)   nc=$DIM$BOLD; lc=$DIM ;;
+    suave)   nc=$WH$BOLD;  lc=$WH ;;
   esac
   if (( ${#d} > dw )); then d=$sh; fi
   (( dw < 29 )) && d=''     # sin espacio para todas las descripciones: ninguna
@@ -1923,12 +1931,12 @@ header() {
 
   box_top "SERVIDOR"
   if (( NC == 3 )); then
-    box_row "$(printf '%s%-23.23s%s%s%-*.*s%s%s%10s%s' "$IPC" "$IP" "$RST" "$WH" $(( TW - 33 )) $(( TW - 33 )) "$OS_NAME" "$RST" "$WH" "$now" "$RST")"
+    box_row "$(printf '%s%-23.23s%s%s%-*.*s%s%s%10s%s' "$IPC" "$IP" "$RST" "$WH" $(( TW - 33 )) $(( TW - 33 )) "$OS_NAME" "$RST" "$HI" "$now" "$RST")"
   else
     box_cols "$(kv IP "$IP" "$IPC")" "$(kv Hora "$now")"
     box_row "$(kv Sistema "${OS_NAME:0:$(( TW - 9 ))}")"
   fi
-  box_row "$(printf '%sactivo %s%s%s  %s%s%s  %sregistro %s%s%s' "$DIM" "$WH" "$UPT" "$RST" "$DG" "$SEP" "$RST" "$DIM" "$WH" "${reg:--}" "$RST")"
+  box_row "$(printf '%sactivo %s%s%s  %s%s%s  %sregistro %s%s%s' "$DIM" "$HI" "$UPT" "$RST" "$DG" "$SEP" "$RST" "$DIM" "$HI" "${reg:--}" "$RST")"
   box_row ""
   metrics
   box_bottom
@@ -1982,7 +1990,7 @@ main() {
   init_fs
   load_ports
   init_ui
-  trap 'printf "\e[?25h\e[0m"' EXIT
+  trap 'printf "\e[?25h\e[0m"; theme_off' EXIT
   init_env
   self_install
   autostart_default
@@ -1993,6 +2001,7 @@ main() {
     "") ;;
     *) usage; exit 1 ;;
   esac
+  theme_on
   if [[ ! -s $NAME_F ]]; then
     if [[ -t 0 && -t 1 ]]; then register_vps || exit 1; else default_name; fi
   fi
