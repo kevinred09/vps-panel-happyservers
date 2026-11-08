@@ -9,6 +9,9 @@
 #  Uso:
 #    bash vps-panel.sh                 registro del VPS (1a vez) + menú ("vpspanel")
 #    bash vps-panel.sh --install-all   instalación completa sin menú
+#
+#  Valores por defecto: banner SSH desactivado, auto-inicio del panel activado.
+#  Los puertos se cambian en Protocolos y se guardan en /etc/vpspanel/ports.conf
 #    UDPCUSTOM_URL=<url> vpspanel      (opcional) usar otro binario de udp-custom
 # ======================================================================
 
@@ -24,7 +27,7 @@ fi
 if [[ $(locale charmap 2>/dev/null) == UTF-8 ]]; then UTF=1; else UTF=0; fi
 
 # ------------------------------ Configuración -------------------------
-VERSION=2.0
+VERSION=2.1
 BASE=${VPSPANEL_BASE:-/etc/vpspanel}
 USERDB=$BASE/users.db
 V2DB=$BASE/v2ray.db
@@ -45,6 +48,13 @@ PORT_SQUID=${PORT_SQUID:-3128}
 PORT_UDP=${PORT_UDP:-36712}
 PORT_SLOWDNS=${PORT_SLOWDNS:-5300}
 UDPCUSTOM_URL=${UDPCUSTOM_URL:-}
+
+# Puertos personalizables (Protocolos > Cambiar puerto). PVAR: variable de cada protocolo.
+declare -A PVAR=([dropbear]=PORT_DROPBEAR [ssl]=PORT_SSL [badvpn]=PORT_BADVPN [ws]=PORT_WS
+                 [squid]=PORT_SQUID [v2ray]=PORT_V2RAY [udp]=PORT_UDP [slowdns]=PORT_SLOWDNS)
+declare -A PDEF=([dropbear]=110 [ssl]=443 [badvpn]=7300 [ws]=80
+                 [squid]=3128 [v2ray]=8080 [udp]=36712 [slowdns]=5300)
+PORT_KEYS=(dropbear ssl ws squid v2ray badvpn udp slowdns)
 
 # UDP Custom: binario x86_64 descargado automáticamente. La URL apunta a un commit
 # exacto del repositorio (no a "main") y el archivo se verifica con SHA256 antes de
@@ -86,7 +96,7 @@ declare -A INST=(
   [slowdns]=inst_slowdns
 )
 PROTO_KEYS=(dropbear ssl badvpn ws squid v2ray udp slowdns openvpn wireguard)
-PROTO_NAMES=("DROPBEAR" "SSL STUNNEL" "BADVPN UDPGW" "WEBSOCKET" "SQUID PROXY"
+PROTO_NAMES=("DROPBEAR" "SSL" "BADVPN" "WEBSOCKET" "SQUID"
              "V2RAY" "UDP CUSTOM" "SLOWDNS" "OPENVPN" "WIREGUARD")
 
 # ------------------------------ Interfaz ------------------------------
@@ -108,19 +118,19 @@ init_ui() {
     RST=$'\e[0m';           BOLD=$'\e[1m'
     ACC=$'\e[38;5;45m';     ACC2=$'\e[38;5;141m'
     HI=$'\e[1;38;5;255m';   TXT=$'\e[38;5;252m';  DIM=$'\e[38;5;245m'
-    OKC=$'\e[38;5;84m';     ERC=$'\e[38;5;203m';  WRC=$'\e[38;5;221m'
-    BRD=$'\e[38;5;37m';     SHC=$'\e[38;5;238m'
+    OKC=$'\e[38;5;87m';      ERC=$'\e[38;5;203m';  WRC=$'\e[38;5;221m'
+    BRD=$'\e[38;5;37m';     SHC=$'\e[38;5;240m'; IPC=$'\e[1;38;5;219m'
   else
-    RST='' BOLD='' ACC='' ACC2='' HI='' TXT='' DIM='' OKC='' ERC='' WRC='' BRD='' SHC=''
+    RST='' BOLD='' ACC='' ACC2='' HI='' TXT='' DIM='' OKC='' ERC='' WRC='' BRD='' SHC='' IPC=''
   fi
 
   if (( UTF )); then
     GH='─' GV='│' GTL='╭' GTR='╮' GBL='╰' GBR='╯'
-    GDOT='●' GRING='○' GFUL='█' GEMP='░' GBAR='▀' ARW='›' SEP='·'
+    GDOT='●' GRING='○' GFUL='━' GEMP='╌' GBAR='━' GBLK='█' ARW='›' SEP='·'
     SPIN=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
   else
     GH='-' GV='|' GTL='+' GTR='+' GBL='+' GBR='+'
-    GDOT='*' GRING='o' GFUL='#' GEMP='.' GBAR='=' ARW='>' SEP='-'
+    GDOT='*' GRING='o' GFUL='#' GEMP='.' GBAR='=' GBLK='#' ARW='>' SEP='-'
     SPIN=('|' '/' '-' '\')
   fi
 
@@ -192,17 +202,21 @@ grid() {      # modo(col|row) celda...   reparte celdas en dos columnas
   fi
 }
 
-kv()    { printf '%s%-8s%s %s%s%s' "$DIM" "$1" "$RST" "$HI" "$2" "$RST"; }      # etiqueta valor
+kv()    { printf '%s%-8s%s %s%s%s' "$DIM" "$1" "$RST" "${3:-$HI}" "$2" "$RST"; }  # etiqueta valor [color]
 mcell() { printf '%s%s%s  %s%s%s' "$ACC" "$1" "$RST" "${3:-$TXT}" "$2" "$RST"; } # NN etiqueta [color]
 pcell() { printf '%s%-11s%s %s%s%s' "$DIM" "$1" "$RST" "$HI" "$2" "$RST"; }      # etiqueta puerto
 
-bar() {       # porcentaje ancho -> [████░░░░]
-  local p=$1 w=$2 f e col fs es
+bar() {       # porcentaje ancho -> ━━━╌╌╌  (degradado; ámbar desde 60%, rojo desde 85%)
+  local p=$1 w=$2 f i k n=${#RAMP[@]} s=''
   (( p > 100 )) && p=100; (( p < 0 )) && p=0
-  f=$(( p * w / 100 )); e=$(( w - f ))
-  if (( p >= 85 )); then col=$ERC; elif (( p >= 60 )); then col=$WRC; else col=$OKC; fi
-  printf -v fs '%*s' "$f" ''; printf -v es '%*s' "$e" ''
-  printf '%s[%s%s%s%s%s%s]%s' "$DIM" "$RST" "$col" "${fs// /$GFUL}" "$DIM" "${es// /$GEMP}" "$DIM" "$RST"
+  f=$(( p * w / 100 )); (( p > 0 && f < 1 )) && f=1
+  for (( i=0; i<f; i++ )); do
+    if [[ -z $RST ]]; then s+=$GFUL
+    elif (( p >= 85 )); then s+="${ERC}${GFUL}"
+    elif (( p >= 60 )); then s+="${WRC}${GFUL}"
+    else k=$(( i * n / w )); printf -v k '\e[38;5;%sm' "${RAMP[k]}"; s+="${k}${GFUL}"; fi
+  done
+  printf '%s%s%s%s' "$s" "$SHC" "$(rep "$GEMP" $(( w - f )))" "$RST"
 }
 
 # ---- Mensajes ------------------------------------------------------
@@ -262,10 +276,10 @@ declare -A FONT=(
   ["."]="00000 00000 00000 00000 00100" ["?"]="01110 10001 00110 00000 00100"
 )
 
-banner_width() {   # texto -> REPLY = ancho en columnas
+banner_width() {   # texto -> REPLY = ancho mínimo en columnas (letra de 8 + 1 de separación)
   local t=${1^^} i x=0
   for (( i=0; i<${#t}; i++ )); do
-    if [[ ${t:i:1} == ' ' ]]; then x=$(( x + 3 )); else x=$(( x + 6 )); fi
+    if [[ ${t:i:1} == ' ' ]]; then x=$(( x + 5 )); else x=$(( x + 9 )); fi
   done
   REPLY=$x
 }
@@ -288,36 +302,41 @@ banner_split() {   # texto -> BL[] con 1 o 2 líneas; devuelve 1 si no cabe
   return 0
 }
 
-banner_big() {     # una línea de texto en letras grandes con degradado y sombra
-  local t=${1^^} i ch g r c x=0 cw S=1 pad line q='?' fb sb sp
+banner_big() {     # una línea de texto en letras grandes con degradado
+  local t=${1^^} i ch g r c x=0 oc lw gap sp cw pad line q='?' src prev col
   local -A lit=()
-  local -a bits
+  local -a bits cmap
+  banner_width "$t"
+  # Cada columna de la fuente 5x5 se ensancha: letras de 8 columnas, o de 10 si el nombre es corto
+  if (( REPLY * 4 / 3 <= BW )); then cmap=(0 0 1 1 2 2 3 3 4 4); gap=2; sp=6
+  else                               cmap=(0 0 1 2 2 3 4 4);     gap=1; sp=5; fi
+  lw=${#cmap[@]}
   for (( i=0; i<${#t}; i++ )); do
     ch=${t:i:1}
-    if [[ $ch == ' ' ]]; then x=$(( x + 3 )); continue; fi
+    if [[ $ch == ' ' ]]; then x=$(( x + sp )); continue; fi
     g=${FONT[$ch]:-${FONT[$q]}}
     read -ra bits <<< "$g"
     for (( r=0; r<5; r++ )); do
-      for (( c=0; c<5; c++ )); do
-        [[ ${bits[r]:c:1} == 1 ]] && lit[$r,$(( x + c ))]=1
+      for (( oc=0; oc<lw; oc++ )); do
+        src=${cmap[oc]}
+        [[ ${bits[r]:src:1} == 1 ]] && lit[$r,$(( x + oc ))]=1
       done
     done
-    x=$(( x + 6 ))
+    x=$(( x + lw + gap ))
   done
-  (( x * 2 <= BW )) && S=2                     # nombres cortos: trazo doble (más grueso)
-  cw=$(( x * S ))
+  cw=$(( x - gap )); (( cw < 1 )) && cw=1
   mk_grad "$cw"
-  printf -v fb '%*s' "$S" ''; sb=${fb// /$GEMP}; sp=$fb; fb=${fb// /$GFUL}
   pad=$(( (UW - cw) / 2 )); (( pad < 0 )) && pad=0
-  for (( r=0; r<6; r++ )); do
+  for (( r=0; r<5; r++ )); do
     printf -v line '%*s' "$pad" ''
-    for (( c=0; c<x; c++ )); do
+    prev=''
+    for (( c=0; c<cw; c++ )); do
       if [[ -n ${lit[$r,$c]:-} ]]; then
-        line+="${GC[c*S]}${fb}"
-      elif (( r > 0 && c > 0 )) && [[ -n ${lit[$(( r - 1 )),$(( c - 1 ))]:-} ]]; then
-        line+="${SHC}${sb}"
+        col=${GC[c]}
+        if [[ $col != "$prev" ]]; then line+=$col; prev=$col; fi
+        line+=$GBLK
       else
-        line+="$sp"
+        line+=' '
       fi
     done
     printf '%s%s\n' "$line" "$RST"
@@ -516,7 +535,7 @@ ClientAliveInterval 30
 ClientAliveCountMax 3
 MaxSessions 100
 MaxStartups 100:30:200
-Banner $BANNER
+Banner $(banner_path)
 EOF
   if sshd -t 2>/dev/null; then
     systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null
@@ -543,8 +562,12 @@ inst_dropbear() {
   apt_i dropbear || { err "Fallo al instalar dropbear"; return 1; }
   systemctl disable --now dropbear >/dev/null 2>&1
   mkdir -p /etc/dropbear
+  unit_dropbear
+}
+
+unit_dropbear() {   # servicio con el puerto y el banner actuales
   mkunit vps-dropbear "Dropbear SSH" \
-    "$(command -v dropbear) -F -E -R -p $PORT_DROPBEAR -b $BANNER -K 30"
+    "$(command -v dropbear) -F -E -R -p $PORT_DROPBEAR $(banner_opt) -K 30"
   fw_open "$PORT_DROPBEAR" tcp
   verify dropbear Dropbear
 }
@@ -555,6 +578,10 @@ inst_ssl() {
   apt_i stunnel4 || { err "Fallo al instalar stunnel4"; return 1; }
   systemctl disable --now stunnel4 >/dev/null 2>&1
   [[ -s $CERT ]] || mk_selfsigned "$(get_host)"
+  conf_ssl
+}
+
+conf_ssl() {   # configuración y servicio con el puerto actual
   cat > "$BASE/stunnel.conf" <<EOF
 foreground = yes
 pid =
@@ -587,6 +614,10 @@ inst_badvpn() {
   rc=$?
   rm -rf "$t"
   (( rc == 0 )) || { err "Fallo al compilar badvpn-udpgw"; return 1; }
+  unit_badvpn
+}
+
+unit_badvpn() {
   mkunit vps-badvpn "BadVPN UDPGW" \
     "/usr/local/bin/badvpn-udpgw --listen-addr 127.0.0.1:$PORT_BADVPN --max-clients 1000 --max-connections-for-client 10"
   verify badvpn BadVPN-UDPGW
@@ -711,6 +742,10 @@ if __name__ == "__main__":
     asyncio.run(main())
 PYEOF
   chmod 755 /usr/local/bin/vps-ws.py
+  unit_ws
+}
+
+unit_ws() {
   mkunit vps-ws "Proxy WebSocket a SSH" \
     "$(command -v python3) /usr/local/bin/vps-ws.py $PORT_WS $SSH_PORT $PORT_DROPBEAR"
   fw_open "$PORT_WS" tcp
@@ -721,6 +756,10 @@ inst_squid() {
   ensure_base; need_port squid "$PORT_SQUID" || return 1
   info "Instalando Squid..."
   apt_i squid || { err "Fallo al instalar squid"; return 1; }
+  conf_squid
+}
+
+conf_squid() {
   local ips; ips="127.0.0.1 $IP $(hostname -I)"
   cat > /etc/squid/squid.conf <<EOF
 http_port $PORT_SQUID
@@ -800,6 +839,12 @@ inst_slowdns() {
     -privkey-file "$BASE/slowdns/server.key" -pubkey-file "$BASE/slowdns/server.pub" >/dev/null
   echo "$ns" > "$BASE/slowdns/ns"
 
+  unit_slowdns
+}
+
+unit_slowdns() {   # usa el NameServer guardado
+  local ns ipt=/usr/sbin/iptables
+  ns=$(<"$BASE/slowdns/ns")
   mkunit vps-slowdns "SlowDNS (dnstt)" \
     "/usr/local/bin/dnstt-server -udp :$PORT_SLOWDNS -privkey-file $BASE/slowdns/server.key $ns 127.0.0.1:$SSH_PORT" \
     "ExecStartPre=-$ipt -t nat -D PREROUTING -p udp --dport 53 -j REDIRECT --to-ports $PORT_SLOWDNS
@@ -920,14 +965,53 @@ proto_action() {
   esac
 }
 
+# El banner SSH viene DESACTIVADO: solo existe si el archivo $BANNER tiene contenido.
+banner_on()   { [[ -s $BANNER ]]; }
+banner_path() { if banner_on; then printf '%s' "$BANNER"; else printf 'none'; fi; }
+banner_opt()  { banner_on && printf -- '-b %s' "$BANNER"; return 0; }
+
+banner_apply() {   # aplica el estado actual a OpenSSH y a Dropbear
+  cfg_ssh
+  apply_proto dropbear
+  return 0
+}
+
+banner_migrate() {   # versiones anteriores creaban un banner con el nombre del VPS
+  [[ -s $BANNER && ! -f $BASE/.banner-off ]] || { touch "$BASE/.banner-off"; return 0; }
+  local b; b=$(<"$BANNER"); b=${b%$'\n'}
+  if [[ $b == "VPS PANEL" || $b == "$(vps_name)" ]]; then
+    rm -f "$BANNER"
+    [[ -f $BASE/.prep ]] && banner_apply >/dev/null 2>&1
+  fi
+  touch "$BASE/.banner-off"
+}
+
 cfg_banner() {
   ensure_base
-  echo "Escribe el banner (HTML permitido). Línea vacía para terminar:"
-  local l txt=""
-  while IFS= read -r l; do [[ -z $l ]] && break; txt+="$l"$'\n'; done
-  [[ -n $txt ]] || { err "Banner vacío"; return 1; }
-  printf '%s' "$txt" > "$BANNER"
-  ok "Banner aplicado"
+  local o l txt
+  if banner_on; then
+    info "Banner ${OKC}ACTIVADO${RST}. Contenido actual:"; sed 's/^/        /' "$BANNER"
+  else
+    info "Banner ${DIM}DESACTIVADO${RST}: al conectar no se muestra ningún banner."
+  fi
+  printf '\n  %s01%s  Escribir o cambiar el banner (lo activa)\n' "$ACC" "$RST"
+  printf '  %s02%s  Desactivar el banner\n' "$ACC" "$RST"
+  printf '  %s00%s  Volver\n' "$ACC" "$RST"
+  ask Opción o || return 3
+  [[ $o =~ ^[0-9]+$ ]] && o=$(( 10#$o ))
+  case $o in
+    1) echo "Escribe el banner (HTML permitido). Línea vacía para terminar:"
+       txt=""
+       while IFS= read -r l; do [[ -z $l ]] && break; txt+="$l"$'\n'; done
+       [[ -n $txt ]] || { err "Banner vacío"; return 1; }
+       printf '%s' "$txt" > "$BANNER"
+       banner_apply
+       ok "Banner activado" ;;
+    2) rm -f "$BANNER"
+       banner_apply
+       ok "Banner desactivado" ;;
+    *) return 3 ;;
+  esac
 }
 
 cfg_bbr() {
@@ -1031,14 +1115,53 @@ restart_services() {
 
 autostart_on() { grep -q 'vpspanel-autostart' /root/.bashrc 2>/dev/null; }
 
+autostart_enable() {
+  autostart_on || echo '[[ $- == *i* && -z "${VPSPANEL_ACTIVE:-}" ]] && vpspanel # vpspanel-autostart' >> /root/.bashrc
+}
+
 toggle_autostart() {
   if autostart_on; then
     sed -i '/vpspanel-autostart/d' /root/.bashrc
     ok "Auto-inicio desactivado"
   else
-    echo '[[ $- == *i* && -z "${VPSPANEL_ACTIVE:-}" ]] && vpspanel # vpspanel-autostart' >> /root/.bashrc
+    autostart_enable
     ok "Auto-inicio activado"
   fi
+}
+
+autostart_default() {   # primera ejecución: el auto-inicio queda ACTIVADO
+  [[ -f $BASE/.autostart.init ]] && return 0
+  if [[ -s $NAME_F ]]; then touch "$BASE/.autostart.init"; return 0; fi   # panel ya en uso: se respeta tu ajuste
+  if [[ -x /usr/local/bin/vpspanel ]]; then
+    autostart_enable
+    touch "$BASE/.autostart.init"
+  fi
+}
+
+panel_cmd() {   # texto con el que se abre el panel
+  if [[ -x /usr/local/bin/vpspanel ]]; then echo vpspanel
+  else echo "bash $(readlink -f "$0" 2>/dev/null || echo vps-panel.sh)"; fi
+}
+
+show_access() {   # pantalla posterior al primer registro
+  local c; c=$(panel_cmd)
+  cls; gradient_bar; echo
+  printf '  %sREGISTRO COMPLETO%s\n\n' "$HI" "$RST"
+  box_top "ACCESO AL PANEL"
+  if autostart_on; then
+    box_row "${OKC}${GDOT}${RST} ${HI}Auto-inicio ACTIVADO${RST}"
+    box_row "${DIM}Se abre solo al entrar por SSH.${RST}"
+    box_row "${DIM}Si lo desactivas, ábrelo con:${RST}"
+  else
+    box_row "${WRC}${GRING}${RST} ${HI}Auto-inicio DESACTIVADO${RST}"
+    box_row "${DIM}El panel no abre solo. Escribe:${RST}"
+  fi
+  box_row ""
+  box_row "  ${ACC}${ARW}${RST} ${HI}${c}${RST}"
+  box_row ""
+  box_row "${DIM}Cambiar: Herramientas > Auto-inicio${RST}"
+  box_bottom
+  pause
 }
 
 # ------------------------------ Desinstalar ---------------------------
@@ -1083,7 +1206,7 @@ name_check() {   # nombre -> 0 si sirve; si no, deja el motivo en MSG
   if [[ -z $t ]]; then MSG="Escribe un nombre."; return 1; fi
   if ! [[ $t =~ $re ]]; then MSG="Usa solo letras, números, espacio, punto, guion y guion bajo."; return 1; fi
   if ! banner_split "$t"; then
-    MSG="No cabe en el banner. Máximo $(( BW / 6 )) letras, o dos palabras de ese largo."
+    MSG="No cabe en el banner. Máximo $(( BW / 9 )) letras, o dos palabras de ese largo."
     return 1
   fi
   return 0
@@ -1100,7 +1223,7 @@ register_vps() {
     else
       printf '  %sNombre actual: %s  (ENTER para conservarlo)%s\n' "$DIM" "$cur" "$RST"
     fi
-    printf '  %sMáximo %d letras, o dos palabras de ese largo.%s\n\n' "$DIM" "$(( BW / 6 ))" "$RST"
+    printf '  %sMáximo %d letras, o dos palabras de ese largo.%s\n\n' "$DIM" "$(( BW / 9 ))" "$RST"
     rd "Nombre del VPS: " name || { err "No hay entrada disponible"; return 1; }
     read -ra w <<< "$name"; name="${w[*]:-}"            # quita espacios sobrantes
     if [[ -z $name && -n $cur ]]; then return 0; fi
@@ -1114,13 +1237,10 @@ register_vps() {
     [[ $ans == [nN]* ]] && continue
     printf '%s\n' "$name" > "$NAME_F"
     [[ -s $REG_F ]] || date +%d/%m/%Y > "$REG_F"
-    # El banner SSH acompaña al nombre mientras siga siendo el de fábrica
-    if [[ ! -s $BANNER || $(<"$BANNER") == "VPS PANEL" || $(<"$BANNER") == "$cur" ]]; then
-      printf '%s\n' "$name" > "$BANNER"
-    fi
     echo
     ok "VPS registrado como $name"
     sleep 1
+    (( first )) && show_access
     return 0
   done
 }
@@ -1141,8 +1261,6 @@ ensure_base() {
   spin "Actualizando lista de paquetes" apt-get update -qq
   apt_i curl wget jq git unzip tar openssl iptables ca-certificates cron procps iproute2 python3
   grep -qx /bin/false /etc/shells || echo /bin/false >> /etc/shells
-  [[ -s $BANNER ]] || printf '%s\n' "$(vps_name || true)" > "$BANNER"
-  [[ -s $BANNER ]] || echo "VPS PANEL" > "$BANNER"
   install_helpers
   cfg_ssh
   touch "$BASE/.prep"
@@ -1187,6 +1305,12 @@ inst_udp() {
   systemctl stop udp-custom >/dev/null 2>&1
   install -m755 "$tmp" "$dir/udp-custom"
   rm -f "$tmp"
+  conf_udp || return 1
+  info "En HTTP Custom: modo UDP Custom, host $(get_host), puerto $PORT_UDP"
+}
+
+conf_udp() {   # configuración y servicio de UDP Custom con el puerto actual
+  local dir=/etc/udp-custom excl
   cat > "$dir/config.json" <<EOF
 {
   "listen": ":$PORT_UDP",
@@ -1199,13 +1323,34 @@ EOF
   excl="53,$PORT_SLOWDNS,1194,51820"
   mkunit udp-custom "UDP Custom" "$dir/udp-custom server -exclude $excl" "WorkingDirectory=$dir"
   fw_open "$PORT_UDP" udp
-  verify udp "UDP Custom" || return 1
-  info "En HTTP Custom: modo UDP Custom, host $(get_host), puerto $PORT_UDP"
+  verify udp "UDP Custom"
+}
+
+show_ports_plan() {
+  box_top "PUERTOS A USAR"
+  grid row "$(pcell DROPBEAR "$PORT_DROPBEAR")"   "$(pcell SSL "$PORT_SSL")" \
+           "$(pcell WEBSOCKET "$PORT_WS")"        "$(pcell SQUID "$PORT_SQUID")" \
+           "$(pcell V2RAY "$PORT_V2RAY")"         "$(pcell BADVPN "$PORT_BADVPN")" \
+           "$(pcell 'UDP CUSTOM' "$PORT_UDP")"
+  box_bottom
 }
 
 install_all() {
   ensure_base
-  local item n=0 total=7
+  local item n=0 total=7 a
+  # Con --install-all (o sin teclado) todo es automático con los puertos actuales
+  if [[ -z ${INSTALL_AUTO:-} && -t 0 ]]; then
+    show_ports_plan
+    while :; do
+      printf '\n  %sENTER%s instalar ahora   %sP%s cambiar puertos   %s0%s cancelar\n' "$ACC" "$RST" "$ACC" "$RST" "$ACC" "$RST"
+      rd "Opción: " a || return 1
+      case ${a,,} in
+        "") break ;;
+        p)  sub_header "CAMBIAR PUERTOS"; ports_wizard; echo; show_ports_plan ;;
+        0)  return 0 ;;
+      esac
+    done
+  fi
   for item in "inst_dropbear:Dropbear" "inst_ssl:SSL (stunnel)" "inst_badvpn:BadVPN UDPGW" \
               "inst_ws:WebSocket" "inst_squid:Squid" "inst_v2ray:V2Ray" "inst_udp:UDP Custom"; do
     n=$(( n + 1 ))
@@ -1215,7 +1360,7 @@ install_all() {
   echo
   cfg_bbr
   echo
-  ok "Instalación completa. Ejecuta: vpspanel"
+  ok "Instalación completa. Abre el panel con: $(panel_cmd)"
 }
 
 # --------------------------- Cuentas SSH / Dropbear -------------------
@@ -1276,7 +1421,7 @@ menu_ssh() {
              "$(mcell 05 'Listar cuentas')" "$(mcell 06 'Conectados')" \
              "$(mcell 07 'Limpiar vencidas')" "$(mcell 00 'Volver')"
     box_bottom
-    ask Opcion o || return
+    ask Opción o || return
     [[ $o =~ ^[0-9]+$ ]] && o=$(( 10#$o ))
     case $o in
       1) sub_header "CREAR CUENTA SSH";      ssh_create ;;
@@ -1343,7 +1488,7 @@ menu_v2() {
              "$(mcell 03 'Renovar cuenta')" "$(mcell 04 'Listar / enlaces')" \
              "$(mcell 00 'Volver')"
     box_bottom
-    ask Opcion o || return
+    ask Opción o || return
     [[ $o =~ ^[0-9]+$ ]] && o=$(( 10#$o ))
     case $o in
       1) sub_header "CREAR CUENTA V2RAY";    v2_create ;;
@@ -1358,51 +1503,253 @@ menu_v2() {
 }
 
 # ------------------------------ Protocolos ----------------------------
+pget() { local v=${PVAR[$1]}; printf '%s' "${!v}"; }
+
+proto_installed() { systemctl cat "${SVC[$1]}" >/dev/null 2>&1; }
+
+save_ports() {
+  local k
+  {
+    for k in "${PORT_KEYS[@]}"; do echo "${PVAR[$k]}=$(pget "$k")"; done
+    echo "V2PATH=$V2PATH"
+  } > "$BASE/ports.conf"
+}
+
+load_ports() {   # lee /etc/vpspanel/ports.conf validando cada línea
+  local l k v
+  [[ -f $BASE/ports.conf ]] || return 0
+  while IFS= read -r l; do
+    k=${l%%=*}; v=${l#*=}
+    case $k in
+      PORT_DROPBEAR|PORT_SSL|PORT_BADVPN|PORT_WS|PORT_SQUID|PORT_V2RAY|PORT_UDP|PORT_SLOWDNS)
+        if [[ $v =~ ^[0-9]{1,5}$ ]] && (( 10#$v >= 1 && 10#$v <= 65535 )); then
+          printf -v "$k" '%s' "$(( 10#$v ))"
+        fi ;;
+      V2PATH) [[ $v =~ ^/[A-Za-z0-9._~/-]{1,40}$ ]] && V2PATH=$v ;;
+    esac
+  done < "$BASE/ports.conf"
+  return 0
+}
+
+is_udp_key() { [[ $1 == udp || $1 == slowdns ]]; }
+
+port_check() {   # clave puerto -> 0 si sirve (deja el número en PCHK); si no, el motivo en MSG
+  local k=$1 p=$2 o
+  if ! [[ $p =~ ^[0-9]{1,5}$ ]] || (( 10#$p < 1 || 10#$p > 65535 )); then MSG="Puerto inválido (1-65535)."; return 1; fi
+  p=$(( 10#$p ))
+  for o in "${PORT_KEYS[@]}"; do
+    [[ $o == "$k" ]] && continue
+    if { is_udp_key "$o" && is_udp_key "$k"; } || { ! is_udp_key "$o" && ! is_udp_key "$k"; }; then
+      if (( $(pget "$o") == p )); then MSG="Ya lo usa ${o^^} en este panel."; return 1; fi
+    fi
+  done
+  if ! is_udp_key "$k" && (( p == SSH_PORT )); then MSG="Es el puerto SSH del servidor."; return 1; fi
+  PCHK=$p
+  (( p == $(pget "$k") )) && return 0                       # sin cambios
+  if is_udp_key "$k"; then
+    if ss -H -lun "sport = :$p" 2>/dev/null | grep -q .; then MSG="El puerto UDP $p ya está en uso."; return 1; fi
+  elif port_busy "$p"; then
+    MSG="El puerto $p ya está en uso por otro programa."; return 1
+  fi
+  return 0
+}
+
+port_set() { printf -v "${PVAR[$1]}" '%s' "$2"; save_ports; }
+
+v2_apply() {   # puerto y path de V2Ray en su config (sin tocar las cuentas)
+  [[ -f $V2CFG ]] || return 0
+  local t; t=$(mktemp)
+  if jq --argjson p "$PORT_V2RAY" --arg w "$V2PATH" \
+       '.inbounds[0].port=$p | .inbounds[0].streamSettings.wsSettings.path=$w' "$V2CFG" > "$t"; then
+    cat "$t" > "$V2CFG"
+  fi
+  rm -f "$t"
+  systemctl restart v2ray
+  fw_open "$PORT_V2RAY" tcp
+  verify v2ray V2Ray
+}
+
+apply_proto() {   # clave -> reescribe su configuración con los puertos actuales (solo si está instalado)
+  local k=$1 was=1
+  proto_installed "$k" || return 0
+  is_on "$k" || was=0
+  case $k in
+    dropbear) unit_dropbear ;;
+    ssl)      conf_ssl ;;
+    badvpn)   unit_badvpn ;;
+    ws)       unit_ws ;;
+    squid)    conf_squid ;;
+    v2ray)    v2_apply ;;
+    udp)      conf_udp ;;
+    slowdns)  [[ -s $BASE/slowdns/ns ]] && unit_slowdns ;;
+    *)        return 0 ;;
+  esac
+  (( was )) || systemctl disable --now "${SVC[$k]}" >/dev/null 2>&1
+  return 0
+}
+
+apply_chain() {   # clave -> la aplica y también a los que dependen de su puerto
+  local d
+  apply_proto "$1"
+  case $1 in
+    dropbear) for d in ws squid; do apply_proto "$d"; done ;;
+    ws)       apply_proto squid ;;
+  esac
+  return 0
+}
+
+proto_port() {   # clave
+  local k=$1 v cur; cur=$(pget "$k")
+  rd "Nuevo puerto para ${k^^} [$cur]: " v || return 1
+  [[ -z $v ]] && { info "Sin cambios"; return 0; }
+  port_check "$k" "$v" || { err "$MSG"; return 1; }
+  [[ $PCHK == "$cur" ]] && { info "Sin cambios"; return 0; }
+  port_set "$k" "$PCHK"
+  ok "Puerto de ${k^^}: $PCHK"
+  if proto_installed "$k"; then info "Aplicando (se reinician los servicios afectados)..."; apply_chain "$k"; fi
+}
+
+ports_wizard() {   # pregunta el puerto de cada protocolo; ENTER conserva el actual
+  local k v cur
+  local -a ch=()
+  printf '\n  %sENTER = conservar el valor actual.%s\n\n' "$DIM" "$RST"
+  for k in "${PORT_KEYS[@]}"; do
+    cur=$(pget "$k")
+    while :; do
+      rd "$(printf '%-10s' "${k^^}") [$cur]: " v || return 1
+      [[ -z $v ]] && break
+      if port_check "$k" "$v"; then
+        [[ $PCHK != "$cur" ]] && { port_set "$k" "$PCHK"; cur=$PCHK; ch+=("$k"); }
+        break
+      fi
+      warn "$MSG"
+    done
+  done
+  ok "Puertos guardados"
+  for k in "${ch[@]}"; do apply_chain "$k"; done
+  return 0
+}
+
+ports_reset() {
+  local k c
+  rd "¿Restaurar los puertos por defecto? (s/N): " c
+  [[ $c == [sS] ]] || return 0
+  for k in "${PORT_KEYS[@]}"; do printf -v "${PVAR[$k]}" '%s' "${PDEF[$k]}"; done
+  V2PATH=/v2ray
+  save_ports
+  ok "Puertos restaurados"
+  for k in dropbear ws squid ssl v2ray badvpn udp slowdns; do apply_proto "$k"; done
+}
+
+v2_path_set() {
+  local p
+  proto_installed v2ray || { err "V2Ray no está instalado."; return 1; }
+  rd "Nuevo path de V2Ray [$V2PATH]: " p
+  [[ -z $p ]] && { info "Sin cambios"; return 0; }
+  [[ $p == /* ]] || p="/$p"
+  [[ $p =~ ^/[A-Za-z0-9._~/-]{1,40}$ ]] || { err "Path inválido (letras, números y . _ ~ - /)"; return 1; }
+  V2PATH=$p; save_ports
+  ok "Path de V2Ray: $V2PATH"
+  apply_proto v2ray
+  info "Vuelve a copiar los enlaces: Cuentas V2Ray > Listar."
+}
+
+slowdns_ns() {
+  local ns
+  [[ -x /usr/local/bin/dnstt-server ]] || { err "SlowDNS no está instalado."; return 1; }
+  info "NameServer actual: $(cat "$BASE/slowdns/ns" 2>/dev/null || echo -)"
+  rd "Nuevo NameServer (NS), ej. ns.midominio.com: " ns
+  [[ $ns =~ ^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]] || { err "NameServer inválido"; return 1; }
+  echo "$ns" > "$BASE/slowdns/ns"
+  unit_slowdns
+}
+
+proto_menu() {   # clave nombre
+  local k=$1 nm=$2 o lbl st
+  case $k in openvpn|wireguard) sub_header "$nm"; proto_action "$k"; pause; return ;; esac
+  while :; do
+    if is_on "$k"; then st="${OKC}${GDOT} ACTIVO${RST}"; lbl=Detener
+    elif proto_installed "$k"; then st="${DIM}${GRING} DETENIDO${RST}"; lbl=Activar
+    else st="${DIM}${GRING} NO INSTALADO${RST}"; lbl=Instalar; fi
+    sub_header "$nm"
+    box_top "ESTADO"
+    box_cols "$(kv Estado "$st")" "$(kv Puerto "$(pget "$k")")"
+    [[ $k == v2ray ]]   && box_row "$(kv Path "$V2PATH")"
+    [[ $k == slowdns ]] && box_row "$(kv NS "$(cat "$BASE/slowdns/ns" 2>/dev/null || echo -)")"
+    box_bottom
+    box_top "ACCIONES"
+    case $k in
+      v2ray)   grid col "$(mcell 01 "$lbl")" "$(mcell 02 'Cambiar puerto')" "$(mcell 03 'Cambiar path')" "$(mcell 00 Volver)" ;;
+      slowdns) grid col "$(mcell 01 "$lbl")" "$(mcell 02 'Cambiar puerto')" "$(mcell 03 'Cambiar NameServer')" "$(mcell 00 Volver)" ;;
+      *)       grid col "$(mcell 01 "$lbl")" "$(mcell 02 'Cambiar puerto')" "$(mcell 00 Volver)" ;;
+    esac
+    box_bottom
+    ask Opción o || return
+    [[ $o =~ ^[0-9]+$ ]] && o=$(( 10#$o ))
+    case $o in
+      1) proto_action "$k" ;;
+      2) proto_port "$k" ;;
+      3) case $k in v2ray) v2_path_set ;; slowdns) slowdns_ns ;; *) continue ;; esac ;;
+      0) return ;;
+      *) continue ;;
+    esac
+    pause
+  done
+}
+
 menu_protocols() {
-  local i k n stt
+  local i k n stt prt
   local -a cells
   while :; do
     cells=()
     for i in "${!PROTO_KEYS[@]}"; do
       k=${PROTO_KEYS[i]}
-      if is_on "$k"; then stt="${OKC}${GDOT} ON${RST}"; else stt="${DIM}${GRING} OFF${RST}"; fi
-      cells+=( "$(printf '%s%02d%s  %s%-12s%s %s' "$ACC" $(( i + 1 )) "$RST" "$TXT" "${PROTO_NAMES[i]}" "$RST" "$stt")" )
+      if is_on "$k"; then stt="${OKC}${GDOT} ON ${RST}"; else stt="${DIM}${GRING} OFF${RST}"; fi
+      prt=''; [[ -n ${PVAR[$k]:-} ]] && prt=":$(pget "$k")"
+      cells+=( "$(printf '%s%02d%s  %s%-10s%s %s %s%s%s' "$ACC" $(( i + 1 )) "$RST" "$TXT" "${PROTO_NAMES[i]}" "$RST" "$stt" "$DIM" "$prt" "$RST")" )
     done
     sub_header "PROTOCOLOS"
-    box_top "ESTADO"
+    box_top "ESTADO Y PUERTOS"
     grid col "${cells[@]}"
     box_bottom
-    printf '\n  %sElige un número: instala si falta, activa o detiene.%s\n' "$DIM" "$RST"
-    printf '  %s00%s  Volver\n' "$ACC" "$RST"
-    ask Opcion n || return
+    box_top "OPCIONES"
+    box_row "$(mcell 11 'Cambiar todos los puertos')"
+    box_row "$(mcell 12 'Restaurar puertos por defecto')"
+    box_row "$(mcell 00 Volver)"
+    box_bottom
+    printf '\n  %sElige un protocolo para activarlo, detenerlo o personalizarlo.%s\n' "$DIM" "$RST"
+    ask Opción n || return
     [[ $n =~ ^[0-9]+$ ]] && n=$(( 10#$n ))
-    [[ $n == 0 ]] && return
-    if [[ $n =~ ^[0-9]+$ ]] && (( n >= 1 && n <= ${#PROTO_KEYS[@]} )); then
-      sub_header "${PROTO_NAMES[n-1]}"
-      proto_action "${PROTO_KEYS[n-1]}"
-      pause
-    fi
+    case $n in
+      0)  return ;;
+      11) sub_header "CAMBIAR PUERTOS"; ports_wizard; pause ;;
+      12) sub_header "RESTAURAR PUERTOS"; ports_reset; pause ;;
+      *)  if [[ $n =~ ^[0-9]+$ ]] && (( n >= 1 && n <= ${#PROTO_KEYS[@]} )); then
+            proto_menu "${PROTO_KEYS[n-1]}" "${PROTO_NAMES[n-1]}"
+          fi ;;
+    esac
   done
 }
 
 # ------------------------------ Herramientas --------------------------
 menu_tools() {
-  local o a
+  local o a b
   while :; do
+    if banner_on; then b="${OKC}${GDOT} ON${RST}"; else b="${DIM}${GRING} OFF${RST}"; fi
     if autostart_on; then a="${OKC}${GDOT} ON${RST}"; else a="${DIM}${GRING} OFF${RST}"; fi
     sub_header "HERRAMIENTAS Y AJUSTES"
     box_top "AJUSTES"
-    grid col "$(mcell 01 'Banner SSH')" "$(mcell 02 'Aceleración BBR')" \
+    grid col "$(mcell 01 'Banner SSH') $b" "$(mcell 02 'Aceleración BBR')" \
              "$(mcell 03 'Memoria swap')" "$(mcell 04 'Limpiar caché')" \
              "$(mcell 05 'Configurar DNS')" "$(mcell 06 'Dominio / SSL')" \
              "$(mcell 07 'Clave root')" "$(mcell 08 'Reiniciar servicios')" \
              "$(mcell 09 'Auto-inicio') $a" "$(mcell 10 'Nombre del VPS')"
     box_bottom
     printf '\n  %s00%s  Volver\n' "$ACC" "$RST"
-    ask Opcion o || return
+    ask Opción o || return
     [[ $o =~ ^[0-9]+$ ]] && o=$(( 10#$o ))
     case $o in
-      1)  sub_header "BANNER SSH";            cfg_banner ;;
+      1)  sub_header "BANNER SSH"; cfg_banner; [[ $? == 3 ]] && continue ;;
       2)  sub_header "ACELERACION BBR";       cfg_bbr ;;
       3)  sub_header "MEMORIA SWAP";          cfg_swap ;;
       4)  sub_header "LIMPIAR CACHE Y LOGS";  cfg_cache ;;
@@ -1452,17 +1799,19 @@ svc_cell() {   # clave etiqueta puerto
 }
 
 header() {
-  local name reg
+  local name reg sub sp
   name=$(vps_name); reg=$(cat "$REG_F" 2>/dev/null)
   cls
   gradient_bar
   echo
   banner_print "${name:-VPS PANEL}"
   echo
-  printf ' %sADMINISTRADOR DE VPS%s  %s%s%s  %sv%s%s\n\n' "$HI" "$RST" "$DIM" "$SEP" "$RST" "$ACC2" "$VERSION" "$RST"
+  sub="ADMINISTRADOR DE VPS  ${SEP}  v${VERSION}"
+  sp=$(( (UW - ${#sub}) / 2 )); (( sp < 1 )) && sp=1
+  printf '%*s%sADMINISTRADOR DE VPS%s  %s%s%s  %sv%s%s\n\n' "$sp" '' "$HI" "$RST" "$DIM" "$SEP" "$RST" "$ACC2" "$VERSION" "$RST"
   sys_stats
   box_top "SERVIDOR"
-  box_cols "$(kv IP "$IP")" "$(kv Hora "$(date +%H:%M:%S)")"
+  box_cols "$(kv IP "$IP" "$IPC")" "$(kv Hora "$(date +%H:%M:%S)")"
   box_row "$(kv Sistema "${OS_NAME:0:$(( IW - 9 ))}")"
   box_cols "$(kv Registro "${reg:--}")" "$(kv Activo "$UPT")"
   res_line CPU   "$CPU_P" "$CPU_X"
@@ -1489,7 +1838,7 @@ main_menu() {
   local o c
   while :; do
     header
-    ask Opcion o || exit 0
+    ask Opción o || exit 0
     [[ $o =~ ^[0-9]+$ ]] && o=$(( 10#$o ))
     case $o in
       1) menu_ssh ;;
@@ -1509,12 +1858,15 @@ usage() { echo "Uso: $0 [--install-all]"; }
 main() {
   preflight
   init_fs
+  load_ports
   init_ui
   trap 'printf "\e[?25h"' EXIT
   init_env
   self_install
+  autostart_default
+  banner_migrate
   case "${1:-}" in
-    --install-all) default_name; install_all; exit 0 ;;
+    --install-all) default_name; INSTALL_AUTO=1; install_all; exit 0 ;;
     -h|--help)     usage; exit 0 ;;
     "") ;;
     *) usage; exit 1 ;;
