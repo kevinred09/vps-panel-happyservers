@@ -13,6 +13,8 @@
 #  Valores por defecto: banner SSH desactivado, auto-inicio del panel activado.
 #  Cuentas SSH nuevas: contrasena xxxx, 30 dias y 1 conexion. En los campos con valor por
 #  defecto ([30], [1]...) ENTER escribe ese valor en el campo para que quede a la vista.
+#  Atajo "1.1" en el menu principal: crea al instante user1, user2, user3... (contrasena xxxx,
+#  30 dias, 1 conexion) sin preguntar nada. La secuencia se guarda en /etc/vpspanel/quick.seq.
 #  Los puertos se cambian en Preparacion del sistema y se guardan en /etc/vpspanel/ports.conf
 #    UDPCUSTOM_URL=<url> vpspanel      (opcional) usar otro binario de udp-custom
 #
@@ -40,6 +42,14 @@ DOMAIN_F=$BASE/domain
 NAME_F=$BASE/vps.name
 REG_F=$BASE/vps.reg
 HIDE_F=$BASE/hide.conf     # partes del panel ocultas (una por linea: name, server, services)
+
+# Atajo "1.1" del menu principal: cuentas user1, user2, user3... creadas sin preguntar nada
+QUICK_PREFIX=user          # nombre base; el numero lo pone la secuencia
+QUICK_PASS=xxxx            # contrasena fija
+QUICK_DAYS=30              # dias de validez
+QUICK_LIMIT=1              # conexiones simultaneas (igual que el valor por defecto de NUEVO USUARIO SSH)
+SEQ_F=$BASE/quick.seq      # ultimo numero usado: la secuencia sigue despues de cerrar o reiniciar
+QUICK_LOCK=$BASE/quick.lock  # candado: dos sesiones del panel no pueden tomar el mismo numero
 V2CFG=/usr/local/etc/v2ray/config.json
 V2PATH=/v2ray
 
@@ -850,6 +860,48 @@ ssh_create() {
   echo "$u:$p" | chpasswd
   echo "$u|$p|$exp|$l" >> "$USERDB"
   show_ssh_info "$u" "$p" "$exp" "$l"
+}
+
+# Atajo "1.1": crea al instante la siguiente cuenta de la secuencia user1, user2, user3...
+# El ultimo numero usado queda en $SEQ_F, asi la secuencia sigue igual despues de cerrar el
+# panel o reiniciar el VPS, y un numero no se reutiliza aunque su cuenta se borre o venza
+# (vps-cleanup borra las vencidas, por eso el numero no se calcula mirando users.db).
+# Si el nombre ya existe (por ejemplo un user5 creado a mano) se salta al siguiente libre:
+# nunca se duplica una cuenta. Solo se avanza el contador cuando la cuenta quedo creada.
+quick_make() {   # se llama con el candado tomado; imprime "usuario|fecha_de_vencimiento"
+  local last=0 n u exp
+  [[ -s $SEQ_F ]] && read -r last < "$SEQ_F"
+  [[ $last =~ ^[0-9]+$ ]] || last=0
+  n=$(( 10#$last + 1 ))
+  while :; do
+    u=$QUICK_PREFIX$n
+    grep -q "^${u}|" "$USERDB" || id "$u" >/dev/null 2>&1 || break
+    n=$(( n + 1 ))
+  done
+  exp=$(date -d "+$QUICK_DAYS days" +%F)
+  useradd -M -s /bin/false -e "$exp" "$u" || { err "No se pudo crear el usuario $u"; return 1; }
+  if ! echo "$u:$QUICK_PASS" | chpasswd; then
+    userdel -f "$u" 2>/dev/null
+    err "No se pudo asignar la contrasena de $u"; return 1
+  fi
+  echo "$u|$QUICK_PASS|$exp|$QUICK_LIMIT" >> "$USERDB"
+  if printf '%s\n' "$n" > "$SEQ_F.tmp"; then    # escritura atomica: el contador nunca queda a medias
+    sync "$SEQ_F.tmp" 2>/dev/null
+    mv -f "$SEQ_F.tmp" "$SEQ_F"
+  fi
+  printf '%s|%s\n' "$u" "$exp"
+}
+
+quick_user() {
+  local out rc u exp
+  ensure_base
+  out=$( { flock -w 10 9 || { err "Otra sesion del panel esta creando un usuario. Intenta de nuevo"; exit 2; }
+           quick_make; } 9>"$QUICK_LOCK" )
+  rc=$?
+  out=${out##*$'\n'}
+  (( rc == 0 )) && [[ $out == *"|"* ]] || return 1
+  IFS='|' read -r u exp <<< "$out"
+  show_ssh_info "$u" "$QUICK_PASS" "$exp" "$QUICK_LIMIT"
 }
 
 # Dias que faltan para una fecha AAAA-MM-DD: desde ahora hasta las 00:00 UTC de esa fecha
@@ -1933,6 +1985,7 @@ header() {
 
   # Menu
   item_m 1 "ADMINISTRAR CUENTAS (SSH/DROPBEAR)"
+  item_m 1.1 "CREAR USUARIO RAPIDO"
   item_m 2 "ADMINISTRAR CUENTAS (V2ray)"
   line_dash
   item_m 3 "PREPARACION DEL SISTEMA" "$HL_GRY"
@@ -1961,6 +2014,7 @@ main_menu() {
     ask o m || exit 0
     case $o in
       1) menu_ssh ;;
+      1.1) sub_header "CREAR USUARIO RAPIDO"; quick_user; pause ;;
       2) menu_v2 ;;
       3) ensure_base; menu_system ;;
       4) sub_header "DESINSTALAR PANEL"; uninstall_all; pause ;;
