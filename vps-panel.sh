@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ======================================================================
-#  VPS PANEL v2.2 - instalador y administrador de protocolos para tuneles
+#  VPS PANEL v2.3 - instalador y administrador de protocolos para tuneles
 #  Compatible con HTTP Custom y apps similares.
 #  SSH, Dropbear, SSL, WebSocket, Squid, V2Ray, BadVPN-UDPGW,
 #  UDP Custom, SlowDNS, OpenVPN y WireGuard
@@ -11,11 +11,15 @@
 #    bash vps-panel.sh --install-all   instalacion completa sin menu
 #
 #  Valores por defecto: banner SSH desactivado, auto-inicio del panel activado.
-#  Los puertos se cambian en Protocolos y se guardan en /etc/vpspanel/ports.conf
+#  Las cuentas SSH nuevas usan la contrasena xxxx (ENTER en el campo la escribe sola).
+#  Los puertos se cambian en Preparacion del sistema y se guardan en /etc/vpspanel/ports.conf
 #    UDPCUSTOM_URL=<url> vpspanel      (opcional) usar otro binario de udp-custom
 #
-#  Interfaz: solo caracteres ASCII (sin emojis ni simbolos especiales).
-#  Todo el aspecto visual esta en el bloque "Interfaz".
+#  Interfaz: replica el panel de referencia (colores RGB exactos, lineas de 53
+#  columnas). Todo el aspecto visual esta en el bloque "Interfaz".
+#    VPSPANEL_COLOR=256 vpspanel       terminal sin colores de 24 bits (aproximado)
+#    VPSPANEL_COLOR=16  vpspanel       colores del tema de la terminal
+#    VPSPANEL_EMOJI=0   vpspanel       sin los iconos del menu SSH
 # ======================================================================
 
 set -u
@@ -24,8 +28,9 @@ export DEBIAN_FRONTEND=noninteractive
 export VPSPANEL_ACTIVE=1
 
 # ------------------------------ Configuracion -------------------------
-VERSION=2.2
+VERSION=2.3
 NAME_MAX=24        # largo maximo del nombre del VPS (se muestra en el titulo)
+DEF_PASS=xxxx      # contrasena por defecto de las cuentas SSH (ENTER en el campo la escribe sola)
 BASE=${VPSPANEL_BASE:-/etc/vpspanel}
 USERDB=$BASE/users.db
 V2DB=$BASE/v2ray.db
@@ -99,27 +104,105 @@ PROTO_NAMES=("DROPBEAR" "SSL" "BADVPN" "WEBSOCKET" "SQUID"
              "V2RAY" "UDP CUSTOM" "SLOWDNS" "OPENVPN" "WIREGUARD")
 
 # ------------------------------ Interfaz ------------------------------
-# Todo el aspecto visual esta en este bloque. Todas las pantallas siguen
-# el mismo estilo:
-#   - lineas "=" rojas arriba y abajo de cada titulo
-#   - menus con el formato "[1] > OPCION" y estados [ON] / [OFF]
-#   - amarillo = titulos, verde = activo o correcto, rojo = apagado o peligro
-# Solo se usan caracteres ASCII: no hay emojis ni simbolos especiales.
+# Todo el aspecto visual esta en este bloque. Replica el panel de referencia:
+#   - lineas "=" y "-" rojas de 53 columnas; titulos en blanco (secciones en naranja)
+#   - menus con el formato "[1] > TEXTO" y estados [ON] verde / [OFF] rojo
+#   - botones con fondo de color (gris, rojo y azul) y titulo con degradado
+# Colores: por defecto RGB de 24 bits (los mismos de la referencia). Si tu terminal no
+# los admite (PuTTY viejo, JuiceSSH, ConnectBot, Terminal de macOS):
+#     VPSPANEL_COLOR=256 vpspanel     colores aproximados de 256
+#     VPSPANEL_COLOR=16  vpspanel     colores del tema de la terminal
+#   o dejalo fijo:  echo 256 > /etc/vpspanel/color.conf
+# Los iconos y el simbolo de grado se escriben como bytes UTF-8 (\x..): el archivo
+# sigue siendo ASCII. VPSPANEL_EMOJI=0 quita los iconos del menu SSH.
 
-ANCHO=52       # ancho de las lineas (las columnas de datos estan pensadas para este ancho)
+ANCHO=53       # ancho de las lineas (igual que la referencia)
 FW=12          # ancho de las etiquetas de field() (algunas pantallas lo cambian)
 VL=0           # largo visible del ultimo texto medido con vlen()
+CMODE=24       # modo de color: 24 (RGB), 256 o 16
+EMOJI=${VPSPANEL_EMOJI:-1}
+GRADMAP=0000000011111111112222222223444   # degradado del titulo: 31 posiciones -> color 0..4
+MON=(Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec)
 
-init_ui() {   # colores: solo si la salida es una terminal (VPSPANEL_COLOR=1 los fuerza)
-  if [[ ( -t 1 || -n ${VPSPANEL_COLOR:-} ) && -z ${NO_COLOR:-} && ${TERM:-dumb} != dumb ]]; then
-    RST=$'\e[0m'
-    RED=$'\e[1;31m'; GRN=$'\e[1;32m'; YEL=$'\e[1;33m'; BLU=$'\e[1;94m'
-    MAG=$'\e[1;35m'; WHT=$'\e[1;37m'; GRY=$'\e[90m'
-    BTN_GRAY=$'\e[30;47m'; BTN_RED=$'\e[1;37;41m'; BTN_BLUE=$'\e[1;37;44m'   # botones con fondo
-  else
-    RST=''; RED=''; GRN=''; YEL=''; BLU=''; MAG=''; WHT=''; GRY=''
-    BTN_GRAY=''; BTN_RED=''; BTN_BLUE=''
+c256() {   # r g b -> indice de la paleta xterm de 256 colores mas cercano
+  local r=$1 g=$2 b=$3 mx mn a rq gq bq
+  mx=$r; (( g > mx )) && mx=$g; (( b > mx )) && mx=$b
+  mn=$r; (( g < mn )) && mn=$g; (( b < mn )) && mn=$b
+  if (( mx - mn < 10 )); then                       # gris: rampa de grises
+    a=$(( (r + g + b) / 3 ))
+    if (( a < 8 )); then echo 16
+    elif (( a > 246 )); then echo 231
+    else echo $(( 232 + (a - 8) / 10 )); fi
+    return
   fi
+  rq=$(( r < 48 ? 0 : r < 115 ? 1 : (r - 35) / 40 ))
+  gq=$(( g < 48 ? 0 : g < 115 ? 1 : (g - 35) / 40 ))
+  bq=$(( b < 48 ? 0 : b < 115 ? 1 : (b - 35) / 40 ))
+  echo $(( 16 + 36 * rq + 6 * gq + bq ))
+}
+
+c_fg() {   # r g b ansi16  -> color de texto (negrita) segun el modo
+  case $CMODE in
+    24)  printf '\e[1;38;2;%d;%d;%dm' "$1" "$2" "$3" ;;
+    256) printf '\e[1;38;5;%dm' "$(c256 "$1" "$2" "$3")" ;;
+    *)   printf '\e[%sm' "$4" ;;
+  esac
+}
+
+c_bt() {   # r g b  r g b  ansi16  -> texto + fondo (botones y resaltados)
+  case $CMODE in
+    24)  printf '\e[1;38;2;%d;%d;%d;48;2;%d;%d;%dm' "$1" "$2" "$3" "$4" "$5" "$6" ;;
+    256) printf '\e[1;38;5;%d;48;5;%dm' "$(c256 "$1" "$2" "$3")" "$(c256 "$4" "$5" "$6")" ;;
+    *)   printf '\e[%sm' "$7" ;;
+  esac
+}
+
+init_ui() {   # colores: solo si la salida es una terminal (VPSPANEL_COLOR=... los fuerza)
+  local mode=${VPSPANEL_COLOR:-}
+  [[ -z $mode && -s $BASE/color.conf ]] && mode=$(head -c 16 "$BASE/color.conf" | tr -dc '0-9A-Za-z')
+  # los iconos y el simbolo de grado son UTF-8: si la sesion no lo es, se fuerza C.UTF-8
+  [[ $(locale charmap 2>/dev/null) == UTF-8 ]] || { export LC_ALL=C.UTF-8; } 2>/dev/null
+  if [[ ( -t 1 || -n ${VPSPANEL_COLOR:-} ) && -z ${NO_COLOR:-} && ${TERM:-dumb} != dumb ]]; then
+    case ${mode,,} in
+      16|ansi)                 CMODE=16 ;;
+      256)                     CMODE=256 ;;
+      24|true|truecolor|24bit) CMODE=24 ;;
+      *) case ${TERM:-} in linux|vt*|ansi|cons*|screen|screen.*) CMODE=16 ;; *) CMODE=24 ;; esac ;;
+    esac
+    RST=$'\e[0m'
+    #            R   G   B  ansi16
+    RED=$(c_fg 242  78  80 '1;31')     # lineas, flechas, etiquetas de puertos, [OFF], peligro
+    GRN=$(c_fg   0 132  99 '1;32')     # numeros [1], [ON], valores
+    BLU=$(c_fg  32 145 246 '1;94')     # etiquetas (S.O:, RAM:, CPU:...)
+    DBL=$(c_fg   8  99 159 '0;34')     # azul oscuro
+    WHT=$(c_fg 255 255 255 '1;37')     # texto de los menus
+    YEL=$(c_fg 236 168  85 '1;33')     # secciones, avisos y pregunta del menu principal
+    LYE=$(c_fg 253 196 125 '1;93')     # amarillo claro (cabeceras de tabla, opciones destacadas)
+    PNK=$(c_fg 210  84 154 '1;35')     # IP
+    GRY=$(c_fg 141 145 165 '0;37')     # gris
+    MAG=$PNK
+    G0=$(c_fg 255  95  95 '1;31'); G1=$(c_fg 255   0 135 '1;31'); G2=$(c_fg 255   0 175 '1;35')
+    G3=$(c_fg 215   0 175 '1;35'); G4=$(c_fg 215   0 215 '1;35')   # degradado del titulo
+    #                  texto (R G B)   fondo (R G B)   ansi16
+    BTN_GRAY=$(c_bt 226 227 232  141 145 165 '30;47')     # boton gris   (SALIR DEL VPS)
+    BTN_RED=$(c_bt  226 227 232  242  78  80 '1;37;41')   # boton rojo   (VOLVER, SALIR DEL SCRIPT)
+    BTN_REDW=$(c_bt 255 255 255  242  78  80 '1;37;41')   # boton rojo con texto blanco (menus SSH)
+    BTN_BLUE=$(c_bt 226 227 232    8  99 159 '1;37;44')   # boton azul   (REBOOT VPS)
+    HL_GRY=$(c_bt   255 255 255  141 145 165 '1;30;47')   # resaltado gris (PREPARACION DEL SISTEMA)
+  else
+    RST=''; RED=''; GRN=''; BLU=''; DBL=''; WHT=''; YEL=''; LYE=''; PNK=''; GRY=''; MAG=''
+    G0=''; G1=''; G2=''; G3=''; G4=''
+    BTN_GRAY=''; BTN_RED=''; BTN_REDW=''; BTN_BLUE=''; HL_GRY=''
+  fi
+  if [[ $EMOJI == 1 ]]; then        # iconos del menu SSH (bytes UTF-8)
+    I_PEN=$' \xe2\x9c\x8f\xef\xb8\x8f'    # lapiz
+    I_BIN=$' \xf0\x9f\x97\x91'            # papelera
+    I_REC=$' \xe2\x99\xbb\xef\xb8\x8f'    # reciclaje
+    I_LUP=$' \xf0\x9f\x94\x8e'            # lupa
+  else
+    I_PEN=''; I_BIN=''; I_REC=''; I_LUP=''
+  fi
+  MK_ON=$'\xe2\x97\x89'; MK_OFF=$'\xe2\x97\x8b'   # marcas de estado: activo / inactivo
   EQ=$(rep = "$ANCHO"); DASH=$(rep - "$ANCHO")
 }
 
@@ -129,7 +212,7 @@ cls()  { [[ -t 1 ]] && printf '\e[H\e[2J\e[3J'; return 0; }                # lim
 
 # ---- Lineas y titulos ------------------------------------------------
 line_eq()   { printf '%s%s%s\n' "$RED" "$EQ" "$RST"; }     # ====================
-line_dash() { printf '%s%s%s\n' "$GRY" "$DASH" "$RST"; }   # --------------------
+line_dash() { printf '%s%s%s\n' "$RED" "$DASH" "$RST"; }   # --------------------
 
 center() {   # texto [color]  ->  texto centrado en la linea
   local pad=$(( (ANCHO - ${#1}) / 2 ))
@@ -137,8 +220,19 @@ center() {   # texto [color]  ->  texto centrado en la linea
   printf '%*s%s%s%s\n' "$pad" '' "${2:-$WHT}" "$1" "$RST"
 }
 
-title()      { line_eq; center "$1" "${2:-$YEL}"; line_eq; }   # barra, titulo, barra
-sub_header() { cls; title "$1"; }                              # pantalla nueva con titulo
+center_grad() {   # texto  ->  centrado, con el degradado de color por caracter del titulo
+  local t=$1 n=${#1} i j out='' pad
+  local -a G=("$G0" "$G1" "$G2" "$G3" "$G4")
+  pad=$(( (ANCHO - n) / 2 )); (( pad < 0 )) && pad=0
+  for (( i = 0; i < n; i++ )); do
+    j=$(( i * 31 / n ))
+    out+="${G[${GRADMAP:j:1}]}${t:i:1}"
+  done
+  printf '%*s%s%s\n' "$pad" '' "$out" "$RST"
+}
+
+title()      { line_eq; center "$1" "${2:-$WHT}"; line_eq; }   # barra, titulo, barra
+sub_header() { cls; title "$1" "${2:-}"; }                     # pantalla nueva con titulo
 
 section() {   # texto  ->  ============ TEXTO ============
   local n=$(( ANCHO - ${#1} - 2 )) l r
@@ -148,40 +242,43 @@ section() {   # texto  ->  ============ TEXTO ============
 }
 
 # ---- Menus -----------------------------------------------------------
-item() {   # numero texto [color]  ->  " [1] > TEXTO"
+item_m() {   # numero texto [color]  ->  " [1] > TEXTO"   (menu principal)
+  printf ' %s[%s]%s %s>%s %s%s%s\n' "$GRN" "$1" "$RST" "$RED" "$RST" "${3:-$WHT}" "$2" "$RST"
+}
+
+item() {   # numero texto [color]  ->  "  [1] > TEXTO"   (submenus: numero alineado a la derecha)
   printf ' %s%4s%s %s>%s %s%s%s\n' "$GRN" "[$1]" "$RST" "$RED" "$RST" "${3:-$WHT}" "$2" "$RST"
 }
 
 onoff() {   # comando [args]  ->  [ON] verde si el comando tiene exito, [OFF] rojo si no
-  if "$@"; then printf '%s%-5s%s' "$GRN" '[ON]' "$RST"; else printf '%s%-5s%s' "$RED" '[OFF]' "$RST"; fi
+  if "$@"; then printf '%s[ON]%s' "$GRN" "$RST"; else printf '%s[OFF]%s' "$RED" "$RST"; fi
 }
 
+ON_W=0   # ancho del texto de item_on (para alinear los estados de un mismo menu)
 item_on() {   # numero texto comando [args]  ->  opcion con su estado al final
   local n=$1 t=$2; shift 2
-  item "$n" "$(printf '%-30s' "$t")$(onoff "$@")"
+  item "$n" "$(printf '%-*s' "$ON_W" "$t") $(onoff "$@")"
 }
 
-menu_end() {   # [texto]  ->  pie de los submenus con el boton [0] > VOLVER
+menu_end() {   # [texto] [estilo]  ->  pie de los submenus: "[0] > VOLVER" (boton rojo)
   line_eq
-  item 0 " ${1:-VOLVER} " "$BTN_RED"
+  item 0 "${1:-VOLVER}" "${2:-$BTN_RED}"
   line_eq
 }
 
 # ---- Datos en columnas -----------------------------------------------
-kv()    { printf '%s%-6s%s %s%s%s' "$BLU" "$1" "$RST" "${3:-$WHT}" "$2" "$RST"; }           # ETIQUETA valor [color]
-pcell() { printf '%s%-11s%s %s%-5s%s' "$RED" "$1:" "$RST" "$GRN" "$2" "$RST"; }             # ETIQUETA: puerto
-field() { printf ' %s%-*s%s %s%s%s\n' "$YEL" "$FW" "$1" "$RST" "${3:-$YEL}" "$2" "$RST"; }  # ETIQUETA valor [color]
+pcell() { printf '%s%s:%s %s%s%s' "$RED" "$1" "$RST" "$GRN" "$2" "$RST"; }                  # ETIQUETA: puerto
+field() { printf ' %s%-*s%s %s%s%s\n' "$BLU" "$FW" "$1" "$RST" "${3:-$WHT}" "$2" "$RST"; }  # ETIQUETA valor [color]
 
-row() {   # celda1 [celda2 [celda3]]  ->  celdas en columnas fijas (de 27 y 13 caracteres)
-  local out=" $1" sp n
-  if [[ -n ${2:-} ]]; then
-    vlen "$1"; n=$(( 27 - VL )); (( n < 1 )) && n=1
-    printf -v sp '%*s' "$n" ''; out+=$sp$2
-    if [[ -n ${3:-} ]]; then
-      vlen "$2"; n=$(( 13 - VL )); (( n < 1 )) && n=1
-      printf -v sp '%*s' "$n" ''; out+=$sp$3
-    fi
-  fi
+cols() {   # "col:celda" ...  ->  celdas colocadas en columnas fijas (col = posicion del primer caracter)
+  local out='' cur=0 spec c cell n sp
+  for spec in "$@"; do
+    c=${spec%%:*}; cell=${spec#*:}
+    n=$(( c - cur )); (( n < 0 )) && n=0
+    printf -v sp '%*s' "$n" ''
+    out+=$sp$cell
+    vlen "$cell"; cur=$(( cur + n + VL ))
+  done
   printf '%s\n' "$out"
 }
 
@@ -198,11 +295,27 @@ pause() {
   read -r _
 }
 
-rd() { local p=$1; shift; read -rp " ${YEL}${p}${RST}" "$@"; }   # pregunta: rd "Texto: " variable
+rd() { local p=$1; shift; read -rp " ${WHT}${p}${RST}" "$@"; }   # pregunta: rd "TEXTO: " variable
 
-ask() {   # variable  ->  pide la opcion del menu (los numeros se normalizan: 01 pasa a 1)
-  local r
-  printf ' %sSeleccione una Opcion:%s ' "$YEL" "$RST"
+rd_pass() {   # texto variable  ->  pide la contrasena; ENTER en el campo vacio escribe DEF_PASS solo
+  local t=$1 v
+  printf ' %s%s%s ' "$WHT" "$t" "$RST"
+  read -r v || return 1
+  if [[ -z $v ]]; then
+    v=$DEF_PASS
+    # sube a la linea de la pregunta y escribe la clave en el campo, a continuacion del texto
+    [[ -t 1 ]] && printf '\e[1A\r\e[%dC%s\n' "$(( ${#t} + 2 ))" "$v"
+  fi
+  printf -v "$2" '%s' "$v"
+}
+
+ask() {   # variable [estilo]  ->  pide la opcion del menu (los numeros se normalizan: 01 pasa a 1)
+  local r txt='Seleccione una Opcion:' col=$WHT
+  case ${2:-} in
+    m) col=$YEL ;;                            # menu principal: naranja
+    u) txt='SELECCIONE UNA OPCION:' ;;        # menus de cuentas: mayusculas
+  esac
+  printf ' %s%s%s ' "$col" "$txt" "$RST"
   read -r r || return 1
   [[ $r =~ ^[0-9]+$ ]] && r=$(( 10#$r ))
   printf -v "$1" '%s' "$r"
@@ -236,6 +349,7 @@ init_env() {
   OS_NAME=$(grep -m1 '^PRETTY_NAME=' /etc/os-release 2>/dev/null | cut -d'"' -f2)
   OS_NAME=${OS_NAME:-Linux}
   OS_NAME=${OS_NAME% \(*}; OS_NAME=${OS_NAME/GNU\/Linux /}   # "Debian GNU/Linux 12 (bookworm)" -> "Debian 12"
+  OS_NAME=${OS_NAME% LTS}                                  # "Ubuntu 20.04.6 LTS" -> "Ubuntu 20.04.6"
 }
 
 preflight() {
@@ -264,8 +378,6 @@ is_on() {
 get_host() { local d; d=$(cat "$DOMAIN_F" 2>/dev/null); echo "${d:-$IP}"; }
 
 valid_name() { [[ $1 =~ ^[a-z_][a-z0-9_-]{2,30}$ ]]; }
-
-rand_pass() { tr -dc 'A-Za-z0-9' </dev/urandom | head -c 10; }
 
 port_busy() { ss -H -ltn "sport = :$1" 2>/dev/null | grep -q .; }
 
@@ -728,14 +840,18 @@ ExecStopPost=-$ipt -t nat -D PREROUTING -p udp --dport 53 -j REDIRECT --to-ports
 # ------------------------- Cuentas SSH (originales) -------------------
 ssh_create() {
   local u p d l exp
-  rd "Usuario: " u
+  sub_header "CREAR USUARIOS"
+  acct_table "$USERDB"
+  menu_end VOLVER "$BTN_REDW"
+  rd "NUEVO USUARIO: " u || return 3
+  [[ -n $u && $u != 0 ]] || return 3
   valid_name "$u" || { err "Usuario invalido (3-31 caracteres: a-z 0-9 _ -)"; return 1; }
   if id "$u" >/dev/null 2>&1; then err "El usuario ya existe"; return 1; fi
-  rd "Contrasena [aleatoria]: " p; p=${p:-$(rand_pass)}
+  rd_pass "CONTRASENA:" p || return 1
   [[ $p != *"|"* && -n $p ]] || { err "La contrasena no puede contener '|'"; return 1; }
-  rd "Dias de validez [30]: " d; d=${d:-30}
+  rd "DIAS DE VALIDEZ [30]: " d; d=${d:-30}
   [[ $d =~ ^[0-9]+$ ]] || { err "Dias invalidos"; return 1; }
-  rd "Limite de conexiones [1]: " l; l=${l:-1}
+  rd "LIMITE DE CONEXIONES [1]: " l; l=${l:-1}
   [[ $l =~ ^[0-9]+$ ]] || { err "Limite invalido"; return 1; }
   exp=$(date -d "+$d days" +%F)
   useradd -M -s /bin/false -e "$exp" "$u" || { err "No se pudo crear el usuario"; return 1; }
@@ -744,40 +860,54 @@ ssh_create() {
   show_ssh_info "$u" "$p" "$exp" "$l"
 }
 
-# Dias que faltan para una fecha AAAA-MM-DD (negativo si ya vencio).
-today_s() { date -u -d "$(date +%F)" +%s; }   # hoy a las 00:00, en segundos
-
-days_left() {   # fecha hoy_en_segundos
-  local s
+# Dias que faltan para una fecha AAAA-MM-DD: desde ahora hasta las 00:00 UTC de esa fecha
+# (cuando la cuenta vence), redondeado hacia abajo. Negativo si ya vencio.
+days_left() {   # fecha ahora_en_segundos
+  local s r
   s=$(date -u -d "$1" +%s 2>/dev/null) || { echo 0; return; }
-  echo $(( (s - $2) / 86400 ))
+  r=$(( s - $2 ))
+  if (( r < 0 && r % 86400 != 0 )); then echo $(( r / 86400 - 1 )); else echo $(( r / 86400 )); fi
 }
 
-# Tabla de cuentas con numero, vencimiento y dias que faltan (en rojo: vencidas;
-# en amarillo: faltan 3 dias o menos). Deja los nombres en ACCT[].
+fdate() {   # AAAA-MM-DD -> FD="May10/27" (mes en ingles, como la referencia)
+  if [[ $1 =~ ^[0-9]{4}-(0[1-9]|1[0-2])-[0-9]{2}$ ]]; then
+    FD="${MON[10#${BASH_REMATCH[1]} - 1]}${1:8:2}/${1:2:2}"
+  else
+    FD='--------'
+  fi
+}
+
+# Tabla de cuentas: N, nombre, clave, fecha, dias que faltan, limite y estado (ULK = sin
+# bloquear, LOK = bloqueada). Deja los nombres en ACCT[].
 # El archivo puede ser users.db (SSH: con clave y limite) o v2ray.db (V2Ray).
 acct_table() {   # archivo
-  local db=$1 kind=v2 n p e l d c now
+  local db=$1 kind=v2 n p e l d c now sta num
+  local -A LK=()
   [[ $db == "$USERDB" ]] && kind=ssh
   ACCT=()
-  now=$(today_s)
+  now=$(date +%s)
+  num=$'N\xc2\xb0'
   if [[ $kind == ssh ]]; then
-    printf ' %s%3s  %-16s %-10s %-8s %4s %3s%s\n' "$WHT" N USUARIO CLAVE FECHA DIAS LIM "$RST"
+    if [[ -r /etc/shadow ]]; then
+      while IFS=: read -r n p _; do [[ $p == '!'* ]] && LK[$n]=1; done < /etc/shadow
+    fi
+    printf '%s  %s %-14s%-14s%-9s%-4s%-4s%s%s\n' "$LYE" "$num" Usuario Contrasena Fecha Dia Lim Sta "$RST"
   else
-    printf ' %s%3s  %-20s %-8s %4s%s\n' "$WHT" N CUENTA FECHA DIAS "$RST"
+    printf '%s  %s %-28s%-9s%s%s\n' "$LYE" "$num" Cuenta Fecha Dia "$RST"
   fi
   line_dash
   while IFS='|' read -r n p e l; do
     [[ -n $n ]] || continue
     ACCT+=("$n")
-    d=$(days_left "$e" "$now")
-    if (( d < 0 )); then c=$RED; elif (( d <= 3 )); then c=$YEL; else c=$GRN; fi
+    d=$(days_left "$e" "$now"); fdate "$e"
+    if (( d < 0 )); then c=$RED; else c=$GRN; fi
     if [[ $kind == ssh ]]; then
-      printf ' %s%3d)%s %-16.16s %-10.10s %s%-8s %4d%s %s%3s%s\n' \
-        "$GRN" "${#ACCT[@]}" "$RST" "$n" "$p" "$c" "${e:8:2}/${e:5:2}/${e:2:2}" "$d" "$RST" "$YEL" "${l:--}" "$RST"
+      if [[ -n ${LK[$n]:-} ]]; then sta="${RED}LOK"; else sta="${GRN}ULK"; fi
+      printf '%s%3d)%s-%s%-14.14s%-14.14s%s%-9s%s%-4s%s%-4s%s%s\n' \
+        "$GRN" "${#ACCT[@]}" "$RED" "$WHT" "$n" "$p" "$RED" "$FD" "$c" "$d" "$LYE" "${l:--}" "$sta" "$RST"
     else
-      printf ' %s%3d)%s %-20.20s %s%-8s %4d%s\n' \
-        "$GRN" "${#ACCT[@]}" "$RST" "$n" "$c" "${e:8:2}/${e:5:2}/${e:2:2}" "$d" "$RST"
+      printf '%s%3d)%s-%s%-28.28s%s%-9s%s%-4s%s\n' \
+        "$GRN" "${#ACCT[@]}" "$RED" "$WHT" "$n" "$RED" "$FD" "$c" "$d" "$RST"
     fi
   done < "$db"
 }
@@ -789,8 +919,8 @@ pick_account() {   # archivo
   PICK=
   grep -q '^[^|]' "$db" 2>/dev/null || { warn "No hay cuentas creadas"; return 1; }
   acct_table "$db"
-  printf '\n %sTOTAL: %d   (en rojo: vencidas)%s\n\n' "$BLU" "${#ACCT[@]}" "$RST"
-  rd "Numero o nombre (0 = cancelar): " sel || return 3
+  menu_end VOLVER "$BTN_REDW"
+  rd "NUMERO O NOMBRE: " sel || return 3
   sel=${sel//[[:space:]]/}
   [[ -n $sel && $sel != 0 ]] || return 3
   if [[ $sel =~ ^[0-9]+$ ]]; then
@@ -810,7 +940,7 @@ ssh_delete() {
   pick_account "$USERDB" || return $?
   u=$PICK
   valid_name "$u" && grep -q "^${u}|" "$USERDB" || { err "Usuario no encontrado"; return 1; }
-  rd "Eliminar la cuenta $u? (s/N): " c
+  rd "ELIMINAR LA CUENTA $u? (s/N): " c
   [[ $c == [sS]* ]] || return 3
   pkill -KILL -u "$u" 2>/dev/null
   userdel -f "$u" 2>/dev/null
@@ -823,7 +953,7 @@ ssh_renew() {
   pick_account "$USERDB" || return $?
   u=$PICK
   valid_name "$u" && grep -q "^${u}|" "$USERDB" || { err "Usuario no encontrado"; return 1; }
-  rd "Dias desde hoy para $u [30]: " d; d=${d:-30}
+  rd "DIAS DESDE HOY PARA $u [30]: " d; d=${d:-30}
   [[ $d =~ ^[0-9]+$ ]] || { err "Dias invalidos"; return 1; }
   exp=$(date -d "+$d days" +%F)
   usermod -e "$exp" "$u" && db_set "$u" 3 "$exp" && ok "$u vence el $exp"
@@ -831,9 +961,9 @@ ssh_renew() {
 
 ssh_passwd() {
   local u p
-  rd "Usuario: " u
+  rd "USUARIO: " u
   valid_name "$u" && grep -q "^${u}|" "$USERDB" || { err "Usuario no encontrado"; return 1; }
-  rd "Nueva contrasena [aleatoria]: " p; p=${p:-$(rand_pass)}
+  rd_pass "NUEVA CONTRASENA:" p || return 1
   [[ $p != *"|"* && -n $p ]] || { err "La contrasena no puede contener '|'"; return 1; }
   echo "$u:$p" | chpasswd && db_set "$u" 2 "$p" && ok "Nueva contrasena de $u: $p"
 }
@@ -861,7 +991,7 @@ v2_delete() {
   pick_account "$V2DB" || return $?
   n=$PICK
   valid_name "$n" && grep -q "^${n}|" "$V2DB" || { err "Cuenta no encontrada"; return 1; }
-  rd "Eliminar la cuenta $n? (s/N): " c
+  rd "ELIMINAR LA CUENTA $n? (s/N): " c
   [[ $c == [sS]* ]] || return 3
   v2_edit --arg em "$n" '.inbounds[0].settings.clients |= map(select(.email != $em))' || return 1
   sed -i "/^${n}|/d" "$V2DB"
@@ -874,7 +1004,7 @@ v2_renew() {
   pick_account "$V2DB" || return $?
   n=$PICK
   valid_name "$n" && grep -q "^${n}|" "$V2DB" || { err "Cuenta no encontrada"; return 1; }
-  rd "Dias desde hoy para $n [30]: " d; d=${d:-30}
+  rd "DIAS DESDE HOY PARA $n [30]: " d; d=${d:-30}
   [[ $d =~ ^[0-9]+$ ]] || { err "Dias invalidos"; return 1; }
   exp=$(date -d "+$d days" +%F)
   t=$(mktemp)
@@ -1102,7 +1232,7 @@ uninstall_all() {
   local c s u p
   warn "Se eliminaran el panel y sus servicios."
   warn "Tambien se borraran las cuentas SSH."
-  rd "Escribe SI para continuar: " c
+  rd "ESCRIBE SI PARA CONTINUAR: " c
   [[ $c == SI ]] || return 0
   while IFS='|' read -r u p _; do
     [[ -n $u ]] || continue
@@ -1157,16 +1287,16 @@ register_vps() {
     fi
     echo " Maximo $NAME_MAX caracteres (letras, numeros, . _ -)"
     echo
-    rd "Nombre del VPS: " name || { err "No hay entrada disponible"; return 1; }
+    rd "NOMBRE DEL VPS: " name || { err "No hay entrada disponible"; return 1; }
     read -ra w <<< "$name"; name="${w[*]:-}"            # quita espacios sobrantes
     if [[ -z $name && -n $cur ]]; then return 0; fi
     if ! name_check "$name"; then
       warn "$MSG"; sleep 2; continue
     fi
     sub_header "REGISTRO DE VPS"
-    center "=====>>>> ${name^^} <<<<=====" "$YEL"
+    center_grad "=====>>>> ${name^^} <<<<====="
     echo
-    rd "Confirmar este nombre? [S/n]: " ans || return 1
+    rd "CONFIRMAR ESTE NOMBRE? [S/n]: " ans || return 1
     [[ $ans == [nN]* ]] && continue
     printf '%s\n' "$name" > "$NAME_F"
     [[ -s $REG_F ]] || date +%d/%m/%Y > "$REG_F"
@@ -1261,10 +1391,10 @@ EOF
 
 show_ports_plan() {
   section "PUERTOS A USAR"
-  row "$(pcell DROPBEAR "$PORT_DROPBEAR")"  "$(pcell SSL "$PORT_SSL")"
-  row "$(pcell WEBSOCKET "$PORT_WS")"       "$(pcell SQUID "$PORT_SQUID")"
-  row "$(pcell V2RAY "$PORT_V2RAY")"        "$(pcell BADVPN "$PORT_BADVPN")"
-  row "$(pcell 'UDP CUSTOM' "$PORT_UDP")"
+  cols "1:$(pcell DROPBEAR "$PORT_DROPBEAR")"  "21:$(pcell SSL "$PORT_SSL")"
+  cols "1:$(pcell WEBSOCKET "$PORT_WS")"       "21:$(pcell SQUID "$PORT_SQUID")"
+  cols "1:$(pcell V2RAY "$PORT_V2RAY")"        "21:$(pcell BADVPN "$PORT_BADVPN")"
+  cols "1:$(pcell UDPCUSTOM "$PORT_UDP")"
 }
 
 install_all() {
@@ -1304,63 +1434,62 @@ show_ssh_info() { # usuario clave expira limite
   local FW=24   # etiquetas mas anchas en esta pantalla
   cls
   title "USUARIO CREADO CON EXITO!" "$GRN"
-  field "IP:" "$IP" "$MAG"
+  field "IP:" "$IP" "$PNK"
   [[ -s $DOMAIN_F ]] && field "DOMINIO:" "$(get_host)"
   field "NOMBRE DE USUARIO:" "$1"
   field "CONTRASENA DE USUARIO:" "$2"
   field "CONEXIONES:" "$4"
   field "EXPIRA EN:" "${3:8:2}/${3:5:2}/${3:0:4}"
   section "PUERTOS"
-  row "$(pcell SSH "$SSH_PORT")"      "$(pcell DROPBEAR "$PORT_DROPBEAR")"
-  row "$(pcell SSL "$PORT_SSL")"      "$(pcell WEBSOCKET "$PORT_WS")"
-  row "$(pcell SQUID "$PORT_SQUID")"  "$(pcell 'UDP CUSTOM' "$PORT_UDP")"
+  cols "1:$(pcell SSH "$SSH_PORT")"     "21:$(pcell DROPBEAR "$PORT_DROPBEAR")"
+  cols "1:$(pcell SSL "$PORT_SSL")"     "21:$(pcell WEBSOCKET "$PORT_WS")"
+  cols "1:$(pcell SQUID "$PORT_SQUID")" "21:$(pcell UDPCUSTOM "$PORT_UDP")"
   line_eq
   field "UDPGW:" "127.0.0.1:$PORT_BADVPN" "$GRN"
-  printf ' %sPAYLOAD WS:%s\n' "$YEL" "$RST"
+  printf ' %sPAYLOAD WS:%s\n' "$BLU" "$RST"
   printf ' %sGET / HTTP/1.1[crlf]Host: %s[crlf]Upgrade: websocket[crlf][crlf]%s\n' "$GRN" "$(get_host)" "$RST"
 }
 
 ssh_list() {
   grep -q '^[^|]' "$USERDB" 2>/dev/null || { warn "No hay usuarios creados"; return 0; }
   acct_table "$USERDB"
-  printf '\n %sTOTAL: %d   (en rojo: vencidos)%s\n' "$BLU" "${#ACCT[@]}" "$RST"
+  printf '\n %sTOTAL: %d%s\n' "$BLU" "${#ACCT[@]}" "$RST"
 }
 
 ssh_online() {
   local u p e l n tot=0
-  printf ' %s%-20s %s%s\n' "$WHT" USUARIO CONEXIONES "$RST"
+  printf '%s %-20s %s%s\n' "$LYE" USUARIO CONEXIONES "$RST"
   line_dash
   while IFS='|' read -r u p e l; do
     [[ -n $u ]] || continue
     n=$(ps -u "$u" -o comm= 2>/dev/null | grep -cE '^(sshd|dropbear)$')
-    if (( n > 0 )); then printf ' %-20s %s%s%s\n' "$u" "$GRN" "$n" "$RST"; tot=$(( tot + n )); fi
+    if (( n > 0 )); then printf ' %s%-20s%s %s%s%s\n' "$WHT" "$u" "$RST" "$GRN" "$n" "$RST"; tot=$(( tot + n )); fi
   done < "$USERDB"
   printf '\n %sTOTAL DE CONEXIONES: %d%s\n' "$BLU" "$tot" "$RST"
 }
 
 menu_ssh() {
   ensure_base
-  local o n
+  local o
   while :; do
-    n=$(grep -c '^[^|]' "$USERDB" 2>/dev/null); n=${n:-0}
-    sub_header "ADMINISTRACION DE USUARIOS SSH"
-    field "USUARIOS CREADOS:" "$n" "$GRN"
-    line_dash
-    item 1 "NUEVO USUARIO SSH"
-    item 2 "REMOVER USUARIO" "$RED"
-    item 3 "RENOVAR USUARIO" "$GRN"
+    sub_header "ADMINISTRACION DE USUARIOS SSH V16"
+    item 1 "NUEVO USUARIO SSH$I_PEN"
+    item 2 "REMOVER USUARIO$I_BIN" "$RED"
+    item 3 "RENOVAR USUARIO$I_REC" "$GRN"
     item 4 "CAMBIAR CONTRASENA"
-    item 5 "DETALLES DE TODOS LOS USUARIOS" "$GRN"
+    line_dash
+    item 5 "DETALLES DE TODOS USUARIOS$I_LUP" "$GRN"
     item 6 "MONITOR DE USUARIOS CONECTADOS"
+    line_dash
     item 7 "ELIMINAR USUARIOS VENCIDOS"
-    menu_end
-    ask o || return
+    menu_end VOLVER "$BTN_REDW"
+    ask o u || return
     case $o in
-      1) sub_header "NUEVO USUARIO SSH";              ssh_create ;;
+      1) ssh_create;                                  [[ $? == 3 ]] && continue ;;
       2) sub_header "REMOVER USUARIO";                ssh_delete; [[ $? == 3 ]] && continue ;;
       3) sub_header "RENOVAR USUARIO";                ssh_renew;  [[ $? == 3 ]] && continue ;;
       4) sub_header "CAMBIAR CONTRASENA";             ssh_passwd ;;
-      5) sub_header "DETALLES DE TODOS LOS USUARIOS"; ssh_list ;;
+      5) sub_header "DETALLES DE TODOS USUARIOS";     ssh_list ;;
       6) sub_header "MONITOR DE USUARIOS CONECTADOS"; ssh_online ;;
       7) sub_header "ELIMINAR USUARIOS VENCIDOS";     /usr/local/bin/vps-cleanup && ok "Usuarios vencidos eliminados" ;;
       0) return ;;
@@ -1374,10 +1503,10 @@ menu_ssh() {
 v2_create() {
   v2_need || return 1
   local n d id exp
-  rd "Nombre de la cuenta: " n
+  rd "NOMBRE DE LA CUENTA: " n
   valid_name "$n" || { err "Nombre invalido (3-31 caracteres: a-z 0-9 _ -)"; return 1; }
   if grep -q "^${n}|" "$V2DB"; then err "La cuenta ya existe"; return 1; fi
-  rd "Dias de validez [30]: " d; d=${d:-30}
+  rd "DIAS DE VALIDEZ [30]: " d; d=${d:-30}
   [[ $d =~ ^[0-9]+$ ]] || { err "Dias invalidos"; return 1; }
   id=$(cat /proc/sys/kernel/random/uuid)
   exp=$(date -d "+$d days" +%F)
@@ -1399,7 +1528,7 @@ v2_create() {
 
 v2_list() {
   local n id e c=0 d col now
-  now=$(today_s)
+  now=$(date +%s)
   while IFS='|' read -r n id e; do
     [[ -n $n ]] || continue
     d=$(days_left "$e" "$now")
@@ -1414,18 +1543,16 @@ v2_list() {
 
 menu_v2() {
   ensure_base
-  local o n
+  local o
   while :; do
-    n=$(grep -c '^[^|]' "$V2DB" 2>/dev/null); n=${n:-0}
     sub_header "ADMINISTRACION DE CUENTAS V2RAY"
-    field "CUENTAS CREADAS:" "$n" "$GRN"
+    item 1 "NUEVA CUENTA V2RAY$I_PEN"
+    item 2 "REMOVER CUENTA$I_BIN" "$RED"
+    item 3 "RENOVAR CUENTA$I_REC" "$GRN"
     line_dash
-    item 1 "NUEVA CUENTA V2RAY"
-    item 2 "REMOVER CUENTA" "$RED"
-    item 3 "RENOVAR CUENTA" "$GRN"
-    item 4 "DETALLES Y ENLACES DE LAS CUENTAS" "$GRN"
-    menu_end
-    ask o || return
+    item 4 "DETALLES Y ENLACES DE LAS CUENTAS$I_LUP" "$GRN"
+    menu_end VOLVER "$BTN_REDW"
+    ask o u || return
     case $o in
       1) sub_header "NUEVA CUENTA V2RAY";        v2_create ;;
       2) sub_header "REMOVER CUENTA V2RAY";      v2_delete; [[ $? == 3 ]] && continue ;;
@@ -1600,20 +1727,25 @@ slowdns_ns() {
   unit_slowdns
 }
 
-proto_menu() {   # clave nombre
-  local k=$1 nm=$2 o lbl st
+proto_menu() {   # clave nombre   (administrador de un protocolo)
+  local k=$1 nm=$2 o st sub
   case $k in openvpn|wireguard) sub_header "$nm"; proto_action "$k"; pause; return ;; esac
   while :; do
-    if is_on "$k"; then st="${GRN}ACTIVO${RST}"; lbl=DETENER
-    elif proto_installed "$k"; then st="${RED}DETENIDO${RST}"; lbl=ACTIVAR
-    else st="${RED}NO INSTALADO${RST}"; lbl=INSTALAR; fi
-    sub_header "$nm"
-    field "ESTADO:" "$st"
-    field "PUERTO:" "$(pget "$k")" "$GRN"
-    [[ $k == v2ray ]]   && field "PATH:" "$V2PATH" "$GRN"
-    [[ $k == slowdns ]] && field "NS:" "$(cat "$BASE/slowdns/ns" 2>/dev/null || echo -)" "$GRN"
+    if is_on "$k" || proto_installed "$k"; then st=installed; else st=none; fi
+    sub="PUERTO: $(pget "$k")"
+    [[ $k == ws ]]       && sub+=" >> $SSH_PORT"
+    [[ $k == v2ray ]]    && sub+="   PATH: $V2PATH"
+    [[ $k == slowdns ]]  && sub+="   NS: $(cat "$BASE/slowdns/ns" 2>/dev/null || echo -)"
+    cls
+    title "$nm MANAGER"
+    center "$sub" "$LYE"
     line_eq
-    item 1 "$lbl $nm"
+    if [[ $st == installed ]]; then
+      item_on 1 "INICIAR/PARAR SERVICIO" is_on "$k"
+    else
+      item 1 "INSTALAR $nm" "$GRN"
+    fi
+    line_dash
     item 2 "CAMBIAR PUERTO"
     [[ $k == v2ray ]]   && item 3 "CAMBIAR PATH"
     [[ $k == slowdns ]] && item 3 "CAMBIAR NAMESERVER"
@@ -1630,39 +1762,14 @@ proto_menu() {   # clave nombre
   done
 }
 
-menu_protocols() {
-  local i k n p
-  while :; do
-    sub_header "PROTOCOLOS Y PUERTOS"
-    for i in "${!PROTO_KEYS[@]}"; do
-      k=${PROTO_KEYS[i]}
-      p=''; [[ -n ${PVAR[$k]:-} ]] && p=$(pget "$k")
-      item "$(( i + 1 ))" "$(printf '%-12s' "${PROTO_NAMES[i]}")$(onoff is_on "$k")  ${GRN}${p}${RST}"
-    done
-    line_dash
-    item 11 "CAMBIAR TODOS LOS PUERTOS"
-    item 12 "RESTAURAR PUERTOS POR DEFECTO"
-    menu_end
-    ask n || return
-    case $n in
-      0)  return ;;
-      11) sub_header "CAMBIAR PUERTOS"; ports_wizard; pause ;;
-      12) sub_header "RESTAURAR PUERTOS"; ports_reset; pause ;;
-      *)  if [[ $n =~ ^[0-9]+$ ]] && (( n >= 1 && n <= ${#PROTO_KEYS[@]} )); then
-            proto_menu "${PROTO_KEYS[n-1]}" "${PROTO_NAMES[n-1]}"
-          fi ;;
-    esac
-  done
-}
-
 # ------------------------------ Herramientas --------------------------
 menu_view() {   # mostrar u ocultar partes de la pantalla principal
-  local o
+  local o ON_W=26
   while :; do
     sub_header "VISTA DEL PANEL"
     item_on 1 "MOSTRAR NOMBRE DEL VPS"        is_shown name
     item_on 2 "MOSTRAR DATOS DEL SERVIDOR"    is_shown server
-    item_on 3 "MOSTRAR LISTA DE SERVICIOS"    is_shown services
+    item_on 3 "MOSTRAR PUERTOS ACTIVOS"       is_shown services
     menu_end
     ask o || return
     case $o in
@@ -1674,150 +1781,201 @@ menu_view() {   # mostrar u ocultar partes de la pantalla principal
   done
 }
 
-menu_tools() {
-  local o
+# Celdas de la pantalla de preparacion del sistema (dos columnas, como la referencia)
+scell() {   # numero texto [clave de protocolo]  ->  " [1]> TEXTO         [ON]"
+  local st=''
+  [[ -n ${3:-} ]] && st=$(onoff is_on "$3")
+  printf ' %s%4s%s%s>%s %s%-14s%s%s' "$GRN" "[$1]" "$RST" "$RED" "$RST" "$WHT" "$2" "$RST" "$st"
+}
+
+qcell() {   # numero texto [marca]  ->  " [11]> TEXTO  o"  (la marca va en la columna del estado)
+  local pad
+  printf ' %s%4s%s%s>%s %s%s%s' "$GRN" "[$1]" "$RST" "$RED" "$RST" "$WHT" "$2" "$RST"
+  if [[ -n ${3:-} ]]; then
+    pad=$(( 14 - ${#2} )); (( pad < 1 )) && pad=1
+    printf '%*s%s' "$pad" '' "$3"
+  fi
+}
+
+swap_on() { swapon --show --noheadings 2>/dev/null | grep -q .; }
+
+mark() {   # comando [args]  ->  marca verde (activo) o roja (inactivo)
+  if "$@"; then printf '%s%s%s' "$GRN" "$MK_ON" "$RST"; else printf '%s%s%s' "$RED" "$MK_OFF" "$RST"; fi
+}
+
+menu_system() {   # PREPARACION DEL SISTEMA: puertos activos, protocolos y configuraciones rapidas
+  local o i h n
   while :; do
-    sub_header "HERRAMIENTAS Y AJUSTES"
-    item_on 1 "BANNER SSH" banner_on
-    item    2 "ACELERACION TCP BBR"
-    item    3 "MEMORIA SWAP"
-    item    4 "LIMPIAR CACHE Y LOGS"
-    item    5 "CONFIGURAR DNS"
-    item    6 "DOMINIO Y CERTIFICADO SSL"
-    item    7 "CLAVE Y ACCESO ROOT"
-    item    8 "REINICIAR SERVICIOS"
-    item_on 9 "AUTO-INICIO DEL PANEL" autostart_on
-    item   10 "NOMBRE DEL VPS"
-    item   11 "VISTA DEL PANEL"
-    menu_end
+    cls
+    title "INFORMACION DEL SISTEMA Y PUERTOS ACTIVOS" "$YEL"
+    ports_block
+    section "MENU DE PROTOCOLOS"
+    n=${#PROTO_KEYS[@]}; h=$(( (n + 1) / 2 ))        # izquierda 1..h, derecha h+1..n
+    for (( i = 0; i < h; i++ )); do
+      if (( i + h < n )); then
+        cols "0:$(scell $(( i + 1 )) "${PROTO_NAMES[i]}" "${PROTO_KEYS[i]}")" \
+             "26:$(scell $(( i + h + 1 )) "${PROTO_NAMES[i + h]}" "${PROTO_KEYS[i + h]}")"
+      else
+        cols "0:$(scell $(( i + 1 )) "${PROTO_NAMES[i]}" "${PROTO_KEYS[i]}")"
+      fi
+    done
+    section "CONFIGURACIONES RAPIDAS"
+    cols "0:$(qcell 11 'CAMBIAR PUERTOS')"      "26:$(qcell 16 'LIMPIAR CACHE/LOGS')"
+    cols "0:$(qcell 12 'RESTAURAR PUERTOS')"    "26:$(qcell 17 'CONFIGURAR IP DNS')"
+    cols "0:$(qcell 13 'BANNER SSH')"           "26:$(qcell 18 'GEN DOMI/CERT-SSL' "$(mark test -s "$DOMAIN_F")")"
+    cols "0:$(qcell 14 'ACELERACION TCPBBR')"   "26:$(qcell 19 'CLAVE Y ACCESO ROOT')"
+    cols "0:$(qcell 15 'MEMORIA SWAP' "$(mark swap_on)")" "26:$(qcell 20 'REINICIAR SERVICIOS')"
+    line_eq
+    item 21 "NOMBRE DEL VPS"  "$DBL"
+    item 22 "VISTA DEL PANEL" "$BLU"
+    line_eq
+    printf ' %s%4s%s %s>%s    %s VOLVER %s        %s%4s%s %s>%s %sAUTO-INICIAR%s %s\n' \
+      "$GRN" "[0]" "$RST" "$RED" "$RST" "$BTN_RED" "$RST" \
+      "$GRN" "[23]" "$RST" "$RED" "$RST" "$WHT" "$RST" "$(onoff autostart_on)"
+    line_eq
     ask o || return
     case $o in
-      1)  sub_header "BANNER SSH"; cfg_banner; [[ $? == 3 ]] && continue ;;
-      2)  sub_header "ACELERACION TCP BBR";    cfg_bbr ;;
-      3)  sub_header "MEMORIA SWAP";           cfg_swap ;;
-      4)  sub_header "LIMPIAR CACHE Y LOGS";   cfg_cache ;;
-      5)  sub_header "CONFIGURAR DNS";         cfg_dns ;;
-      6)  sub_header "DOMINIO Y CERTIFICADO";  cfg_domain ;;
-      7)  sub_header "CLAVE Y ACCESO ROOT";    cfg_root ;;
-      8)  sub_header "REINICIAR SERVICIOS";    restart_services ;;
-      9)  toggle_autostart ;;
-      10) cfg_vpsname; continue ;;
-      11) menu_view; continue ;;
       0)  return ;;
-      *)  continue ;;
+      11) sub_header "CAMBIAR PUERTOS";        ports_wizard ;;
+      12) sub_header "RESTAURAR PUERTOS";      ports_reset ;;
+      13) sub_header "BANNER SSH";             cfg_banner; [[ $? == 3 ]] && continue ;;
+      14) sub_header "ACELERACION TCP BBR";    cfg_bbr ;;
+      15) sub_header "MEMORIA SWAP";           cfg_swap ;;
+      16) sub_header "LIMPIAR CACHE Y LOGS";   cfg_cache ;;
+      17) sub_header "CONFIGURAR DNS";         cfg_dns ;;
+      18) sub_header "DOMINIO Y CERTIFICADO";  cfg_domain ;;
+      19) sub_header "CLAVE Y ACCESO ROOT";    cfg_root ;;
+      20) sub_header "REINICIAR SERVICIOS";    restart_services ;;
+      21) cfg_vpsname; continue ;;
+      22) menu_view; continue ;;
+      23) toggle_autostart ;;
+      *)  if [[ $o =~ ^[0-9]+$ ]] && (( o >= 1 && o <= ${#PROTO_KEYS[@]} )); then
+            proto_menu "${PROTO_KEYS[o-1]}" "${PROTO_NAMES[o-1]}"
+          fi
+          continue ;;
     esac
     pause
   done
 }
 
 # ---------------------------------- Menu ------------------------------
-fmt_mb() { local m=$1; if (( m >= 1024 )); then printf '%d.%dG' $(( m / 1024 )) $(( (m % 1024) * 10 / 1024 )); else printf '%dM' "$m"; fi; }
-
-sys_stats() {   # llena las variables de CPU, RAM, disco y tiempo activo que muestra header()
-  local l1 mt mu dt du up d h m
-  read -r l1 _ < /proc/loadavg
-  CPU_N=$(nproc 2>/dev/null || echo 1)
-  CPU_LOAD=$l1
-  CPU_P=$(awk -v l="$l1" -v n="$CPU_N" 'BEGIN{p=l/n*100; if(p>100)p=100; printf "%d", p}')
-  read -r mt mu < <(free -m | awk '/^Mem:/{print $2, $3}')
-  mt=${mt:-0}; mu=${mu:-0}
-  RAM_T=$(fmt_mb "$mt"); RAM_U=$(fmt_mb "$mu"); RAM_F=$(fmt_mb $(( mt - mu )))
-  RAM_P=$(( mt > 0 ? mu * 100 / mt : 0 ))
-  read -r dt du < <(df -Pm / | awk 'NR==2{print $2, $3}')
-  dt=${dt:-0}; du=${du:-0}
-  DSK_P=$(( dt > 0 ? du * 100 / dt : 0 ))
-  up=$(cut -d. -f1 /proc/uptime); d=$(( up / 86400 )); h=$(( up % 86400 / 3600 )); m=$(( up % 3600 / 60 ))
-  if (( d > 0 )); then UPT="${d}d ${h}h ${m}m"; else UPT="${h}h ${m}m"; fi
+fmt_mb() {   # MB -> 1.9Gi / 186Mi (redondeado como "free -h")
+  local m=$1 t
+  if (( m >= 1024 )); then t=$(( (m * 10 + 512) / 1024 )); printf '%d.%dGi' $(( t / 10 )) $(( t % 10 ))
+  else printf '%dMi' "$m"; fi
 }
 
-pcol() { if (( $1 >= 85 )); then printf '%s' "$RED"; else printf '%s' "$GRN"; fi; }   # rojo desde 85% de uso
+sys_stats() {   # llena las variables de CPU y RAM que muestra header()
+  local l1 mt mu mf
+  read -r l1 _ < /proc/loadavg
+  CPU_N=$(nproc 2>/dev/null || echo 1)
+  CPU_P=$(awk -v l="$l1" -v n="$CPU_N" 'BEGIN{p=l/n*100; if(p>100)p=100; printf "%d", p}')
+  read -r mt mu mf < <(free -m | awk '/^Mem:/{print $2, $3, $4}')
+  mt=${mt:-0}; mu=${mu:-0}; mf=${mf:-0}
+  RAM_T=$(fmt_mb "$mt"); RAM_U=$(fmt_mb "$mu"); RAM_F=$(fmt_mb "$mf")
+  RAM_P=$(awk -v u="$mu" -v t="$mt" 'BEGIN{printf "%.2f", (t > 0 ? u / t * 100 : 0)}')
+}
 
-# Servicios de la pantalla principal (en este orden) y como se llaman ahi
-SVC_KEYS=(ssh dropbear ssl ws squid v2ray badvpn udp slowdns openvpn wireguard)
-declare -A SVC_LABEL=([ssh]=SSH [dropbear]=DROPBEAR [ssl]=SSL [ws]=WEBSOCKET [squid]=SQUID [v2ray]=V2RAY
-                      [badvpn]=BADVPN [udp]='UDP CUSTOM' [slowdns]=SLOWDNS [openvpn]=OPENVPN [wireguard]=WIREGUARD)
+# Servicios del bloque de puertos (en este orden) y como se llaman ahi
+SHOW_KEYS=(badvpn dropbear ssh ssl v2ray ws udp squid slowdns openvpn wireguard)
+declare -A SHOW_LABEL=([badvpn]=BADVPN [dropbear]=DROPBEAR [ssh]=SSH [ssl]=SSL [v2ray]=V2RAY [ws]=WEBSOCKET
+                       [udp]=UDPCUSTOM [squid]=SQUID [slowdns]=SLOWDNS [openvpn]=OPENVPN [wireguard]=WIREGUARD)
 
-svc_port() {   # clave -> puerto que se muestra (openvpn y wireguard no tienen puerto propio)
+svc_port() {   # clave -> puerto que se muestra (openvpn y wireguard lo leen de su configuracion)
   case $1 in
-    ssh)               echo "$SSH_PORT" ;;
-    openvpn|wireguard) echo "-" ;;
-    *)                 pget "$1" ;;
+    ssh)       echo "$SSH_PORT" ;;
+    openvpn)   awk '$1=="port"{print $2; exit}' /etc/openvpn/server/server.conf /etc/openvpn/server.conf 2>/dev/null ;;
+    wireguard) awk -F' *= *' '$1=="ListenPort"{print $2; exit}' /etc/wireguard/wg0.conf 2>/dev/null ;;
+    *)         pget "$1" ;;
   esac
 }
 
-svc_cell() {   # clave  ->  "NOMBRE:  puerto  [ON]"  (verde si esta activo, rojo si no; usa ON[] de header)
-  local c=$RED t='[OFF]'
-  if [[ -n ${ON[$1]:-} ]]; then c=$GRN; t='[ON]'; fi
-  printf '%s%-11s%s %s%-5s%s %s%-5s%s' "$c" "${SVC_LABEL[$1]}:" "$RST" "$WHT" "$(svc_port "$1")" "$RST" "$c" "$t" "$RST"
+ports_block() {   # puertos de los servicios activos: ETIQUETA: puerto, en dos columnas
+  local k p n=0 left=''
+  for k in "${SHOW_KEYS[@]}"; do
+    is_on "$k" || continue
+    p=$(svc_port "$k"); p=${p:--}
+    if (( n % 2 == 0 )); then
+      left=$(pcell "${SHOW_LABEL[$k]}" "$p")
+    else
+      cols "1:$left" "21:$(pcell "${SHOW_LABEL[$k]}" "$p")"
+    fi
+    n=$(( n + 1 ))
+  done
+  (( n % 2 )) && cols "1:$left"
+  (( n > 0 ))   # devuelve 0 solo si hay algo que mostrar
 }
 
 header() {
-  local name reg k i a b on=0
-  local -A ON=()
-  name=$(vps_name); reg=$(cat "$REG_F" 2>/dev/null)
+  local name
+  name=$(vps_name)
   if is_hidden name || [[ -z $name ]]; then name='VPS PANEL'; fi
-  if ! is_hidden services; then
-    for k in "${SVC_KEYS[@]}"; do
-      if is_on "$k"; then ON[$k]=1; on=$(( on + 1 )); fi
-    done
-  fi
   is_hidden server || sys_stats
 
   cls
   # Titulo
   line_eq
-  center "=====>>>> ${name^^} <<<<=====" "$YEL"
-  center "ADMINISTRADOR DE VPS  v$VERSION"
+  center_grad "=====>>>> ${name^^} <<<<====="
+  line_eq
 
-  # Datos del servidor
+  # Datos del servidor: SISTEMA / MEMORIA / PROCESADOR
   if ! is_hidden server; then
+    cols "1:${GRN}SISTEMA${RST}" "24:${GRN}MEMORIA${RST}" "40:${GRN}PROCESADOR${RST}"
+    cols "1:${BLU}S.O:${RST} ${WHT}${OS_NAME:0:17}${RST}" \
+         "24:${BLU}RAM:${RST}    ${GRN}${RAM_T}${RST}" \
+         "40:${BLU}CPU:${RST} ${GRN}${CPU_N}${RST}"
+    cols "1:${BLU}IP:${RST} ${PNK}${IP:0:18}${RST}" \
+         "24:${BLU}USADA:${RST}  ${GRN}${RAM_U}${RST}" \
+         "40:${BLU}EN USO:${RST}${GRN}${CPU_P}%${RST}"
+    cols "1:${BLU}FECHA:${RST} ${WHT}$(date +%D)${RST}" \
+         "24:${BLU}LIBRE:${RST}  ${GRN}${RAM_F}${RST}"
+    cols "1:${BLU}HORA:${RST}  ${WHT}$(date +%T)${RST}" \
+         "24:${BLU}EN USO:${RST} ${GRN}${RAM_P}%${RST}"
     line_eq
-    row "${GRN}SISTEMA${RST}" "${GRN}MEMORIA${RST}" "${GRN}PROCESADOR${RST}"
-    row "$(kv S.O.:   "${OS_NAME:0:18}")"      "$(kv RAM:   "$RAM_T" "$GRN")"  "$(kv CPU:   "$CPU_N" "$GRN")"
-    row "$(kv IP:     "$IP" "$MAG")"           "$(kv USADA: "$RAM_U" "$GRN")"  "$(kv USO:   "$CPU_P%" "$(pcol "$CPU_P")")"
-    row "$(kv FECHA:  "$(date +%d/%m/%y)")"    "$(kv LIBRE: "$RAM_F" "$GRN")"  "$(kv CARGA: "$CPU_LOAD")"
-    row "$(kv HORA:   "$(date +%T)")"          "$(kv USO:   "$RAM_P%" "$(pcol "$RAM_P")")"  "$(kv DISCO: "$DSK_P%" "$(pcol "$DSK_P")")"
-    row "$(kv ACTIVO: "$UPT")"                 "$(kv REGISTRO: "${reg:--}")"
   fi
 
-  # Servicios: dos columnas (los primeros 6 a la izquierda, el resto a la derecha)
+  # Puertos de los servicios activos
   if ! is_hidden services; then
-    section "SERVICIOS ACTIVOS: $on/${#SVC_KEYS[@]}"
-    for i in 0 1 2 3 4 5; do
-      a=${SVC_KEYS[i]}; b=${SVC_KEYS[i+6]:-}
-      if [[ -n $b ]]; then row "$(svc_cell "$a")" "$(svc_cell "$b")"; else row "$(svc_cell "$a")"; fi
-    done
+    ports_block && line_eq
   fi
 
   # Menu
-  line_eq
-  item 1 "ADMINISTRAR CUENTAS (SSH/DROPBEAR)"
-  item 2 "ADMINISTRAR CUENTAS (V2RAY)"
+  item_m 1 "ADMINISTRAR CUENTAS (SSH/DROPBEAR)"
+  item_m 2 "ADMINISTRAR CUENTAS (V2ray)"
   line_dash
-  item 3 "PROTOCOLOS, ESTADO Y PUERTOS"
-  item 4 "HERRAMIENTAS (BBR, SWAP, DNS, DOMINIO)"
-  item 5 "INSTALAR TODOS LOS PROTOCOLOS"
+  item_m 3 "PREPARACION DEL SISTEMA" "$HL_GRY"
   line_dash
-  item 6 "DESINSTALAR PANEL" "$RED"
+  printf ' %s[4]%s %s>%s %s[!]%s %sDESINSTALAR PANEL%s\n' "$GRN" "$RST" "$RED" "$RST" "$YEL" "$RST" "$RED" "$RST"
+  line_dash
+  item_m 5 "INSTALAR TODOS LOS PROTOCOLOS"
   line_eq
-  printf ' %s0)%s %s SALIR %s     %s7)%s %s REINICIAR VPS %s\n' "$GRN" "$RST" "$BTN_GRAY" "$RST" "$GRN" "$RST" "$BTN_BLUE" "$RST"
+  printf ' %s0)%s %sSALIR DEL VPS%s  %s6)%s %sSALIR DEL SCRIPT%s  %s7)%s %sREBOOT VPS%s\n' \
+    "$GRN" "$RST" "$BTN_GRAY" "$RST" "$GRN" "$RST" "$BTN_RED" "$RST" "$GRN" "$RST" "$BTN_BLUE" "$RST"
   line_eq
+}
+
+exit_vps() {   # cierra el panel y la sesion SSH que lo abrio
+  local p
+  cls
+  p=$(ps -o comm= -p "$PPID" 2>/dev/null)
+  case $p in bash|-bash|sh|dash|ash|zsh) kill -HUP "$PPID" 2>/dev/null ;; esac
+  exit 0
 }
 
 main_menu() {
   local o c=''
   while :; do
     header
-    ask o || exit 0
+    ask o m || exit 0
     case $o in
       1) menu_ssh ;;
       2) menu_v2 ;;
-      3) ensure_base; menu_protocols ;;
-      4) menu_tools ;;
+      3) ensure_base; menu_system ;;
+      4) sub_header "DESINSTALAR PANEL"; uninstall_all; pause ;;
       5) sub_header "INSTALACION COMPLETA"; install_all; pause ;;
-      6) sub_header "DESINSTALAR PANEL"; uninstall_all; pause ;;
-      7) rd "Reiniciar el VPS ahora? (s/N): " c; [[ $c == [sS] ]] && reboot ;;
-      0) cls; exit 0 ;;
+      6) cls; exit 0 ;;
+      7) rd "REINICIAR EL VPS AHORA? (s/N): " c; [[ $c == [sS] ]] && reboot ;;
+      0) exit_vps ;;
     esac
   done
 }
