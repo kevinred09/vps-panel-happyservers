@@ -11,7 +11,8 @@
 #    bash vps-panel.sh --install-all   instalacion completa sin menu
 #
 #  Valores por defecto: banner SSH desactivado, auto-inicio del panel activado.
-#  Las cuentas SSH nuevas usan la contrasena xxxx (ENTER en el campo la escribe sola).
+#  Cuentas SSH nuevas: contrasena xxxx, 30 dias y 1 conexion. En los campos con valor por
+#  defecto ([30], [1]...) ENTER escribe ese valor en el campo para que quede a la vista.
 #  Los puertos se cambian en Preparacion del sistema y se guardan en /etc/vpspanel/ports.conf
 #    UDPCUSTOM_URL=<url> vpspanel      (opcional) usar otro binario de udp-custom
 #
@@ -19,7 +20,6 @@
 #  columnas). Todo el aspecto visual esta en el bloque "Interfaz".
 #    VPSPANEL_COLOR=256 vpspanel       terminal sin colores de 24 bits (aproximado)
 #    VPSPANEL_COLOR=16  vpspanel       colores del tema de la terminal
-#    VPSPANEL_EMOJI=0   vpspanel       sin los iconos del menu SSH
 # ======================================================================
 
 set -u
@@ -113,14 +113,13 @@ PROTO_NAMES=("DROPBEAR" "SSL" "BADVPN" "WEBSOCKET" "SQUID"
 #     VPSPANEL_COLOR=256 vpspanel     colores aproximados de 256
 #     VPSPANEL_COLOR=16  vpspanel     colores del tema de la terminal
 #   o dejalo fijo:  echo 256 > /etc/vpspanel/color.conf
-# Los iconos y el simbolo de grado se escriben como bytes UTF-8 (\x..): el archivo
-# sigue siendo ASCII. VPSPANEL_EMOJI=0 quita los iconos del menu SSH.
+# El simbolo de grado de las tablas y los circulos de estado se escriben como bytes UTF-8
+# (\x..): el archivo sigue siendo ASCII. No hay emojis en ningun menu.
 
 ANCHO=53       # ancho de las lineas (igual que la referencia)
 FW=12          # ancho de las etiquetas de field() (algunas pantallas lo cambian)
 VL=0           # largo visible del ultimo texto medido con vlen()
 CMODE=24       # modo de color: 24 (RGB), 256 o 16
-EMOJI=${VPSPANEL_EMOJI:-1}
 GRADMAP=0000000011111111112222222223444   # degradado del titulo: 31 posiciones -> color 0..4
 MON=(Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec)
 
@@ -193,14 +192,6 @@ init_ui() {   # colores: solo si la salida es una terminal (VPSPANEL_COLOR=... l
     RST=''; RED=''; GRN=''; BLU=''; DBL=''; WHT=''; YEL=''; LYE=''; PNK=''; GRY=''; MAG=''
     G0=''; G1=''; G2=''; G3=''; G4=''
     BTN_GRAY=''; BTN_RED=''; BTN_REDW=''; BTN_BLUE=''; HL_GRY=''
-  fi
-  if [[ $EMOJI == 1 ]]; then        # iconos del menu SSH (bytes UTF-8)
-    I_PEN=$' \xe2\x9c\x8f\xef\xb8\x8f'    # lapiz
-    I_BIN=$' \xf0\x9f\x97\x91'            # papelera
-    I_REC=$' \xe2\x99\xbb\xef\xb8\x8f'    # reciclaje
-    I_LUP=$' \xf0\x9f\x94\x8e'            # lupa
-  else
-    I_PEN=''; I_BIN=''; I_REC=''; I_LUP=''
   fi
   MK_ON=$'\xe2\x97\x89'; MK_OFF=$'\xe2\x97\x8b'   # marcas de estado: activo / inactivo
   EQ=$(rep = "$ANCHO"); DASH=$(rep - "$ANCHO")
@@ -297,17 +288,18 @@ pause() {
 
 rd() { local p=$1; shift; read -rp " ${WHT}${p}${RST}" "$@"; }   # pregunta: rd "TEXTO: " variable
 
-rd_pass() {   # texto variable  ->  pide la contrasena; ENTER en el campo vacio escribe DEF_PASS solo
+rd_def() {   # texto variable defecto  ->  pregunta; ENTER en el campo vacio escribe el valor por defecto
   local t=$1 v
   printf ' %s%s%s ' "$WHT" "$t" "$RST"
   read -r v || return 1
   if [[ -z $v ]]; then
-    v=$DEF_PASS
-    # sube a la linea de la pregunta y escribe la clave en el campo, a continuacion del texto
+    v=$3
+    # sube a la linea de la pregunta y escribe el valor en el campo, a continuacion del texto
     [[ -t 1 ]] && printf '\e[1A\r\e[%dC%s\n' "$(( ${#t} + 2 ))" "$v"
   fi
   printf -v "$2" '%s' "$v"
 }
+rd_pass() { rd_def "$1" "$2" "$DEF_PASS"; }   # contrasena: ENTER escribe xxxx
 
 ask() {   # variable [estilo]  ->  pide la opcion del menu (los numeros se normalizan: 01 pasa a 1)
   local r txt='Seleccione una Opcion:' col=$WHT
@@ -849,9 +841,9 @@ ssh_create() {
   if id "$u" >/dev/null 2>&1; then err "El usuario ya existe"; return 1; fi
   rd_pass "CONTRASENA:" p || return 1
   [[ $p != *"|"* && -n $p ]] || { err "La contrasena no puede contener '|'"; return 1; }
-  rd "DIAS DE VALIDEZ [30]: " d; d=${d:-30}
+  rd_def "DIAS DE VALIDEZ [30]:" d 30 || return 3
   [[ $d =~ ^[0-9]+$ ]] || { err "Dias invalidos"; return 1; }
-  rd "LIMITE DE CONEXIONES [1]: " l; l=${l:-1}
+  rd_def "LIMITE DE CONEXIONES [1]:" l 1 || return 3
   [[ $l =~ ^[0-9]+$ ]] || { err "Limite invalido"; return 1; }
   exp=$(date -d "+$d days" +%F)
   useradd -M -s /bin/false -e "$exp" "$u" || { err "No se pudo crear el usuario"; return 1; }
@@ -953,7 +945,7 @@ ssh_renew() {
   pick_account "$USERDB" || return $?
   u=$PICK
   valid_name "$u" && grep -q "^${u}|" "$USERDB" || { err "Usuario no encontrado"; return 1; }
-  rd "DIAS DESDE HOY PARA $u [30]: " d; d=${d:-30}
+  rd_def "DIAS DESDE HOY PARA $u [30]:" d 30 || return 3
   [[ $d =~ ^[0-9]+$ ]] || { err "Dias invalidos"; return 1; }
   exp=$(date -d "+$d days" +%F)
   usermod -e "$exp" "$u" && db_set "$u" 3 "$exp" && ok "$u vence el $exp"
@@ -1004,7 +996,7 @@ v2_renew() {
   pick_account "$V2DB" || return $?
   n=$PICK
   valid_name "$n" && grep -q "^${n}|" "$V2DB" || { err "Cuenta no encontrada"; return 1; }
-  rd "DIAS DESDE HOY PARA $n [30]: " d; d=${d:-30}
+  rd_def "DIAS DESDE HOY PARA $n [30]:" d 30 || return 1
   [[ $d =~ ^[0-9]+$ ]] || { err "Dias invalidos"; return 1; }
   exp=$(date -d "+$d days" +%F)
   t=$(mktemp)
@@ -1093,7 +1085,7 @@ EOF
 
 cfg_swap() {
   local s
-  rd "Tamano de swap en MB [1024]: " s; s=${s:-1024}
+  rd_def "Tamano de swap en MB [1024]:" s 1024 || return 1
   [[ $s =~ ^[0-9]+$ ]] || { err "Tamano invalido"; return 1; }
   swapoff /swapfile 2>/dev/null; rm -f /swapfile
   fallocate -l "${s}M" /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count="$s" status=none
@@ -1115,8 +1107,8 @@ cfg_cache() {
 
 cfg_dns() {
   local d1 d2
-  rd "DNS primario [1.1.1.1]: " d1; d1=${d1:-1.1.1.1}
-  rd "DNS secundario [8.8.8.8]: " d2; d2=${d2:-8.8.8.8}
+  rd_def "DNS primario [1.1.1.1]:" d1 1.1.1.1 || return 1
+  rd_def "DNS secundario [8.8.8.8]:" d2 8.8.8.8 || return 1
   if systemctl is-active --quiet systemd-resolved; then
     mkdir -p /etc/systemd/resolved.conf.d
     printf '[Resolve]\nDNS=%s %s\n' "$d1" "$d2" > /etc/systemd/resolved.conf.d/vpspanel.conf
@@ -1473,12 +1465,12 @@ menu_ssh() {
   local o
   while :; do
     sub_header "ADMINISTRACION DE USUARIOS SSH V16"
-    item 1 "NUEVO USUARIO SSH$I_PEN"
-    item 2 "REMOVER USUARIO$I_BIN" "$RED"
-    item 3 "RENOVAR USUARIO$I_REC" "$GRN"
+    item 1 "NUEVO USUARIO SSH"
+    item 2 "REMOVER USUARIO" "$RED"
+    item 3 "RENOVAR USUARIO" "$GRN"
     item 4 "CAMBIAR CONTRASENA"
     line_dash
-    item 5 "DETALLES DE TODOS USUARIOS$I_LUP" "$GRN"
+    item 5 "DETALLES DE TODOS USUARIOS" "$GRN"
     item 6 "MONITOR DE USUARIOS CONECTADOS"
     line_dash
     item 7 "ELIMINAR USUARIOS VENCIDOS"
@@ -1506,7 +1498,7 @@ v2_create() {
   rd "NOMBRE DE LA CUENTA: " n
   valid_name "$n" || { err "Nombre invalido (3-31 caracteres: a-z 0-9 _ -)"; return 1; }
   if grep -q "^${n}|" "$V2DB"; then err "La cuenta ya existe"; return 1; fi
-  rd "DIAS DE VALIDEZ [30]: " d; d=${d:-30}
+  rd_def "DIAS DE VALIDEZ [30]:" d 30 || return 1
   [[ $d =~ ^[0-9]+$ ]] || { err "Dias invalidos"; return 1; }
   id=$(cat /proc/sys/kernel/random/uuid)
   exp=$(date -d "+$d days" +%F)
@@ -1546,11 +1538,11 @@ menu_v2() {
   local o
   while :; do
     sub_header "ADMINISTRACION DE CUENTAS V2RAY"
-    item 1 "NUEVA CUENTA V2RAY$I_PEN"
-    item 2 "REMOVER CUENTA$I_BIN" "$RED"
-    item 3 "RENOVAR CUENTA$I_REC" "$GRN"
+    item 1 "NUEVA CUENTA V2RAY"
+    item 2 "REMOVER CUENTA" "$RED"
+    item 3 "RENOVAR CUENTA" "$GRN"
     line_dash
-    item 4 "DETALLES Y ENLACES DE LAS CUENTAS$I_LUP" "$GRN"
+    item 4 "DETALLES Y ENLACES DE LAS CUENTAS" "$GRN"
     menu_end VOLVER "$BTN_REDW"
     ask o u || return
     case $o in
