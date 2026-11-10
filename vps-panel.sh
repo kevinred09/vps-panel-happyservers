@@ -15,8 +15,9 @@
 #  defecto ([30], [1]...) ENTER escribe ese valor en el campo para que quede a la vista.
 #  Atajo "1.1" en el menu principal: crea al instante user1, user2, user3... (contrasena xxxx,
 #  30 dias, 1 conexion) sin preguntar nada. La secuencia se guarda en /etc/vpspanel/quick.seq.
-#  Usuarios SSH: la opcion 2 elimina varios a la vez (1,5,6,9) y la 8 elimina todos. Antes de
-#  borrar sale una advertencia y se esperan 7 segundos (DEL_WAIT) para poder leerla.
+#  Usuarios SSH: la opcion 2 elimina varios a la vez (1,5,6,9) y la 8 elimina todos. En la 2,
+#  hasta 3 usuarios (DEL_NOWARN) se borran directo, sin advertencia; con mas de 3 sale la
+#  advertencia y se esperan 3 segundos (DEL_WAIT_SEL). En la 8 la espera es de 7 (DEL_WAIT).
 #  Los puertos se cambian en Preparacion del sistema y se guardan en /etc/vpspanel/ports.conf
 #    UDPCUSTOM_URL=<url> vpspanel      (opcional) usar otro binario de udp-custom
 #
@@ -53,7 +54,9 @@ QUICK_LIMIT=1              # conexiones simultaneas (igual que el valor por defe
 SEQ_F=$BASE/quick.seq      # ultimo numero usado: la secuencia sigue despues de cerrar o reiniciar
 QUICK_LOCK=$BASE/quick.lock  # candado: dos sesiones del panel no pueden tomar el mismo numero
 
-DEL_WAIT=7                 # segundos de espera con la advertencia antes de eliminar cuentas SSH
+DEL_WAIT=7                 # segundos de espera con la advertencia antes de eliminar TODAS las cuentas (opcion 8)
+DEL_WAIT_SEL=3             # segundos de espera con la advertencia al eliminar varias cuentas (opcion 2)
+DEL_NOWARN=3               # opcion 2: hasta este numero de cuentas se borran directo, sin advertencia
 V2CFG=/usr/local/etc/v2ray/config.json
 V2PATH=/v2ray
 
@@ -1016,10 +1019,12 @@ names_grid() {   # max nombre...
   (( total <= max )) || printf ' %s... y %d mas%s\n' "$GRY" $(( total - max )) "$RST"
 }
 
-# Advertencia + espera de DEL_WAIT segundos + confirmacion. Devuelve 3 si se cancela.
+# Advertencia + espera (DEL_WAIT_SEL segundos en la opcion 2, DEL_WAIT en la 8) + confirmacion.
+# Devuelve 3 si se cancela.
 ssh_confirm_delete() {   # all|sel  nombres...
-  local mode=$1 c n head
+  local mode=$1 c n head secs=$DEL_WAIT_SEL
   shift; n=$#
+  [[ $mode == all ]] && secs=$DEL_WAIT
   cls
   title "ADVERTENCIA" "$YEL"
   if [[ $mode == all ]]; then
@@ -1034,7 +1039,7 @@ ssh_confirm_delete() {   # all|sel  nombres...
   warn "Se cierran sus conexiones activas."
   warn "Esta accion NO se puede deshacer."
   echo
-  warn_wait "$DEL_WAIT"
+  warn_wait "$secs"
   if [[ $mode == all ]]; then
     rd "ESCRIBE SI PARA ELIMINAR TODAS LAS CUENTAS: " c || return 3
     [[ $c == SI ]] || return 3
@@ -1070,7 +1075,8 @@ ssh_remove() {   # nombres...
 }
 
 # Opcion 2: una o varias cuentas, por numero o por nombre, separadas por comas (1,5,6,9).
-# Si algun dato no esta en la lista no se elimina nada.
+# Si algun dato no esta en la lista no se elimina nada. Hasta 3 cuentas (DEL_NOWARN) se borran
+# directo, sin advertencia; con mas de 3 sale la advertencia con espera de DEL_WAIT_SEL segundos.
 ssh_delete() {
   local sel tok idx u n
   local -a toks=() del=() bad=()
@@ -1099,7 +1105,9 @@ ssh_delete() {
     info "Usa numeros separados por comas: 1,5,6,9"
     return 1
   fi
-  ssh_confirm_delete sel "${del[@]}" || return $?
+  if (( ${#del[@]} > DEL_NOWARN )); then
+    ssh_confirm_delete sel "${del[@]}" || return $?
+  fi
   ssh_remove "${del[@]}"
 }
 
