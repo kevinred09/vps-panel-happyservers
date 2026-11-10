@@ -15,6 +15,8 @@
 #  defecto ([30], [1]...) ENTER escribe ese valor en el campo para que quede a la vista.
 #  Atajo "1.1" en el menu principal: crea al instante user1, user2, user3... (contrasena xxxx,
 #  30 dias, 1 conexion) sin preguntar nada. La secuencia se guarda en /etc/vpspanel/quick.seq.
+#  Usuarios SSH: la opcion 2 elimina varios a la vez (1,5,6,9) y la 8 elimina todos. Antes de
+#  borrar sale una advertencia y se esperan 7 segundos (DEL_WAIT) para poder leerla.
 #  Los puertos se cambian en Preparacion del sistema y se guardan en /etc/vpspanel/ports.conf
 #    UDPCUSTOM_URL=<url> vpspanel      (opcional) usar otro binario de udp-custom
 #
@@ -50,6 +52,8 @@ QUICK_DAYS=30              # dias de validez
 QUICK_LIMIT=1              # conexiones simultaneas (igual que el valor por defecto de NUEVO USUARIO SSH)
 SEQ_F=$BASE/quick.seq      # ultimo numero usado: la secuencia sigue despues de cerrar o reiniciar
 QUICK_LOCK=$BASE/quick.lock  # candado: dos sesiones del panel no pueden tomar el mismo numero
+
+DEL_WAIT=7                 # segundos de espera con la advertencia antes de eliminar cuentas SSH
 V2CFG=/usr/local/etc/v2ray/config.json
 V2PATH=/v2ray
 
@@ -979,17 +983,134 @@ pick_account() {   # archivo
   return 0
 }
 
+# ---- Eliminar cuentas SSH: advertencia con espera obligatoria antes de borrar -----------
+# Cuenta regresiva que no se puede saltar: da tiempo a leer la advertencia. Lo que se teclee
+# mientras tanto se descarta, para que un ENTER suelto no llegue a confirmar nada.
+warn_wait() {   # segundos
+  local s=$1 w
+  if [[ -t 1 ]]; then
+    printf '\e[?25l'
+    while (( s > 0 )); do
+      w=segundos; (( s == 1 )) && w=segundo
+      printf '\r\e[K %sPodras continuar en %d %s...%s' "$YEL" "$s" "$w" "$RST"
+      sleep 1; s=$(( s - 1 ))
+    done
+    printf '\r\e[K\e[?25h'
+  else
+    info "Espera $s segundos para continuar..."; sleep "$s"
+  fi
+  if [[ -t 0 ]]; then while read -r -s -n 1 -t 0.05 _; do :; done; fi
+}
+
+# Nombres en 3 columnas (hasta $1); si son mas, resume el resto para que la pantalla no se desborde
+names_grid() {   # max nombre...
+  local max=$1 total n=0 u row=''
+  shift; total=$#
+  for u in "$@"; do
+    (( n < max )) || break
+    row+=$(printf '%s%-17.17s%s' "$WHT" "$u" "$RST")
+    n=$(( n + 1 ))
+    if (( n % 3 == 0 )); then printf ' %s\n' "$row"; row=''; fi
+  done
+  [[ -z $row ]] || printf ' %s\n' "$row"
+  (( total <= max )) || printf ' %s... y %d mas%s\n' "$GRY" $(( total - max )) "$RST"
+}
+
+# Advertencia + espera de DEL_WAIT segundos + confirmacion. Devuelve 3 si se cancela.
+ssh_confirm_delete() {   # all|sel  nombres...
+  local mode=$1 c n head
+  shift; n=$#
+  cls
+  title "ADVERTENCIA" "$YEL"
+  if [[ $mode == all ]]; then
+    printf ' %sSe van a ELIMINAR TODAS las cuentas SSH (%d).%s\n\n' "$RED" "$n" "$RST"
+  else
+    if (( n == 1 )); then head="Se va a ELIMINAR 1 cuenta SSH:"; else head="Se van a ELIMINAR $n cuentas SSH:"; fi
+    printf ' %s%s%s\n\n' "$RED" "$head" "$RST"
+    names_grid 15 "$@"
+    echo
+  fi
+  warn "Se borran del servidor y del panel."
+  warn "Se cierran sus conexiones activas."
+  warn "Esta accion NO se puede deshacer."
+  echo
+  warn_wait "$DEL_WAIT"
+  if [[ $mode == all ]]; then
+    rd "ESCRIBE SI PARA ELIMINAR TODAS LAS CUENTAS: " c || return 3
+    [[ $c == SI ]] || return 3
+  else
+    rd "CONFIRMAR LA ELIMINACION? (s/N): " c || return 3
+    [[ $c == [sS]* ]] || return 3
+  fi
+}
+
+# Borra las cuentas indicadas: cierra sus conexiones, las quita del sistema y de users.db.
+# Una cuenta solo sale de users.db si de verdad dejo de existir en el sistema; si no se pudo
+# borrar, queda en la lista para poder reintentarlo.
+ssh_remove() {   # nombres...
+  local u t list
+  local -a gone=() failed=()
+  (( $# > 20 )) && info "Eliminando $# cuentas..."
+  for u in "$@"; do
+    valid_name "$u" || { failed+=("$u"); continue; }
+    pkill -KILL -u "$u" 2>/dev/null
+    userdel -f "$u" 2>/dev/null
+    if id "$u" >/dev/null 2>&1; then failed+=("$u"); else gone+=("$u"); fi
+  done
+  if (( ${#gone[@]} )); then
+    t=$(mktemp)
+    list=$(IFS='|'; printf '%s' "${gone[*]}")
+    awk -F'|' -v list="|$list|" 'index(list, "|" $1 "|") == 0' "$USERDB" > "$t" && cat "$t" > "$USERDB"
+    rm -f "$t"
+  fi
+  if (( ${#gone[@]} == 1 )); then ok "Usuario ${gone[0]} eliminado"
+  elif (( ${#gone[@]} > 1 )); then ok "${#gone[@]} usuarios eliminados"; fi
+  if (( ${#failed[@]} )); then err "No se pudo eliminar: ${failed[*]}"; return 1; fi
+  return 0
+}
+
+# Opcion 2: una o varias cuentas, por numero o por nombre, separadas por comas (1,5,6,9).
+# Si algun dato no esta en la lista no se elimina nada.
 ssh_delete() {
-  local u c
-  pick_account "$USERDB" || return $?
-  u=$PICK
-  valid_name "$u" && grep -q "^${u}|" "$USERDB" || { err "Usuario no encontrado"; return 1; }
-  rd "ELIMINAR LA CUENTA $u? (s/N): " c
-  [[ $c == [sS]* ]] || return 3
-  pkill -KILL -u "$u" 2>/dev/null
-  userdel -f "$u" 2>/dev/null
-  sed -i "/^${u}|/d" "$USERDB"
-  ok "Usuario $u eliminado"
+  local sel tok idx u n
+  local -a toks=() del=() bad=()
+  local -A seen=()
+  grep -q '^[^|]' "$USERDB" 2>/dev/null || { warn "No hay cuentas creadas"; return 1; }
+  acct_table "$USERDB"
+  menu_end VOLVER "$BTN_REDW"
+  rd "NUMEROS O NOMBRES (EJ: 1,5,6,9): " sel || return 3
+  read -ra toks <<< "${sel//,/ }"
+  (( ${#toks[@]} )) || return 3
+  [[ ${toks[*]} == 0 ]] && return 3
+  for tok in "${toks[@]}"; do
+    u=
+    if [[ $tok =~ ^[0-9]{1,6}$ ]]; then
+      idx=$(( 10#$tok ))
+      (( idx >= 1 && idx <= ${#ACCT[@]} )) && u=${ACCT[idx-1]}
+    else
+      for n in "${ACCT[@]}"; do [[ $n == "$tok" ]] && { u=$n; break; }; done
+    fi
+    if [[ -z $u ]]; then bad+=("$tok"); continue; fi
+    [[ -n ${seen[$u]:-} ]] && continue
+    seen[$u]=1; del+=("$u")
+  done
+  if (( ${#bad[@]} )); then
+    err "No esta en la lista: ${bad[*]}"
+    info "Usa numeros separados por comas: 1,5,6,9"
+    return 1
+  fi
+  ssh_confirm_delete sel "${del[@]}" || return $?
+  ssh_remove "${del[@]}"
+}
+
+# Opcion 8: todas las cuentas SSH. Pide escribir SI despues de la advertencia.
+ssh_delete_all() {
+  local u
+  local -a all=()
+  while IFS='|' read -r u _; do [[ -n $u ]] && all+=("$u"); done < "$USERDB"
+  (( ${#all[@]} )) || { warn "No hay cuentas creadas"; return 1; }
+  ssh_confirm_delete all "${all[@]}" || return $?
+  ssh_remove "${all[@]}"
 }
 
 ssh_renew() {
@@ -1526,6 +1647,7 @@ menu_ssh() {
     item 6 "MONITOR DE USUARIOS CONECTADOS"
     line_dash
     item 7 "ELIMINAR USUARIOS VENCIDOS"
+    item 8 "ELIMINAR TODOS LOS USUARIOS" "$RED"
     menu_end VOLVER "$BTN_REDW"
     ask o u || return
     case $o in
@@ -1536,6 +1658,7 @@ menu_ssh() {
       5) sub_header "DETALLES DE TODOS USUARIOS";     ssh_list ;;
       6) sub_header "MONITOR DE USUARIOS CONECTADOS"; ssh_online ;;
       7) sub_header "ELIMINAR USUARIOS VENCIDOS";     /usr/local/bin/vps-cleanup && ok "Usuarios vencidos eliminados" ;;
+      8) sub_header "ELIMINAR TODOS LOS USUARIOS";    ssh_delete_all; [[ $? == 3 ]] && continue ;;
       0) return ;;
       *) continue ;;
     esac
