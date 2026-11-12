@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ======================================================================
-#  VPS PANEL v3.1 - instalador y administrador de protocolos para tuneles
+#  VPS PANEL v3.2 - instalador y administrador de protocolos para tuneles
 #  Compatible con HTTP Custom y apps similares.
 #  SSH, Dropbear, SSL, WebSocket, SOCKS Python, WS-ePro, Squid, V2Ray,
 #  BadVPN-UDPGW, UDP Custom, SlowDNS, OpenVPN, WireGuard y Psiphon
@@ -42,7 +42,7 @@ export VPSPANEL_ACTIVE=1
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}
 
 # ------------------------------ Configuracion -------------------------
-VERSION=3.1
+VERSION=3.2
 PREP_V=3           # version de la preparacion del sistema (se repite si cambia)
 NAME_MAX=24        # largo maximo del nombre del VPS (se muestra en el titulo)
 DEF_PASS=xxxx      # contrasena por defecto de las cuentas SSH (ENTER en el campo la escribe sola)
@@ -1537,30 +1537,50 @@ EOF
 
   cat > /usr/local/bin/vps-cleanup <<'EOF'
 #!/bin/bash
-# Elimina cuentas SSH y V2Ray expiradas
-DB=/etc/vpspanel/users.db
-V2DB=/etc/vpspanel/v2ray.db
+# Elimina cuentas SSH y V2Ray vencidas. Una cuenta vence a las 00:00 UTC de su fecha (igual que
+# en la tabla de cuentas del panel, donde ya sale en rojo).
+#   vps-cleanup          a mano (ELIMINAR USUARIOS VENCIDOS)
+#   vps-cleanup --auto   cada minuto desde cron, salvo que este desactivado (/etc/vpspanel/autodel.off)
+BASE=/etc/vpspanel
+DB=$BASE/users.db
+V2DB=$BASE/v2ray.db
 V2CFG=/usr/local/etc/v2ray/config.json
-today=$(date +%F)
+if [[ ${1:-} == --auto ]]; then
+  [[ -f $BASE/autodel.off ]] && exit 0
+  exec 9>"$BASE/cleanup.lock"; flock -n 9 || exit 0
+else
+  exec 9>"$BASE/cleanup.lock"; flock -w 30 9
+fi
+today=$(date -u +%F)
+vencida() { [[ $1 =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ && ! $1 > $today ]]; }   # fecha <= hoy (UTC)
 if [[ -s $DB ]]; then
+  S=''
   while IFS='|' read -r u p e l; do
-    [[ -n $u && $e < $today ]] || continue
+    [[ $u =~ ^[a-z_][a-z0-9_-]*$ ]] && vencida "$e" || continue
+    usermod -L "$u" 2>/dev/null                              # nadie mas entra con esa cuenta
+    [[ -n $S ]] || S=$(/usr/local/bin/vps-sessions 2>/dev/null)
+    pids=$(awk -v u="$u" '$1==u {print $2}' <<< "$S")        # SSH y Dropbear (Dropbear corre como root)
+    [[ -n $pids ]] && kill -9 $pids 2>/dev/null
     pkill -KILL -u "$u" 2>/dev/null
     userdel -f "$u" 2>/dev/null
-    sed -i "/^$u|/d" "$DB"
+    if ! id "$u" >/dev/null 2>&1; then                       # si no se pudo, se reintenta al minuto
+      sed -i "/^${u}|/d" "$DB"
+      logger -t vpspanel "cuenta SSH vencida eliminada: $u (vencia $e)"
+    fi
   done < "$DB"
 fi
 if [[ -s $V2DB && -f $V2CFG ]]; then
   changed=0
   while IFS='|' read -r n id e; do
-    [[ -n $n && $e < $today ]] || continue
+    [[ $n =~ ^[a-z_][a-z0-9_-]*$ ]] && vencida "$e" || continue
     t=$(mktemp)
     if jq --arg em "$n" '.inbounds[0].settings.clients |= map(select(.email != $em))' "$V2CFG" > "$t"; then
       cat "$t" > "$V2CFG"
+      sed -i "/^${n}|/d" "$V2DB"
+      logger -t vpspanel "cuenta V2Ray vencida eliminada: $n (vencia $e)"
+      changed=1
     fi
     rm -f "$t"
-    sed -i "/^$n|/d" "$V2DB"
-    changed=1
   done < "$V2DB"
   (( changed )) && systemctl restart v2ray
 fi
@@ -1572,12 +1592,34 @@ EOF
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 * * * * * root /usr/local/bin/vps-limiter >/dev/null 2>&1
-5 0 * * * root /usr/local/bin/vps-cleanup >/dev/null 2>&1
+* * * * * root /usr/local/bin/vps-cleanup --auto >/dev/null 2>&1
 EOF
   chmod 644 /etc/cron.d/vpspanel
   systemctl enable --now cron >/dev/null 2>&1
   install_tools
   install_firewall
+}
+
+# Eliminacion automatica de cuentas vencidas: activada por defecto (se apaga con autodel.off)
+autodel_on() { [[ ! -f $BASE/autodel.off ]]; }
+
+toggle_autodel() {
+  if autodel_on; then
+    touch "$BASE/autodel.off"
+    ok "Eliminacion automatica de usuarios vencidos DESACTIVADA"
+    info "Las cuentas vencidas quedan bloqueadas pero no se borran (ELIMINAR USUARIOS VENCIDOS)."
+  else
+    rm -f "$BASE/autodel.off"
+    ok "Eliminacion automatica de usuarios vencidos ACTIVADA"
+    /usr/local/bin/vps-cleanup --auto 2>/dev/null && info "Se revisaron las cuentas: las vencidas ya se eliminaron."
+  fi
+}
+
+helpers_update() {   # instalaciones anteriores: deja vps-cleanup y el cron al dia
+  [[ -f $BASE/.prep ]] || return 0
+  grep -q -- 'vps-cleanup --auto' /etc/cron.d/vpspanel 2>/dev/null && return 0
+  install_helpers >/dev/null 2>&1
+  return 0
 }
 
 ssh_restart() { systemctl restart ssh >> "$LOG" 2>&1 || systemctl restart sshd >> "$LOG" 2>&1; }
@@ -3396,12 +3438,12 @@ menu_ssh() {
     item 1 "NUEVO USUARIO SSH"
     item 2 "REMOVER USUARIO" "$RED"
     item 3 "RENOVAR USUARIO" "$GRN"
-    item 4 "CAMBIAR CONTRASENA"
+    item 4 "ELIMINAR USUARIOS VENCIDOS"
     line_dash
     item 5 "DETALLES DE TODOS USUARIOS" "$GRN"
     item 6 "MONITOR DE USUARIOS CONECTADOS"
     line_dash
-    item 7 "ELIMINAR USUARIOS VENCIDOS"
+    item 7 "CAMBIAR CONTRASENA"
     item 8 "ELIMINAR TODOS LOS USUARIOS" "$RED"
     menu_end VOLVER "$BTN_REDW"
     ask o u || return
@@ -3409,10 +3451,10 @@ menu_ssh() {
       1) ssh_create;                                  [[ $? == 3 ]] && continue ;;
       2) sub_header "REMOVER USUARIO";                ssh_delete; [[ $? == 3 ]] && continue ;;
       3) sub_header "RENOVAR USUARIO";                ssh_renew;  [[ $? == 3 ]] && continue ;;
-      4) sub_header "CAMBIAR CONTRASENA";             ssh_passwd ;;
+      4) sub_header "ELIMINAR USUARIOS VENCIDOS";     /usr/local/bin/vps-cleanup && ok "Usuarios vencidos eliminados" ;;
       5) sub_header "DETALLES DE TODOS USUARIOS";     ssh_list ;;
       6) sub_header "MONITOR DE USUARIOS CONECTADOS"; ssh_online ;;
-      7) sub_header "ELIMINAR USUARIOS VENCIDOS";     /usr/local/bin/vps-cleanup && ok "Usuarios vencidos eliminados" ;;
+      7) sub_header "CAMBIAR CONTRASENA";             ssh_passwd ;;
       8) sub_header "ELIMINAR TODOS LOS USUARIOS";    ssh_delete_all; [[ $? == 3 ]] && continue ;;
       0) return ;;
       *) continue ;;
@@ -3822,6 +3864,8 @@ menu_system() {   # PREPARACION DEL SISTEMA: puertos activos, protocolos y confi
     printf ' %s%4s%s %s>%s    %s VOLVER %s        %s%4s%s %s>%s %sAUTO-INICIAR%s %s\n' \
       "$GRN" "[0]" "$RST" "$RED" "$RST" "$BTN_RED" "$RST" \
       "$GRN" "[26]" "$RST" "$RED" "$RST" "$WHT" "$RST" "$(onoff autostart_on)"
+    printf ' %26s%s%4s%s %s>%s %sAUTO-ELIMINAR%s %s\n' '' \
+      "$GRN" "[27]" "$RST" "$RED" "$RST" "$WHT" "$RST" "$(onoff autodel_on)"
     line_eq
     ask o || return
     case $o in
@@ -3839,6 +3883,7 @@ menu_system() {   # PREPARACION DEL SISTEMA: puertos activos, protocolos y confi
       24) cfg_vpsname; continue ;;
       25) menu_view; continue ;;
       26) toggle_autostart ;;
+      27) toggle_autodel ;;
       *)  if [[ $o =~ ^[0-9]+$ ]] && (( o >= 1 && o <= ${#PROTO_KEYS[@]} )); then
             proto_menu "${PROTO_KEYS[o-1]}" "${PROTO_NAMES[o-1]}"
           fi
@@ -3985,6 +4030,7 @@ main() {
   self_install
   autostart_default
   banner_migrate
+  helpers_update
   case "${1:-}" in
     --install-all) default_name; INSTALL_AUTO=1; install_all; exit 0 ;;
     -h|--help)     usage; exit 0 ;;
