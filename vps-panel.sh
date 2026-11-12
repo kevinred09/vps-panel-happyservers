@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ======================================================================
-#  VPS PANEL v3.0 - instalador y administrador de protocolos para tuneles
+#  VPS PANEL v3.1 - instalador y administrador de protocolos para tuneles
 #  Compatible con HTTP Custom y apps similares.
 #  SSH, Dropbear, SSL, WebSocket, SOCKS Python, WS-ePro, Squid, V2Ray,
 #  BadVPN-UDPGW, UDP Custom, SlowDNS, OpenVPN, WireGuard y Psiphon
@@ -42,7 +42,7 @@ export VPSPANEL_ACTIVE=1
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}
 
 # ------------------------------ Configuracion -------------------------
-VERSION=3.0
+VERSION=3.1
 PREP_V=3           # version de la preparacion del sistema (se repite si cambia)
 NAME_MAX=24        # largo maximo del nombre del VPS (se muestra en el titulo)
 DEF_PASS=xxxx      # contrasena por defecto de las cuentas SSH (ENTER en el campo la escribe sola)
@@ -1582,24 +1582,83 @@ EOF
 
 ssh_restart() { systemctl restart ssh >> "$LOG" 2>&1 || systemctl restart sshd >> "$LOG" 2>&1; }
 
+# Compatibilidad con las apps de tunel: muchas usan librerias SSH antiguas (familia Ganymed/Trilead)
+# que no conocen rsa-sha2-256/512. OpenSSH 8.8+ (Ubuntu 22.04, Debian 12...) ya no ofrece ssh-rsa:
+# si el VPS solo tiene llave RSA (pasa en varias imagenes) la app falla con "Cannot negotiate,
+# proposals do not match". Se crean las llaves que falten (ECDSA, ED25519) y se agregan con "+"
+# ssh-rsa y el intercambio de claves SHA-1: las apps modernas siguen usando los algoritmos nuevos.
+ssh_conf_others() {   # archivos de configuracion de sshd que no son del panel
+  local c
+  echo /etc/ssh/sshd_config
+  for c in /etc/ssh/sshd_config.d/*.conf; do
+    [[ -f $c && $c != */00-vpspanel.conf ]] && echo "$c"
+  done
+  return 0
+}
+
+ssh_hostkeys() {   # crea las llaves del servidor que falten; imprime HostKey si sshd no las cargaria solo
+  local t f
+  local -a cf
+  mapfile -t cf < <(ssh_conf_others)
+  for t in rsa ecdsa ed25519; do
+    f=/etc/ssh/ssh_host_${t}_key
+    if [[ ! -s $f ]]; then
+      rm -f "$f" "$f.pub"
+      ssh-keygen -q -t "$t" -N '' -f "$f" >> "$LOG" 2>&1 && logln "llave del servidor creada: $t"
+    fi
+  done
+  # Con lineas HostKey en la configuracion no se usan las llaves por defecto: se agregan las que falten
+  grep -qsE '^[[:space:]]*HostKey[[:space:]]' "${cf[@]}" || return 0
+  for t in rsa ecdsa ed25519; do
+    f=/etc/ssh/ssh_host_${t}_key
+    [[ -s $f ]] || continue
+    grep -qsE "^[[:space:]]*HostKey[[:space:]]+${f}[[:space:]]*\$" "${cf[@]}" || echo "HostKey $f"
+  done
+  return 0
+}
+
+ssh_legacy() {   # algoritmos extra con "+" (solo los que esta version de OpenSSH soporta)
+  local q a
+  local -a kex=()
+  q=$(ssh -Q kex 2>/dev/null)
+  for a in diffie-hellman-group14-sha1 diffie-hellman-group-exchange-sha1; do
+    grep -qx "$a" <<< "$q" && kex+=("$a")
+  done
+  (( ${#kex[@]} )) && echo "KexAlgorithms +$(IFS=,; echo "${kex[*]}")"
+  ssh -Q key 2>/dev/null | grep -qx ssh-rsa && echo "HostKeyAlgorithms +ssh-rsa"
+  return 0
+}
+
 cfg_ssh() {
-  local f=/etc/ssh/sshd_config.d/00-vpspanel.conf out
+  local f=/etc/ssh/sshd_config.d/00-vpspanel.conf out hk lg
   mkdir -p /etc/ssh/sshd_config.d
   [[ -d /run/sshd ]] || install -d -m 0755 -o root -g root /run/sshd   # sshd -t la exige (root, 0755)
   grep -qE '^\s*Include\s+/etc/ssh/sshd_config\.d' /etc/ssh/sshd_config \
     || sed -i '1i Include /etc/ssh/sshd_config.d/*.conf' /etc/ssh/sshd_config
-  cat > "$f" <<EOF
-PasswordAuthentication yes
-AllowTcpForwarding yes
-PermitTunnel yes
-UseDNS no
-TCPKeepAlive yes
-ClientAliveInterval 30
-ClientAliveCountMax 3
-MaxSessions 100
-MaxStartups 100:30:200
-Banner $(banner_path)
-EOF
+  hk=$(ssh_hostkeys)
+  lg=$(ssh_legacy)
+  {
+    echo "PasswordAuthentication yes"
+    echo "AllowTcpForwarding yes"
+    echo "PermitTunnel yes"
+    echo "UseDNS no"
+    echo "TCPKeepAlive yes"
+    echo "ClientAliveInterval 30"
+    echo "ClientAliveCountMax 3"
+    echo "MaxSessions 100"
+    echo "MaxStartups 100:30:200"
+    echo "Banner $(banner_path)"
+    echo "# Compatibilidad con apps de tunel (librerias SSH antiguas)"
+    [[ -n $hk ]] && echo "$hk"
+    [[ -n $lg ]] && echo "$lg"
+  } > "$f"
+  if ! out=$(sshd -t 2>&1); then
+    printf '%s\n' "$out" >> "$LOG"
+    if [[ -n $lg ]]; then                                   # se reintenta sin los algoritmos extra
+      sed -i '/^KexAlgorithms +/d; /^HostKeyAlgorithms +/d' "$f"
+      sshd -t >/dev/null 2>&1 && warn "sshd no acepto los algoritmos de compatibilidad; se omiten."
+    fi
+  fi
   if ! out=$(sshd -t 2>&1); then
     printf '%s\n' "$out" >> "$LOG"
     err "Configuracion SSH invalida; se revierte. Detalle:"
@@ -3127,9 +3186,22 @@ cfg_vpsname() { register_vps; }
 # ------------------------- Preparacion del sistema --------------------
 # Se marca como hecha solo si todo salio bien: si falla (sin internet, apt ocupado...),
 # se vuelve a intentar en la siguiente instalacion en lugar de dejar el sistema a medias.
-ssh_ok() {   # sshd acepta contrasenas y reenvio TCP (lo que usan las apps de tunel)
-  local t; t=$(sshd -T 2>/dev/null)
-  [[ -z $t ]] || { grep -qx 'passwordauthentication yes' <<< "$t" && ! grep -qx 'allowtcpforwarding no' <<< "$t"; }
+ssh_ok() {   # sshd acepta contrasenas, reenvio TCP y negocia con las librerias SSH de las apps
+  local t k
+  t=$(sshd -T 2>/dev/null)
+  [[ -n $t ]] || return 0                                   # no se puede comprobar
+  grep -qx 'passwordauthentication yes' <<< "$t" || return 1
+  grep -qx 'allowtcpforwarding no' <<< "$t" && return 1
+  for k in rsa ecdsa ed25519; do
+    [[ -s /etc/ssh/ssh_host_${k}_key ]] && grep -qx "hostkey /etc/ssh/ssh_host_${k}_key" <<< "$t" || return 1
+  done
+  if ssh -Q key 2>/dev/null | grep -qx ssh-rsa; then
+    grep '^hostkeyalgorithms ' <<< "$t" | grep -qE '[ ,]ssh-rsa(,|$)' || return 1
+  fi
+  if ssh -Q kex 2>/dev/null | grep -qx diffie-hellman-group14-sha1; then
+    grep '^kexalgorithms ' <<< "$t" | grep -qE '[ ,]diffie-hellman-group14-sha1(,|$)' || return 1
+  fi
+  return 0
 }
 
 ensure_base() {
