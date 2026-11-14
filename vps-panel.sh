@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ======================================================================
-#  VPS PANEL v3.4 - instalador y administrador de protocolos para tuneles
+#  VPS PANEL v3.4.1 - instalador y administrador de protocolos para tuneles
 #  Compatible con HTTP Custom y apps similares.
 #  SSH, Dropbear, SSL, WebSocket, SOCKS Python, WS-ePro, Squid, V2Ray,
 #  BadVPN-UDPGW, UDP Custom, SlowDNS, OpenVPN, WireGuard y Psiphon
@@ -63,7 +63,7 @@ export VPSPANEL_ACTIVE=1
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}
 
 # ------------------------------ Configuracion -------------------------
-VERSION=3.4
+VERSION=3.4.1
 PREP_V=3          # version de la preparacion del sistema (se repite si cambia)
 NAME_MAX=24        # largo maximo del nombre del VPS (se muestra en el titulo)
 DEF_PASS=xxxx      # contrasena por defecto de las cuentas SSH (ENTER en el campo la escribe sola)
@@ -103,7 +103,9 @@ BK_FORMAT=1                # formato de las copias (MANIFEST: format=1)
 SCRIPT_BK=$BK_DIR/scripts  # versiones anteriores del panel (vps-rollback)
 PANEL_BIN=${VPSPANEL_BIN:-/usr/local/bin/vpspanel}
 HELPERS_V=2                # version de vps-cleanup, vps-rollback y el cron: si cambia, se reinstalan solos
-UPDATE_URL=''              # enlace fijo del instalador para ACTUALIZAR PANEL (vacio: se pregunta y se recuerda)
+# Enlace RAW del instalador en tu repositorio: en ACTUALIZAR PANEL basta con ENTER. Si alguna vez
+# actualizas desde otro enlace, el panel recuerda ese (/etc/vpspanel/update.url) y lo usa primero.
+UPDATE_URL='https://raw.githubusercontent.com/kevinred09/vps-panel-happyservers/main/vps-panel.sh'
 
 # Optimizacion de red (ver el bloque "Optimizacion de red")
 NETOPT_V=1                 # version de la optimizacion: si cambia, se vuelve a aplicar sola
@@ -4424,23 +4426,54 @@ upd_check() {   # archivo  ->  0 si es un instalador valido; version en NEWV, mo
   return 0
 }
 
+upd_default() {   # enlace por defecto: el ultimo con el que se actualizo, o el del panel (UPDATE_URL)
+  local d
+  d=$(head -n1 "$BASE/update.url" 2>/dev/null)
+  printf '%s' "${d:-$UPDATE_URL}"
+}
+
+# Lo que se pega en ACTUALIZAR PANEL: el enlace solo, el comando de instalacion completo
+# (curl ... https://... -o ... && ...), el enlace de la pagina de GitHub (/blob/, se pasa a RAW)
+# o la ruta de un archivo del VPS. Devuelve el enlace https o la ruta, sin espacios ni comillas.
+upd_src() {
+  local s=$1 re="(https?://[^[:space:]\"'\`;|<>()]+)"
+  s="${s#"${s%%[![:space:]]*}"}"; s="${s%"${s##*[![:space:]]}"}"
+  if [[ $s =~ $re ]]; then
+    s=${BASH_REMATCH[1]}; s=${s%%&&*}             # "enlace&&chmod ..." pegado sin espacios
+    if [[ $s =~ ^https://github\.com/([^/]+)/([^/]+)/blob/(.+)$ ]]; then
+      s="https://raw.githubusercontent.com/${BASH_REMATCH[1]}/${BASH_REMATCH[2]}/${BASH_REMATCH[3]}"
+    fi
+  else
+    s=${s#[\"\']}; s=${s%[\"\']}
+  fi
+  printf '%s' "$s"
+}
+
 panel_update() {   # [enlace|archivo]  ->  0 = actualizado (falta abrir la version nueva); 3 = cancelado
-  local src=${1:-} def tmp c='' sum need='' cur
+  local src=${1:-} def tmp c='' sum need='' cur raw
   cur=$(ver_of "$PANEL_BIN"); cur=${cur:-$VERSION}    # la instalada (otra sesion pudo actualizar ya)
-  def=${UPDATE_URL:-$(head -n1 "$BASE/update.url" 2>/dev/null)}
+  def=$(upd_default)
   if [[ -z $src ]]; then
     field "VERSION:" "$cur (instalada)"
-    [[ -n $def ]] && field "ENLACE:" "${def:0:38}$( (( ${#def} > 38 )) && echo ...)"
     echo
-    echo " Pega el enlace RAW del instalador nuevo (https://...) o la"
-    echo " ruta de un archivo del VPS. Usuarios y configuracion se"
-    echo " conservan; antes se guarda una copia de todo."
-    [[ -n $def ]] && echo " ENTER = usar el mismo enlace de la ultima vez."
+    if [[ -n $def ]]; then
+      printf ' %sENLACE DE ACTUALIZACION:%s\n %s%s%s\n\n' "$BLU" "$RST" "$GRN" "$def" "$RST"
+      echo " Presiona ENTER para actualizar desde ese enlace, o pega"
+      echo " otro enlace (tambien sirve el comando de instalacion)."
+    else
+      echo " Pega el enlace RAW del instalador nuevo (https://...), el"
+      echo " comando de instalacion completo o la ruta de un archivo."
+    fi
+    echo " Usuarios y configuracion se conservan; antes se guarda una"
+    echo " copia de todo."
     echo
-    rd "ENLACE: " src || return 3
-    src=${src//[[:space:]]/}
+    rd "ENLACE: " raw || return 3
+    src=$(upd_src "$raw")
     [[ -z $src ]] && src=$def
     [[ -n $src && $src != 0 ]] || return 3
+    [[ -n $raw && $src != "$raw" ]] && info "Enlace: $src"
+  else
+    src=$(upd_src "$src")
   fi
   log_use actualizacion "Actualizar desde $src"
   tmp=$(mktemp) || return 1
@@ -4450,7 +4483,9 @@ panel_update() {   # [enlace|archivo]  ->  0 = actualizado (falta abrir la versi
   field "NUEVA:" "version ${NEWV:-desconocida}"
   printf ' %sSHA256:%s\n %s%s%s\n' "$BLU" "$RST" "$GRY" "$sum" "$RST"   # para compararlo con el publicado
   if cmp -s "$tmp" "$PANEL_BIN"; then
-    rm -f "$tmp"; ok "Ya tienes instalada esta misma version."; return 2
+    rm -f "$tmp"; ok "Ya tienes instalada esta misma version."
+    [[ $src == https://raw.githubusercontent.com/* ]] && info "Si recien la subiste, espera 5 min (cache)."
+    return 2
   fi
   if ! grep -q 'VPSPANEL_ACTIVE' "$tmp"; then warn "El archivo no parece ser VPS PANEL."; need=1
   elif [[ -z $NEWV ]]; then warn "No se pudo leer la version del archivo nuevo."; need=1
@@ -5395,7 +5430,7 @@ main() {
     --restore)     [[ -n ${2:-} ]] || { usage; exit 1; }
                    if [[ -t 0 ]]; then bk_restore "$2"; else bk_restore "$2" si; fi
                    exit $? ;;
-    --update)      panel_update "${2:-$(head -n1 "$BASE/update.url" 2>/dev/null)}"; rc=$?
+    --update)      panel_update "${2:-$(upd_default)}"; rc=$?
                    (( rc == 0 )) && [[ -t 0 && -t 1 ]] && { pause; exec "$PANEL_BIN"; }
                    (( rc == 2 )) && rc=0
                    exit $rc ;;
