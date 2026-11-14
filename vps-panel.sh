@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ======================================================================
-#  VPS PANEL v3.3 - instalador y administrador de protocolos para tuneles
+#  VPS PANEL v3.4 - instalador y administrador de protocolos para tuneles
 #  Compatible con HTTP Custom y apps similares.
 #  SSH, Dropbear, SSL, WebSocket, SOCKS Python, WS-ePro, Squid, V2Ray,
 #  BadVPN-UDPGW, UDP Custom, SlowDNS, OpenVPN, WireGuard y Psiphon
@@ -44,6 +44,12 @@
 #    vpspanel --update [ENLACE]      actualizar el panel
 #    vps-rollback                    volver a la version anterior del panel
 #
+#  Optimizacion de red (PREPARACION DEL SISTEMA > 17): se aplica sola. Buffers UDP de 16 MB para
+#  UDP Custom, cola de red, conntrack, RPS (todos los nucleos procesan la red), BadVPN con 64
+#  conexiones UDP por usuario (antes 20) con casi la misma memoria, ventana de Dropbear segun la
+#  RAM y TCP con BBR.
+#  Muestra donde esta el cuello de botella de cada VPS y se puede deshacer.
+#
 #  Interfaz: replica el panel de referencia (colores RGB exactos, lineas de 53
 #  columnas). Todo el aspecto visual esta en el bloque "Interfaz".
 #    VPSPANEL_COLOR=256 vpspanel       terminal sin colores de 24 bits (aproximado)
@@ -57,7 +63,7 @@ export VPSPANEL_ACTIVE=1
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}
 
 # ------------------------------ Configuracion -------------------------
-VERSION=3.3
+VERSION=3.4
 PREP_V=3          # version de la preparacion del sistema (se repite si cambia)
 NAME_MAX=24        # largo maximo del nombre del VPS (se muestra en el titulo)
 DEF_PASS=xxxx      # contrasena por defecto de las cuentas SSH (ENTER en el campo la escribe sola)
@@ -98,6 +104,16 @@ SCRIPT_BK=$BK_DIR/scripts  # versiones anteriores del panel (vps-rollback)
 PANEL_BIN=${VPSPANEL_BIN:-/usr/local/bin/vpspanel}
 HELPERS_V=2                # version de vps-cleanup, vps-rollback y el cron: si cambia, se reinstalan solos
 UPDATE_URL=''              # enlace fijo del instalador para ACTUALIZAR PANEL (vacio: se pregunta y se recuerda)
+
+# Optimizacion de red (ver el bloque "Optimizacion de red")
+NETOPT_V=1                 # version de la optimizacion: si cambia, se vuelve a aplicar sola
+NETOPT_CONF=/etc/sysctl.d/60-vpspanel-red.conf   # el /etc/sysctl.conf del administrador sigue mandando
+NETOPT_MODS=/etc/modules-load.d/vpspanel.conf     # modulos que se cargan antes de aplicar los ajustes
+NETOPT_HASH=/etc/modprobe.d/vpspanel.conf         # tamano de la tabla de conntrack al cargar el modulo
+NETOPT_ORIG=$BASE/netopt.orig                     # valores que tenia el sistema (para deshacer)
+BADVPN_CONNS=64            # conexiones UDP por usuario en BadVPN con la optimizacion (40 con menos de 1 GB; sin ella, 20)
+BADVPN_MTU=16384           # datagrama maximo de BadVPN (por defecto 65520). Debe superar la MTU de la TUN de las apps
+                           # (1500 o 9000): un datagrama mayor no se descarta, udpgw corta la sesion UDP del usuario
 
 DEL_WAIT=7                 # segundos de espera con la advertencia antes de eliminar TODAS las cuentas (opcion 8)
 DEL_WAIT_SEL=3             # segundos de espera con la advertencia al eliminar varias cuentas (opcion 2)
@@ -774,7 +790,7 @@ mkunit() { # nombre descripcion exec [directivas extra de [Service]] [directivas
     echo "ExecStart=$exec"
     echo "Restart=always"
     echo "RestartSec=2"
-    echo "LimitNOFILE=65535"
+    echo "LimitNOFILE=$(unit_nofile)"
     echo
     echo "[Install]"
     echo "WantedBy=multi-user.target"
@@ -1902,7 +1918,7 @@ dropbear_keys() {   # llaves del servidor (Dropbear no las crea solo con dropbea
 unit_dropbear() {   # servicio con el puerto y el banner actuales
   # KillMode=process: reiniciar Dropbear (puerto, banner) no corta a los usuarios conectados
   mkunit vps-dropbear "Dropbear SSH" \
-    "$(command -v dropbear || echo /usr/sbin/dropbear) -F -E -R -p $PORT_DROPBEAR -W 65536 -K 30 $(banner_opt)" \
+    "$(command -v dropbear || echo /usr/sbin/dropbear) -F -E -R -p $PORT_DROPBEAR -W $(dropbear_win) -K 30 $(banner_opt)" \
     "KillMode=process"
   fw_sync
   verify dropbear Dropbear
@@ -1982,7 +1998,7 @@ build_badvpn() (   # subshell: la salida va al registro
 
 unit_badvpn() {
   mkunit vps-badvpn "BadVPN UDPGW" \
-    "/usr/local/bin/badvpn-udpgw --listen-addr 127.0.0.1:$PORT_BADVPN --max-clients 1000 --max-connections-for-client 20"
+    "/usr/local/bin/badvpn-udpgw --listen-addr 127.0.0.1:$PORT_BADVPN --max-clients 1000 $(badvpn_opts)" "$(badvpn_mem)"
   verify badvpn BadVPN-UDPGW
 }
 
@@ -3140,14 +3156,442 @@ cfg_banner() {
   esac
 }
 
-cfg_bbr() {
+# ------------------------------ Optimizacion de red -------------------
+# Cuellos de botella reales de un VPS de tuneles, sobre todo con UDP Custom (QUIC, basado en
+# Hysteria v1) y con UDP por SSH (BadVPN-UDPGW):
+#  1. Buffer UDP del kernel: 208 KB como maximo. UDP Custom pide varios MB; sin ellos, a alta
+#     velocidad el kernel descarta paquetes (RcvbufErrors) y QUIC lo toma como perdida y frena.
+#     Hysteria recomienda 16 MB.
+#  2. Cola de entrada de la red (netdev_max_backlog = 1000): se desborda con rafagas UDP.
+#  3. Conntrack: UDP Custom redirige (DNAT) todos los puertos UDP y cada conexion de los usuarios
+#     ocupa una entrada. Con la tabla llena el kernel descarta conexiones nuevas, y las TCP de
+#     clientes moviles que desaparecen quedan 5 dias ocupando lugar.
+#  4. Con varios nucleos y tarjeta de una sola cola (lo normal en KVM), un solo nucleo procesa
+#     todos los paquetes: RPS los reparte entre todos.
+#  5. BadVPN: las conexiones UDP no expiran; solo se liberan al llegar al tope por usuario (20),
+#     y Chrome y YouTube (QUIC) abren mas: se les cortan flujos activos. Cada conexion reserva
+#     buffers del tamano del datagrama maximo (65520): medido, hasta ~222 KB por conexion. Con
+#     datagramas de hasta 16384 bytes (sobra para TUN de 1500 o 9000) el peor caso baja a ~78 KB,
+#     asi el tope sube a 64 (40 con menos de 1 GB) con casi la misma memoria maxima que antes, y
+#     un tope de memoria impide que BadVPN deje sin RAM al VPS.
+#  6. Dropbear: ventana de 64 KB por conexion; la subida queda en ventana / latencia (~5 Mbps por
+#     conexion con 100 ms). Se sube segun la RAM (cada conexion activa reserva su ventana).
+#  7. TCP (modos SSH y conexiones del VPS a internet, tambien las de UDP Custom): BBR, buffers de
+#     16 MB, sin arranque lento tras una pausa, MTU probing (redes moviles que bloquean ICMP),
+#     menos datos esperando en el socket (menos latencia) y keepalive de 5 minutos (mantiene las
+#     conexiones a traves del NAT de las operadoras y libera las muertas).
+#  8. Archivos abiertos: 65535 por servicio; con muchos usuarios UDP Custom y BadVPN se quedan cortos.
+# Nunca baja un valor que ya este mas alto, guarda los originales y se puede deshacer.
+ram_mb()    { awk '/^MemTotal:/ {print int($2 / 1024); exit}' /proc/meminfo 2>/dev/null; }
+net_dev()   { awk 'NR > 1 && $2 == "00000000" && $8 == "00000000" {print $1; exit}' /proc/net/route 2>/dev/null; }
+netopt_on() { [[ -s $BASE/.netopt ]]; }
+sysv()      { sysctl -n "$1" 2>/dev/null | tr -s ' \t' ' '; }    # valor actual de un ajuste del kernel
+hsize()     { awk -v b="${1:-0}" 'BEGIN { if (b >= 1048576) printf "%.0f MB", b / 1048576; else printf "%.0f KB", b / 1024 }'; }
+
+unit_nofile() {   # archivos abiertos por servicio: alto con la optimizacion (sin pasar fs.nr_open)
+  local m
+  netopt_on || { echo 65535; return; }
+  m=$(cat /proc/sys/fs/nr_open 2>/dev/null)
+  [[ $m =~ ^[0-9]+$ ]] || m=1048576
+  (( m > 1048576 )) && m=1048576
+  echo "$m"
+}
+
+badvpn_opts() {   # con la optimizacion: 64 conexiones por usuario (40 con poca RAM), datagramas de hasta 16 KB
+  local r c=$BADVPN_CONNS
+  r=$(ram_mb); [[ $r =~ ^[0-9]+$ ]] && (( r < 900 && c > 40 )) && c=40
+  if netopt_on; then echo "--max-connections-for-client $c --udp-mtu $BADVPN_MTU"
+  else echo "--max-connections-for-client 20"; fi
+}
+
+badvpn_mem() {   # tope de memoria de BadVPN (40% de la RAM): si lo pasa, se reinicia solo BadVPN
+  local r
+  netopt_on || return 0
+  r=$(ram_mb)
+  [[ $r =~ ^[0-9]+$ ]] && (( r >= 256 )) && echo "MemoryMax=$(( r * 40 / 100 ))M"
+  return 0
+}
+
+dropbear_win() {   # ventana de recepcion por conexion de Dropbear (limita la subida)
+  local r
+  netopt_on || { echo 65536; return; }
+  r=$(ram_mb)
+  if [[ $r =~ ^[0-9]+$ ]] && (( r >= 900 )); then echo 262144; else echo 131072; fi
+}
+
+netopt_list() {   # clave|valor|modo   max: solo sube  min: solo baja  set: fija  top: sube el maximo (3 numeros)
+  local ct r
+  printf '%s\n' \
+    'net.core.rmem_max|16777216|max' 'net.core.wmem_max|16777216|max' \
+    'net.core.netdev_max_backlog|16384|max' 'net.core.somaxconn|4096|max' \
+    'net.core.default_qdisc|fq|set' \
+    'net.ipv4.tcp_rmem|16777216|top' 'net.ipv4.tcp_wmem|16777216|top' \
+    'net.ipv4.tcp_mtu_probing|1|set' 'net.ipv4.tcp_slow_start_after_idle|0|set' \
+    'net.ipv4.tcp_notsent_lowat|131072|min' 'net.ipv4.tcp_tw_reuse|1|set' \
+    'net.ipv4.tcp_keepalive_time|300|min' 'net.ipv4.tcp_keepalive_intvl|30|min' \
+    'net.ipv4.tcp_keepalive_probes|5|min'
   modprobe tcp_bbr 2>/dev/null
-  cat > /etc/sysctl.d/99-vpspanel.conf <<EOF
-net.core.default_qdisc=fq
-net.ipv4.tcp_congestion_control=bbr
+  grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null &&
+    echo 'net.ipv4.tcp_congestion_control|bbr|set'
+  if [[ -e /proc/sys/net/netfilter/nf_conntrack_max ]]; then   # solo si hay NAT (UDP Custom, OpenVPN...)
+    r=$(ram_mb); [[ $r =~ ^[0-9]+$ ]] || r=1024
+    ct=$(( r * 128 )); (( ct < 65536 )) && ct=65536; (( ct > 1048576 )) && ct=1048576
+    printf '%s\n' "net.netfilter.nf_conntrack_max|$ct|max" \
+      'net.netfilter.nf_conntrack_tcp_timeout_established|7440|min' \
+      'net.netfilter.nf_conntrack_udp_timeout_stream|180|max'
+  fi
+  return 0
+}
+
+netopt_target() {   # actual valor modo  ->  valor final (nunca empeora lo que ya esta mejor)
+  local cur=$1 val=$2 a='' b='' c=''
+  case $3 in
+    max) [[ $cur =~ ^[0-9]+$ ]] && (( cur >= val )) && { echo "$cur"; return; } ;;
+    min) [[ $cur =~ ^[0-9]+$ ]] && (( cur <= val )) && { echo "$cur"; return; } ;;
+    top) read -r a b c <<< "$cur"
+         [[ $c =~ ^[0-9]+$ ]] && (( c >= val )) && { echo "$cur"; return; }
+         echo "${a:-4096} ${b:-131072} $val"; return ;;
+  esac
+  echo "$val"
+}
+
+install_netopt() {   # vps-netopt: reparte la red entre los nucleos (RPS) en cada arranque
+  cat > /usr/local/bin/vps-netopt <<'EOF'
+#!/bin/bash
+# vps-netopt: en VPS con varios nucleos y tarjeta de red de una sola cola (lo normal en KVM)
+# reparte el procesamiento de los paquetes entre todos los nucleos (RPS/RFS). Sin esto un solo
+# nucleo atiende toda la red y limita los Mbps con muchos usuarios (sobre todo UDP Custom).
+#   vps-netopt        lo aplica (vps-netopt.service lo ejecuta en cada arranque)
+#   vps-netopt off    lo quita
+dev=$(awk 'NR > 1 && $2 == "00000000" && $8 == "00000000" {print $1; exit}' /proc/net/route 2>/dev/null)
+[[ -n $dev && -d /sys/class/net/$dev/queues ]] || exit 0
+q=( /sys/class/net/"$dev"/queues/rx-* )
+n=$(nproc 2>/dev/null || echo 1)
+if [[ ${1:-} == off ]]; then
+  for d in "${q[@]}"; do { echo 0 > "$d/rps_cpus"; echo 0 > "$d/rps_flow_cnt"; } 2>/dev/null; done
+  sysctl -qw net.core.rps_sock_flow_entries=0 2>/dev/null
+  exit 0
+fi
+# solo con una cola y de 2 a 32 nucleos (con varias colas la tarjeta ya reparte sola)
+(( ${#q[@]} == 1 && n >= 2 && n <= 32 )) || exit 0
+{ echo "$(printf '%x' $(( (1 << n) - 1 )))" > "${q[0]}/rps_cpus" && echo 32768 > "${q[0]}/rps_flow_cnt"; } 2>/dev/null || exit 0
+sysctl -qw net.core.rps_sock_flow_entries=32768 2>/dev/null
+exit 0
 EOF
-  sysctl --system >/dev/null 2>&1
-  ok "Control de congestion: $(sysctl -n net.ipv4.tcp_congestion_control)"
+  chmod 755 /usr/local/bin/vps-netopt
+  cat > /etc/systemd/system/vps-netopt.service <<'EOF'
+[Unit]
+Description=VPS Panel - reparte la red entre todos los nucleos (RPS)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/vps-netopt
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload >/dev/null 2>&1
+  systemctl enable vps-netopt >/dev/null 2>&1
+  return 0
+}
+
+rps_state() {   # si | no | na (no hace falta: un nucleo o tarjeta con varias colas)
+  local dev n
+  local -a q
+  dev=$(net_dev); [[ -n $dev ]] || { echo na; return; }
+  q=( /sys/class/net/"$dev"/queues/rx-* ); n=$(nproc 2>/dev/null || echo 1)
+  [[ -e ${q[0]} ]] && (( ${#q[@]} == 1 && n >= 2 )) || { echo na; return; }
+  if [[ -n $(tr -d ',0\n' < "${q[0]}/rps_cpus" 2>/dev/null) ]]; then echo si; else echo no; fi
+}
+
+# Aplica los ajustes del kernel, RPS y los nuevos limites de UDP Custom, BadVPN y Dropbear.
+# Cada ajuste se comprueba leyendolo de nuevo: en VPS OpenVZ/LXC el proveedor no deja cambiar
+# varios y se informa cuales. Deja en NETOPT_OK y NETOPT_BAD la cantidad aplicada y no aplicada.
+netopt_apply() {   # [quiet]
+  local quiet=${1:-} k v m cur tgt hs b
+  local -a conf=() badk=()
+  log_use red "Optimizacion de red"
+  NETOPT_OK=0; NETOPT_BAD=0
+  touch "$NETOPT_ORIG"; chmod 600 "$NETOPT_ORIG"
+  mkdir -p "${NETOPT_CONF%/*}" "${NETOPT_MODS%/*}" "${NETOPT_HASH%/*}"
+  # la opcion BBR anterior queda dentro de esta (se guarda para poder deshacer)
+  [[ -f /etc/sysctl.d/99-vpspanel.conf && ! -f $BASE/netopt.99 ]] && cp /etc/sysctl.d/99-vpspanel.conf "$BASE/netopt.99"
+  [[ -z $quiet ]] && info "Ajustando el kernel (UDP, TCP y conntrack)..."
+  while IFS='|' read -r k v m; do
+    cur=$(sysv "$k")
+    if [[ -z $cur ]]; then badk+=("$k"); continue; fi             # no existe en este kernel
+    grep -q "^${k//./\\.}=" "$NETOPT_ORIG" || echo "$k=$cur" >> "$NETOPT_ORIG"
+    tgt=$(netopt_target "$cur" "$v" "$m")
+    [[ $tgt == "$cur" ]] || sysctl -qw "$k=$tgt" >> "$LOG" 2>&1
+    if [[ $(sysv "$k") != "$tgt" ]]; then badk+=("$k"); continue; fi   # el proveedor no lo deja cambiar
+    conf+=("$k = $tgt")
+  done < <(netopt_list)
+  {
+    echo "# VPS PANEL: optimizacion de red (UDP Custom, BadVPN y TCP)."
+    echo "# Para deshacerla: PREPARACION DEL SISTEMA > OPTIMIZAR RED > VOLVER A LOS VALORES ORIGINALES"
+    printf '%s\n' "${conf[@]}"
+  } > "$NETOPT_CONF"
+  rm -f /etc/sysctl.d/99-vpspanel.conf
+  # modulos que deben estar cargados al arrancar para que los ajustes se apliquen
+  {
+    printf '%s\n' "${conf[@]}" | grep -q 'tcp_congestion_control = bbr' && echo tcp_bbr
+    printf '%s\n' "${conf[@]}" | grep -q 'nf_conntrack_max' && echo nf_conntrack
+  } > "$NETOPT_MODS"
+  [[ -s $NETOPT_MODS ]] || rm -f "$NETOPT_MODS"
+  # tabla de conntrack: un cubo cada 4 entradas (busquedas rapidas con la tabla grande)
+  b=$(sysv net.netfilter.nf_conntrack_buckets); hs=$(sysv net.netfilter.nf_conntrack_max)
+  if [[ $b =~ ^[0-9]+$ && $hs =~ ^[0-9]+$ ]] && (( hs / 4 > b )); then
+    hs=$(( hs / 4 ))
+    grep -q '^hashsize=' "$NETOPT_ORIG" || echo "hashsize=$b" >> "$NETOPT_ORIG"
+    sysctl -qw "net.netfilter.nf_conntrack_buckets=$hs" 2>/dev/null ||
+      { echo "$hs" > /sys/module/nf_conntrack/parameters/hashsize; } 2>/dev/null
+    hs=$(sysv net.netfilter.nf_conntrack_buckets)           # el kernel lo redondea: se guarda el aplicado
+    [[ $hs =~ ^[0-9]+$ ]] && (( hs > b )) && echo "options nf_conntrack hashsize=$hs" > "$NETOPT_HASH"
+  fi
+  install_netopt
+  /usr/local/bin/vps-netopt >> "$LOG" 2>&1
+  echo "$NETOPT_V" > "$BASE/.netopt"
+  echo "$(net_drops) $(date +%s)" > "$BASE/.netopt.base"   # para medir las perdidas nuevas
+  rm -f "$BASE/netopt.off"
+  NETOPT_OK=${#conf[@]}; NETOPT_BAD=${#badk[@]}
+  logln "aplicados: ${conf[*]}"
+  logln "no aplicados: ${badk[*]:-ninguno}"
+  if [[ -z $quiet ]]; then
+    ok "Kernel: $NETOPT_OK ajustes activos"
+    (( NETOPT_BAD )) && warn "$NETOPT_BAD ajustes no se pueden cambiar en este VPS (kernel o proveedor)"
+    [[ $(rps_state) == si ]] && ok "RPS: la red se procesa en los $(nproc) nucleos"
+  fi
+  netopt_services "$quiet"
+  return 0
+}
+
+netopt_services() {   # [quiet]  ->  UDP Custom, BadVPN y Dropbear toman los limites actuales
+  local k quiet=${1:-}
+  for k in udp badvpn dropbear; do   # solo lo instalado; lo detenido sigue detenido
+    proto_installed "$k" || continue
+    if [[ -n $quiet ]]; then apply_proto "$k" >/dev/null 2>&1; else apply_proto "$k"; fi
+  done
+  return 0
+}
+
+netopt_revert() {   # vuelve a los valores que tenia el sistema antes de la optimizacion
+  local k v
+  log_use red "Volver a los valores originales"
+  if [[ -s $NETOPT_ORIG ]]; then
+    while IFS='=' read -r k v; do
+      [[ -n $v ]] || continue
+      case $k in
+        hashsize) sysctl -qw "net.netfilter.nf_conntrack_buckets=$v" 2>/dev/null ||
+                    { echo "$v" > /sys/module/nf_conntrack/parameters/hashsize; } 2>/dev/null ;;
+        *.*)      sysctl -qw "$k=$v" >> "$LOG" 2>&1 ;;
+      esac
+    done < "$NETOPT_ORIG"
+  fi
+  [[ -x /usr/local/bin/vps-netopt ]] && /usr/local/bin/vps-netopt off >> "$LOG" 2>&1
+  systemctl disable vps-netopt >/dev/null 2>&1
+  rm -f /etc/systemd/system/vps-netopt.service /usr/local/bin/vps-netopt
+  rm -f "$NETOPT_CONF" "$NETOPT_MODS" "$NETOPT_HASH" "$NETOPT_ORIG" "$BASE/.netopt" "$BASE/.netopt.base"
+  [[ -f $BASE/netopt.99 ]] && mv -f "$BASE/netopt.99" /etc/sysctl.d/99-vpspanel.conf
+  systemctl daemon-reload >/dev/null 2>&1
+  return 0
+}
+
+netopt_update() {   # [quiet]  ->  la aplica sola la primera vez o cuando cambia su version
+  local -a act=()
+  [[ -f $BASE/netopt.off ]] && return 0                       # el administrador la deshizo
+  [[ $(cat "$BASE/.netopt" 2>/dev/null) == "$NETOPT_V" ]] && return 0
+  if [[ -n ${1:-} || ! -t 0 || ! -t 1 ]]; then netopt_apply quiet; return 0; fi
+  is_on udp && act+=("UDP Custom"); is_on badvpn && act+=("BadVPN")
+  cls
+  title "OPTIMIZACION DE RED" "$GRN"
+  echo " Se aplican ajustes de velocidad y latencia para UDP Custom,"
+  echo " BadVPN y TCP. Se puede deshacer en PREPARACION DEL SISTEMA >"
+  echo " OPTIMIZAR RED."
+  case ${#act[@]} in
+    1) echo " ${act[0]} se reinicia: sus usuarios se reconectan solos." ;;
+    2) echo " ${act[0]} y ${act[1]} se reinician: sus usuarios se reconectan solos." ;;
+  esac
+  echo
+  netopt_apply
+  echo
+  netopt_diag
+  pause
+}
+
+udp_skmem() {   # puerto  ->  "buffer descartes" del socket UDP que escucha en ese puerto (ss -m)
+  local s
+  s=$(ss -Huamn "sport = :$1" 2>/dev/null | tr -s ' \t\n' ' ' | sed -n 's/.*skmem:(\([^)]*\)).*/\1/p' | head -1)
+  [[ -n $s ]] || return 1
+  printf '%s %s\n' "$(sed -n 's/.*rb\([0-9]*\).*/\1/p' <<< "$s")" "$(sed -n 's/.*,d\([0-9]*\).*/\1/p' <<< "$s")"
+}
+
+cpu_sample() {   # -> "uso% robado%" medidos durante 1 segundo
+  local -a x y
+  local i t=0 idle st
+  read -ra x < /proc/stat; sleep 1; read -ra y < /proc/stat
+  for i in 1 2 3 4 5 6 7 8; do t=$(( t + ${y[i]:-0} - ${x[i]:-0} )); done
+  idle=$(( ${y[4]:-0} - ${x[4]:-0} + ${y[5]:-0} - ${x[5]:-0} ))   # inactivo + espera de disco
+  st=$(( ${y[8]:-0} - ${x[8]:-0} ))                               # tiempo que el proveedor no le dio al VPS
+  (( t > 0 )) || t=1
+  echo "$(( (t - idle - st) * 100 / t )) $(( st * 100 / t ))"
+}
+
+net_drops() {   # -> "udp cola": paquetes UDP descartados por buffer lleno y por cola de entrada llena
+  local u d=0 x
+  u=$(awk '$1 == "Udp:" { if (!h) { for (i = 2; i <= NF; i++) n[i] = $i; h = 1 }
+            else { for (i = 2; i <= NF; i++) if (n[i] == "RcvbufErrors") print $i; exit } }' /proc/net/snmp 2>/dev/null)
+  while read -r _ x _; do [[ $x =~ ^[0-9a-fA-F]{1,15}$ ]] && d=$(( d + 16#$x )); done < /proc/net/softnet_stat
+  [[ $u =~ ^[0-9]+$ ]] || u=0
+  echo "$u $d"
+}
+
+nline() {   # etiqueta valor ok|warn|bad|na  ->  fila del diagnostico
+  local s c
+  case $3 in
+    ok)   s=OK;        c=$GRN ;;
+    warn) s=MEJORABLE; c=$YEL ;;
+    bad)  s=LIMITA;    c=$RED ;;
+    *)    s='-';       c=$GRY ;;
+  esac
+  printf ' %s%-13s%s %s%-26.26s%s %s%s%s\n' "$BLU" "$1" "$RST" "$WHT" "$2" "$RST" "$c" "$s" "$RST"
+}
+
+# Diagnostico de cada VPS: que esta limitando la velocidad, con datos medidos (no supuestos).
+netopt_diag() {
+  local dev n r q virt aes cpu st v x s rb d cnt max pct w st2 bx bd since FW=13
+  dev=$(net_dev); n=$(nproc 2>/dev/null || echo 1); r=$(ram_mb)
+  q=$(ls -d /sys/class/net/"${dev:-none}"/queues/rx-* 2>/dev/null | wc -l)
+  virt=$(systemd-detect-virt 2>/dev/null); virt=${virt:-desconocido}
+  if grep -qw aes /proc/cpuinfo 2>/dev/null; then aes=si; else aes=no; fi
+  read -r cpu st <<< "$(cpu_sample)"
+  field "VPS:" "${virt^^}, $n CPU, $(fmt_mb "${r:-0}") RAM, kernel $(uname -r | cut -d- -f1)"
+  s=$GRN; (( st >= 10 || cpu >= 85 )) && s=$YEL
+  field "CPU:" "uso ${cpu}%, robado ${st}%, AES-NI $aes" "$s"
+  case $(rps_state) in
+    si) x="RPS activo" ;; no) x="RPS apagado: 1 nucleo" ;; *) x="sin RPS (no hace falta)" ;;
+  esac
+  field "RED:" "${dev:--}, $q cola(s), $x"
+  section "UDP (UDP CUSTOM Y BADVPN)"
+  v=$(sysv net.core.rmem_max)
+  if [[ $v =~ ^[0-9]+$ ]]; then
+    if (( v >= 8388608 )); then st2=ok; else st2=bad; fi
+    nline "BUFFER UDP:" "$(hsize "$v") como maximo" "$st2"
+  else nline "BUFFER UDP:" "no disponible" na; fi
+  if is_on udp && read -r rb d < <(udp_skmem "$PORT_UDP"); then
+    if [[ $rb =~ ^[0-9]+$ ]] && (( rb >= 2097152 )); then st2=ok; else st2=bad; fi
+    [[ $st2 == ok && ${d:-0} != 0 ]] && st2=warn
+    nline "UDP CUSTOM:" "buffer $(hsize "$rb"), ${d:-0} descartes" "$st2"
+  elif is_on udp; then nline "UDP CUSTOM:" "activo (sin ss para medir)" na
+  else nline "UDP CUSTOM:" "no esta activo" na; fi
+  # perdidas: desde que se optimizo (si se reinicio el VPS, desde el arranque)
+  read -r x d <<< "$(net_drops)"
+  bx=''; bd=''
+  [[ -r $BASE/.netopt.base ]] && read -r bx bd _ < "$BASE/.netopt.base"
+  if netopt_on && [[ $bx =~ ^[0-9]+$ && $bd =~ ^[0-9]+$ ]]; then
+    (( x >= bx )) && x=$(( x - bx )); (( d >= bd )) && d=$(( d - bd )); since="desde la optimizacion"
+  else since="desde el arranque"; fi
+  if (( x == 0 )); then st2=ok; else st2=warn; fi
+  nline "PERDIDAS UDP:" "$x $since" "$st2"
+  v=$(sysv net.core.netdev_max_backlog)
+  if [[ $v =~ ^[0-9]+$ ]] && (( v >= 8192 )); then st2=ok; else st2=warn; fi
+  (( d > 0 )) && [[ $st2 == ok ]] && st2=warn
+  nline "COLA ENTRADA:" "${v:--}, $d descartes" "$st2"
+  cnt=$(sysv net.netfilter.nf_conntrack_count); max=$(sysv net.netfilter.nf_conntrack_max)
+  if [[ $cnt =~ ^[0-9]+$ && $max =~ ^[0-9]+$ ]] && (( max > 0 )); then
+    pct=$(( cnt * 100 / max ))
+    if (( pct >= 90 )); then st2=bad; elif (( pct >= 70 || max < 65536 )); then st2=warn; else st2=ok; fi
+    nline "CONNTRACK:" "$cnt de $max ($pct%)" "$st2"
+  else nline "CONNTRACK:" "sin NAT (no hace falta)" na; fi
+  if proto_installed badvpn; then
+    w=$(sed -n 's/.*--max-connections-for-client \([0-9]*\).*/\1/p' /etc/systemd/system/vps-badvpn.service 2>/dev/null | head -1)
+    if (( ${w:-0} >= 40 )); then st2=ok; else st2=warn; fi
+    nline "BADVPN:" "${w:--} conexiones UDP/usuario" "$st2"
+  else nline "BADVPN:" "no instalado" na; fi
+  section "TCP (SSH, WEBSOCKET Y SALIDA)"
+  v=$(sysv net.ipv4.tcp_congestion_control)
+  if [[ $v == bbr ]]; then st2=ok; else st2=warn; fi
+  nline "CONGESTION:" "${v:--} + $(sysv net.core.default_qdisc)" "$st2"
+  v=$(sysv net.ipv4.tcp_rmem); v=${v##* }
+  if [[ $v =~ ^[0-9]+$ ]] && (( v >= 16777216 )); then st2=ok; else st2=warn; fi
+  nline "BUFFER TCP:" "$(hsize "${v:-0}") como maximo" "$st2"
+  if [[ $(sysv net.ipv4.tcp_mtu_probing) =~ ^[12]$ ]]; then nline "MTU PROBING:" "activo (redes moviles)" ok
+  else nline "MTU PROBING:" "apagado" warn; fi
+  if [[ $(sysv net.ipv4.tcp_slow_start_after_idle) == 0 ]]; then nline "TRAS PAUSAS:" "sigue a toda velocidad" ok
+  else nline "TRAS PAUSAS:" "vuelve a arranque lento" warn; fi
+  if proto_installed dropbear; then
+    w=$(sed -n 's/.* -W \([0-9]*\) .*/\1/p' /etc/systemd/system/vps-dropbear.service 2>/dev/null | head -1)
+    if (( ${w:-0} >= 131072 )); then st2=ok; else st2=warn; fi
+    nline "DROPBEAR:" "ventana $(hsize "${w:-0}")" "$st2"
+  fi
+  line_eq
+  if netopt_on; then field "OPTIMIZACION:" "ACTIVA (version $(cat "$BASE/.netopt"))" "$GRN"
+  else field "OPTIMIZACION:" "DESACTIVADA" "$RED"; fi
+}
+
+_speed_get() {   # archivo modo  ->  bytes por segundo (Cloudflare) en el archivo
+  local f=$2 t
+  if [[ $1 == down ]]; then
+    curl -s -o /dev/null --max-time 25 -w '%{speed_download}' 'https://speed.cloudflare.com/__down?bytes=25000000' > "$f"
+  else
+    t=$(mktemp); head -c 10000000 /dev/urandom > "$t"
+    curl -s -o /dev/null --max-time 25 -w '%{speed_upload}' -H 'Content-Type: application/octet-stream' \
+      --data-binary @"$t" 'https://speed.cloudflare.com/__up' > "$f"
+    rm -f "$t"
+  fi
+  return 0
+}
+
+net_speed() {   # velocidad del propio VPS: el maximo que puede repartir entre todos los usuarios
+  local f d u
+  f=$(mktemp)
+  echo " Prueba desde el VPS hasta Cloudflare (bajada 25 MB, subida 10 MB)."
+  echo
+  spin "Midiendo la bajada" _speed_get down "$f"; d=$(cat "$f" 2>/dev/null)
+  spin "Midiendo la subida" _speed_get up "$f"; u=$(cat "$f" 2>/dev/null)
+  rm -f "$f"
+  field "BAJADA:" "$(awk -v b="${d:-0}" 'BEGIN { if (b + 0 > 0) printf "%.0f Mbps", b * 8 / 1000000; else print "no disponible" }')"
+  field "SUBIDA:" "$(awk -v b="${u:-0}" 'BEGIN { if (b + 0 > 0) printf "%.0f Mbps", b * 8 / 1000000; else print "no disponible" }')"
+  echo
+  echo " Es lo maximo que este VPS puede dar a todos los usuarios juntos."
+  echo " Si es bajo, el limite esta en el plan o en el proveedor, no en el panel."
+}
+
+menu_netopt() {   # PREPARACION DEL SISTEMA > OPTIMIZAR RED
+  local o c=''
+  while :; do
+    sub_header "OPTIMIZACION DE RED"
+    netopt_diag
+    line_eq
+    item 1 "APLICAR OPTIMIZACION (UDP, TCP Y BADVPN)" "$GRN"
+    item 2 "MEDIR VELOCIDAD DEL VPS (USA ~35 MB)"
+    netopt_on && item 3 "VOLVER A LOS VALORES ORIGINALES" "$RED"
+    menu_end
+    ask o || return
+    case $o in
+      1) sub_header "OPTIMIZACION DE RED"
+         if is_on udp || is_on badvpn; then
+           info "UDP Custom y BadVPN se reinician: sus usuarios se reconectan solos."
+           rd "APLICAR AHORA? (S/n): " c
+           [[ $c == [nN]* ]] && continue
+         fi
+         netopt_apply ;;
+      2) sub_header "VELOCIDAD DEL VPS"; net_speed ;;
+      3) netopt_on || continue
+         sub_header "VALORES ORIGINALES"
+         rd "QUITAR LA OPTIMIZACION Y VOLVER A LOS VALORES DEL SISTEMA? (s/N): " c
+         [[ $c == [sS]* ]] || continue
+         netopt_revert
+         touch "$BASE/netopt.off"                 # no se vuelve a aplicar sola
+         netopt_services
+         ok "Valores originales restaurados (no se aplica de nuevo sola)" ;;
+      0) return ;;
+      *) continue ;;
+    esac
+    pause
+  done
 }
 
 cfg_swap() {
@@ -3331,13 +3775,14 @@ uninstall_all() {
   info "vuelven solos los usuarios y la configuracion."
   rd "CONSERVAR LAS COPIAS DE SEGURIDAD? (S/n): " keep
   NO_AUTOBK=1                                    # desde aqui no se crean mas copias automaticas
+  netopt_on && netopt_revert >/dev/null 2>&1     # el kernel y la red vuelven a los valores que tenian
   while IFS='|' read -r u p _; do
     [[ -n $u ]] || continue
     if id "$u" >/dev/null 2>&1 && ! panel_uid "$u"; then continue; fi   # nunca root ni cuentas del sistema
     pkill -KILL -u "$u" 2>/dev/null; userdel -f "$u" 2>/dev/null
   done < "$USERDB"
   for s in vps-dropbear vps-stunnel vps-sslws vps-badvpn vps-ws vps-socks vps-wsepro vps-slowdns \
-           udp-custom vps-psiphon vps-firewall; do
+           udp-custom vps-psiphon vps-firewall vps-netopt; do
     systemctl disable --now "$s" >/dev/null 2>&1
     rm -f "/etc/systemd/system/$s.service"
   done
@@ -3353,7 +3798,8 @@ uninstall_all() {
   [[ -x /usr/local/bin/vps-fw ]] && { /usr/local/bin/vps-fw udpclean "$PORT_UDP"; /usr/local/bin/vps-fw clear; }
   systemctl daemon-reload
   rm -rf /etc/udp-custom
-  rm -f /usr/local/bin/{vps-ws.py,vps-proxy.py,vps-probe,vps-fw,vps-sessions,vps-limiter,vps-cleanup,vps-rollback,badvpn-udpgw,dnstt-server,psiphond,wireguard-go}
+  rm -f /usr/local/bin/{vps-ws.py,vps-proxy.py,vps-probe,vps-fw,vps-sessions,vps-limiter,vps-cleanup,vps-rollback,vps-netopt,badvpn-udpgw,dnstt-server,psiphond,wireguard-go}
+  rm -f /etc/systemd/system/vps-netopt.service "$NETOPT_CONF" "$NETOPT_MODS" "$NETOPT_HASH"
   rm -f /etc/cron.d/vpspanel /etc/sysctl.d/99-vpspanel.conf /etc/sysctl.d/99-vpspanel-forward.conf
   rm -f /etc/ssh/sshd_config.d/00-vpspanel.conf /etc/ssh/sshd_config.d/01-vpspanel-root.conf
   rm -f /etc/letsencrypt/renewal-hooks/{pre,post,deploy}/vpspanel.sh
@@ -3397,7 +3843,7 @@ self_install() {
 #   por evento: antes de actualizar, restaurar o desinstalar, y a mano (COPIAS DE SEGURIDAD)
 # Restaurar UNE las cuentas (las de la copia + las actuales que no estan en ella): no borra ninguna.
 # Lo que nunca se copia ni se restaura (temporales, candados y marcas propias de este servidor):
-BK_SKIP='^(\.prep|\.helpers|[^/]*\.lock|fw\.(ports|nat)|.*\.tmp|(.*/)?\.tmp-.*)$'
+BK_SKIP='^(\.prep|\.helpers|\.netopt(\.base)?|netopt\.(orig|99)|[^/]*\.lock|fw\.(ports|nat)|.*\.tmp|(.*/)?\.tmp-.*)$'
 BK_DBS='^(users\.db|v2ray\.db|users\.exp|quick\.seq|test\.seq)$'   # se unen aparte al restaurar
 
 bk_files() { ls -1 "$BK_DIR"/vpspanel-*.tar.gz 2>/dev/null | LC_ALL=C sort -r; }   # la mas reciente primero
@@ -3409,7 +3855,7 @@ mf_get() {   # clave MANIFEST  ->  valor (solo caracteres seguros: la copia pued
 bk_fingerprint() {   # huella rapida (nombres, tamanos, fechas): si no cambio, no hace falta copiar
   {                    # sin candados ni temporales (el cron abre cleanup.lock cada minuto)
     find "$BASE" -type f ! -name '*.lock' ! -name '*.tmp' ! -name '.tmp-*' ! -name 'fw.ports' ! -name 'fw.nat' \
-      ! -name '.prep' ! -name '.helpers' -printf '%P %s %T@\n' 2>/dev/null
+      ! -name '.prep' ! -name '.helpers' ! -name '.netopt*' -printf '%P %s %T@\n' 2>/dev/null
     stat -c '%n %s %Y' "$OVPN_DIR/ca.crt" "$OVPN_DIR/server.key" "$WG_CONF" /etc/shadow 2>/dev/null
   } | LC_ALL=C sort | sha256sum | cut -d' ' -f1
 }
@@ -4225,6 +4671,7 @@ show_ports_plan() {
 
 install_all() {
   ensure_base || { err "Sin la preparacion del sistema no se puede instalar. Revisa el error de arriba."; return 1; }
+  netopt_update quiet                             # los servicios se crean ya con los limites optimizados
   local step n=0 total a
   local -a steps=("inst_dropbear:Dropbear" "inst_ssl:SSL (stunnel)" "inst_badvpn:BadVPN UDPGW"
                   "inst_ws:WebSocket" "inst_socks:SOCKS Python" "inst_wsepro:WS-ePro" "inst_squid:Squid"
@@ -4255,7 +4702,7 @@ install_all() {
     else bad+=("${step#*:}"); warn "Fallo ${step#*:}. Se continua con el resto."; fi
   done
   echo
-  cfg_bbr
+  if netopt_on; then ok "Optimizacion de red activa (UDP, TCP y BadVPN): PREPARACION DEL SISTEMA > 17"; fi
   echo
   if (( ${#bad[@]} == 0 )); then
     ok "Instalacion completa: $total de $total protocolos funcionando. Abre el panel con: $(panel_cmd)"
@@ -4731,7 +5178,7 @@ menu_system() {   # PREPARACION DEL SISTEMA: puertos activos, protocolos y confi
     cols "0:$(qcell 14 'CAMBIAR PUERTOS')"      "26:$(qcell 19 'LIMPIAR CACHE/LOGS')"
     cols "0:$(qcell 15 'RESTAURAR PUERTOS')"    "26:$(qcell 20 'CONFIGURAR IP DNS')"
     cols "0:$(qcell 16 'BANNER SSH')"           "26:$(qcell 21 'GEN DOMI/CERT-SSL' "$(mark test -s "$DOMAIN_F")")"
-    cols "0:$(qcell 17 'ACELERACION TCPBBR')"   "26:$(qcell 22 'CLAVE Y ACCESO ROOT')"
+    cols "0:$(qcell 17 'OPTIMIZAR RED' "$(mark netopt_on)")" "26:$(qcell 22 'CLAVE Y ACCESO ROOT')"
     cols "0:$(qcell 18 'MEMORIA SWAP' "$(mark swap_on)")" "26:$(qcell 23 'REINICIAR SERVICIOS')"
     line_eq
     item 24 "NOMBRE DEL VPS"  "$DBL"
@@ -4749,7 +5196,7 @@ menu_system() {   # PREPARACION DEL SISTEMA: puertos activos, protocolos y confi
       14) sub_header "CAMBIAR PUERTOS";        ports_wizard ;;
       15) sub_header "RESTAURAR PUERTOS";      ports_reset ;;
       16) sub_header "BANNER SSH";             cfg_banner; [[ $? == 3 ]] && continue ;;
-      17) sub_header "ACELERACION TCP BBR";    cfg_bbr ;;
+      17) menu_netopt; continue ;;
       18) sub_header "MEMORIA SWAP";           cfg_swap ;;
       19) sub_header "LIMPIAR CACHE Y LOGS";   cfg_cache ;;
       20) sub_header "CONFIGURAR DNS";         cfg_dns ;;
@@ -4944,7 +5391,7 @@ main() {
   banner_migrate
   helpers_update
   case "${1:-}" in
-    --install-all) data_recover; default_name; INSTALL_AUTO=1; install_all; exit 0 ;;
+    --install-all) data_recover; default_name; INSTALL_AUTO=1; netopt_update quiet; install_all; exit 0 ;;
     --restore)     [[ -n ${2:-} ]] || { usage; exit 1; }
                    if [[ -t 0 ]]; then bk_restore "$2"; else bk_restore "$2" si; fi
                    exit $? ;;
@@ -4962,6 +5409,7 @@ main() {
   if [[ ! -s $NAME_F ]]; then
     if [[ -t 0 && -t 1 ]]; then register_vps || exit 1; else default_name; fi
   fi
+  netopt_update                                   # optimizacion de red: primera vez o version nueva
   main_menu
 }
 
