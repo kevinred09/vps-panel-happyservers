@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ======================================================================
-#  VPS PANEL v3.2 - instalador y administrador de protocolos para tuneles
+#  VPS PANEL v3.3 - instalador y administrador de protocolos para tuneles
 #  Compatible con HTTP Custom y apps similares.
 #  SSH, Dropbear, SSL, WebSocket, SOCKS Python, WS-ePro, Squid, V2Ray,
 #  BadVPN-UDPGW, UDP Custom, SlowDNS, OpenVPN, WireGuard y Psiphon
@@ -15,6 +15,9 @@
 #  defecto ([30], [1]...) ENTER escribe ese valor en el campo para que quede a la vista.
 #  Atajo "1.1" en el menu principal: crea al instante user1, user2, user3... (contrasena xxxx,
 #  30 dias, 1 conexion) sin preguntar nada. La secuencia se guarda en /etc/vpspanel/quick.seq.
+#  Atajo "1.2": cuentas de prueba prueba1, prueba2, prueba3... (contrasena xxx, 3 conexiones) que
+#  duran 24 horas exactas desde que se crean (no hasta medianoche). La hora exacta de cada una
+#  queda en /etc/vpspanel/users.exp y la secuencia en /etc/vpspanel/test.seq.
 #  Usuarios SSH: la opcion 2 elimina varios a la vez (1,5,6,9) y la 8 elimina todos. En la 2,
 #  hasta 3 usuarios (DEL_NOWARN) se borran directo, sin advertencia; con mas de 3 sale la
 #  advertencia y se esperan 3 segundos (DEL_WAIT_SEL). En la 8 la espera es de 7 (DEL_WAIT).
@@ -29,6 +32,18 @@
 #  Registro de errores: todo lo que hacen los comandos queda en /var/log/vpspanel/<protocolo>.log
 #  y, si algo falla, el error real (salida del comando o journal del servicio) sale en pantalla.
 #
+#  Copias de seguridad (opcion 9): /var/backups/vpspanel, fuera de /etc/vpspanel. Actualizar,
+#  reinstalar o cambiar el script no las toca y desinstalar las conserva salvo que pidas borrarlas.
+#  Se crea una copia sola cada vez que cambian usuarios o configuracion (y una diaria), y otra antes
+#  de actualizar, restaurar o desinstalar. Si el panel se instala de nuevo sin datos, recupera solo
+#  los usuarios (con su contrasena, vencimiento y limite), los puertos, llaves y clientes.
+#  Actualizar (opcion 8): con el enlace RAW del instalador nuevo (https). Antes se guardan los
+#  datos y la version actual; si algo sale mal, "vps-rollback" vuelve a la version anterior.
+#    vpspanel --backup               crear una copia ahora
+#    vpspanel --restore ARCHIVO      restaurar una copia (tambien una traida de otro VPS)
+#    vpspanel --update [ENLACE]      actualizar el panel
+#    vps-rollback                    volver a la version anterior del panel
+#
 #  Interfaz: replica el panel de referencia (colores RGB exactos, lineas de 53
 #  columnas). Todo el aspecto visual esta en el bloque "Interfaz".
 #    VPSPANEL_COLOR=256 vpspanel       terminal sin colores de 24 bits (aproximado)
@@ -42,8 +57,8 @@ export VPSPANEL_ACTIVE=1
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}
 
 # ------------------------------ Configuracion -------------------------
-VERSION=3.2
-PREP_V=3           # version de la preparacion del sistema (se repite si cambia)
+VERSION=3.3
+PREP_V=3          # version de la preparacion del sistema (se repite si cambia)
 NAME_MAX=24        # largo maximo del nombre del VPS (se muestra en el titulo)
 DEF_PASS=xxxx      # contrasena por defecto de las cuentas SSH (ENTER en el campo la escribe sola)
 BASE=${VPSPANEL_BASE:-/etc/vpspanel}
@@ -64,6 +79,25 @@ QUICK_DAYS=30              # dias de validez
 QUICK_LIMIT=1              # conexiones simultaneas (igual que el valor por defecto de NUEVO USUARIO SSH)
 SEQ_F=$BASE/quick.seq      # ultimo numero usado: la secuencia sigue despues de cerrar o reiniciar
 QUICK_LOCK=$BASE/quick.lock  # candado: dos sesiones del panel no pueden tomar el mismo numero
+
+# Atajo "1.2" del menu principal: cuentas de prueba prueba1, prueba2, prueba3... sin preguntar nada
+TEST_PREFIX=prueba         # nombre base; el numero lo pone su propia secuencia
+TEST_PASS=xxx              # contrasena fija
+TEST_HOURS=24              # duracion exacta en horas (24 = 1 dia): vence a esa hora, no a medianoche
+TEST_LIMIT=3               # conexiones simultaneas
+TEST_SEQ_F=$BASE/test.seq  # ultimo numero usado de prueba1, prueba2... (no se reutilizan)
+PX_DB=$BASE/users.exp      # vencimiento exacto de las cuentas de prueba: usuario|segundos desde 1970
+DB_LOCK=$BASE/cleanup.lock # candado de las bases de cuentas (el mismo de vps-cleanup: nunca escriben a la vez)
+
+# Copias de seguridad y actualizaciones: fuera de $BASE, sobreviven a actualizar y reinstalar
+BK_DIR=${VPSPANEL_BKDIR:-/var/backups/vpspanel}
+BK_KEEP=30                 # copias automaticas que se conservan
+BK_KEEP_EV=15              # copias manuales y de antes de actualizar, restaurar o desinstalar
+BK_FORMAT=1                # formato de las copias (MANIFEST: format=1)
+SCRIPT_BK=$BK_DIR/scripts  # versiones anteriores del panel (vps-rollback)
+PANEL_BIN=${VPSPANEL_BIN:-/usr/local/bin/vpspanel}
+HELPERS_V=2                # version de vps-cleanup, vps-rollback y el cron: si cambia, se reinstalan solos
+UPDATE_URL=''              # enlace fijo del instalador para ACTUALIZAR PANEL (vacio: se pregunta y se recuerda)
 
 DEL_WAIT=7                 # segundos de espera con la advertencia antes de eliminar TODAS las cuentas (opcion 8)
 DEL_WAIT_SEL=3             # segundos de espera con la advertencia al eliminar varias cuentas (opcion 2)
@@ -168,7 +202,8 @@ PROTO_NAMES=("DROPBEAR" "SSL" "BADVPN" "WEBSOCKET" "SQUID"
 # Todo el aspecto visual esta en este bloque. Replica el panel de referencia:
 #   - lineas "=" y "-" rojas de 53 columnas; titulos en blanco (secciones en naranja)
 #   - menus con el formato "[1] > TEXTO" y estados [ON] verde / [OFF] rojo
-#   - botones con fondo de color (gris, rojo y azul) y titulo con degradado
+#   - botones con fondo de color (gris, rojo y azul)
+#   - titulo del panel (nombre del VPS) en blanco entre las lineas rojas, como cada pantalla
 # Colores: por defecto RGB de 24 bits (los mismos de la referencia). Si tu terminal no
 # los admite (PuTTY viejo, JuiceSSH, ConnectBot, Terminal de macOS):
 #     VPSPANEL_COLOR=256 vpspanel     colores aproximados de 256
@@ -181,7 +216,6 @@ ANCHO=53       # ancho de las lineas (igual que la referencia)
 FW=12          # ancho de las etiquetas de field() (algunas pantallas lo cambian)
 VL=0           # largo visible del ultimo texto medido con vlen()
 CMODE=24       # modo de color: 24 (RGB), 256 o 16
-GRADMAP=0000000011111111112222222223444   # degradado del titulo: 31 posiciones -> color 0..4
 MON=(Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec)
 
 c256() {   # r g b -> indice de la paleta xterm de 256 colores mas cercano
@@ -241,9 +275,7 @@ init_ui() {   # colores: solo si la salida es una terminal (VPSPANEL_COLOR=... l
     PNK=$(c_fg 210  84 154 '1;35')     # IP
     GRY=$(c_fg 141 145 165 '0;37')     # gris
     MAG=$PNK
-    G0=$(c_fg 255  95  95 '1;31'); G1=$(c_fg 255   0 135 '1;31'); G2=$(c_fg 255   0 175 '1;35')
-    G3=$(c_fg 215   0 175 '1;35'); G4=$(c_fg 215   0 215 '1;35')   # degradado del titulo
-    #                  texto (R G B)   fondo (R G B)   ansi16
+    #                texto (R G B)   fondo (R G B)   ansi16
     BTN_GRAY=$(c_bt 226 227 232  141 145 165 '30;47')     # boton gris   (SALIR DEL VPS)
     BTN_RED=$(c_bt  226 227 232  242  78  80 '1;37;41')   # boton rojo   (VOLVER, SALIR DEL SCRIPT)
     BTN_REDW=$(c_bt 255 255 255  242  78  80 '1;37;41')   # boton rojo con texto blanco (menus SSH)
@@ -251,7 +283,6 @@ init_ui() {   # colores: solo si la salida es una terminal (VPSPANEL_COLOR=... l
     HL_GRY=$(c_bt   255 255 255  141 145 165 '1;30;47')   # resaltado gris (PREPARACION DEL SISTEMA)
   else
     RST=''; RED=''; GRN=''; BLU=''; DBL=''; WHT=''; YEL=''; LYE=''; PNK=''; GRY=''; MAG=''
-    G0=''; G1=''; G2=''; G3=''; G4=''
     BTN_GRAY=''; BTN_RED=''; BTN_REDW=''; BTN_BLUE=''; HL_GRY=''
   fi
   MK_ON=$'\xe2\x97\x89'; MK_OFF=$'\xe2\x97\x8b'   # marcas de estado: activo / inactivo
@@ -272,18 +303,8 @@ center() {   # texto [color]  ->  texto centrado en la linea
   printf '%*s%s%s%s\n' "$pad" '' "${2:-$WHT}" "$1" "$RST"
 }
 
-center_grad() {   # texto  ->  centrado, con el degradado de color por caracter del titulo
-  local t=$1 n=${#1} i j out='' pad
-  local -a G=("$G0" "$G1" "$G2" "$G3" "$G4")
-  pad=$(( (ANCHO - n) / 2 )); (( pad < 0 )) && pad=0
-  for (( i = 0; i < n; i++ )); do
-    j=$(( i * 31 / n ))
-    out+="${G[${GRADMAP:j:1}]}${t:i:1}"
-  done
-  printf '%*s%s%s\n' "$pad" '' "$out" "$RST"
-}
-
 title()      { line_eq; center "$1" "${2:-$WHT}"; line_eq; }   # barra, titulo, barra
+brand()      { title "${1^^}" "$WHT"; }                       # titulo del panel: nombre del VPS en blanco
 sub_header() { cls; title "$1" "${2:-}"; }                     # pantalla nueva con titulo
 
 section() {   # texto  ->  ============ TEXTO ============
@@ -347,7 +368,7 @@ pause() {
   read -r _
 }
 
-rd() { local p=$1; shift; read -rp " ${WHT}${p}${RST}" "$@"; }   # pregunta: rd "TEXTO: " variable
+rd() { local p=$1; shift; read -rp " ${WHT}${p}${RST}" "$@"; }   # pregunta: rd "TEXTO: " variable (nunca "p")
 
 rd_def() {   # texto variable defecto  ->  pregunta; ENTER en el campo vacio escribe el valor por defecto
   local t=$1 v
@@ -394,8 +415,11 @@ spin() {   # mensaje comando [args...]  ->  ejecuta el comando mostrando "Mensaj
 init_fs() {
   mkdir -p "$BASE" "$LOG_DIR"
   chmod 700 "$LOG_DIR" 2>/dev/null
-  touch "$USERDB" "$V2DB"
-  chmod 600 "$USERDB" "$V2DB"
+  touch "$USERDB" "$V2DB" "$PX_DB"
+  chmod 600 "$USERDB" "$V2DB" "$PX_DB"
+  # restos de escrituras cortadas (un corte nunca deja la base a medias: se escribe en .tmp-*)
+  find "$BASE" -maxdepth 2 -name '.tmp-*' -mmin +10 -delete 2>/dev/null
+  return 0
 }
 
 init_env() {
@@ -759,10 +783,63 @@ mkunit() { # nombre descripcion exec [directivas extra de [Service]] [directivas
   svc_restart "$name"
 }
 
+# ---- Bases de cuentas (users.db, v2ray.db, users.exp): escritura segura --------------
+# Siempre con el candado de vps-cleanup (el panel y el cron nunca escriben a la vez) y en un
+# archivo temporal que reemplaza al original de una sola vez: un corte (SSH caido, reinicio,
+# disco lleno) nunca deja la base vacia ni a medias.
+db_locked() {   # comando [args]  ->  lo ejecuta con el candado de las bases (en un subshell)
+  ( flock -w 30 8 || { err "Cuentas ocupadas por otra operacion. Reintenta."; exit 1; }
+    "$@" ) 8>"$DB_LOCK"
+}
+
+_db_filter() {   # archivo comando [args]  ->  el archivo pasa a ser la salida del comando (que lo lee)
+  local f=$1 t; shift
+  [[ -e $f ]] || install -m 600 /dev/null "$f" || return 1
+  t=$(mktemp "${f%/*}/.tmp-XXXXXX") || return 1
+  if "$@" < "$f" > "$t"; then
+    chmod 600 "$t"
+    sync "$t" 2>/dev/null
+    mv -f "$t" "$f" && return 0
+  fi
+  rm -f "$t"
+  return 1
+}
+db_filter() { db_locked _db_filter "$@"; }
+
+_db_append() { printf '%s\n' "$2" >> "$1"; }
+db_add() { db_locked _db_append "$1" "$2"; }   # archivo linea
+
 db_set() { # usuario campo valor  (users.db)
-  local t; t=$(mktemp)
-  U="$1" F="$2" V="$3" awk -F'|' -v OFS='|' '$1==ENVIRON["U"]{$(ENVIRON["F"]+0)=ENVIRON["V"]}1' "$USERDB" > "$t"
-  cat "$t" > "$USERDB"; rm -f "$t"
+  db_filter "$USERDB" env U="$1" F="$2" V="$3" awk -F'|' -v OFS='|' '$1==ENVIRON["U"]{$(ENVIRON["F"]+0)=ENVIRON["V"]}1'
+}
+
+px_out() {   # usuario [segundos]  ->  filtro de users.exp: quita al usuario y, con segundos, lo vuelve a poner
+  awk -F'|' -v u="$1" '$1 != u'
+  [[ -n ${2:-} ]] && printf '%s|%s\n' "$1" "$2"
+  return 0
+}
+px_set() { db_filter "$PX_DB" px_out "$1" "$2"; }                                   # usuario segundos
+px_del() { grep -q "^$1|" "$PX_DB" 2>/dev/null || return 0; db_filter "$PX_DB" px_out "$1"; }   # usuario
+
+# Cuentas que el panel puede borrar o modificar: UID normal (1000-59999). Nunca root, nobody ni
+# cuentas del sistema, aunque aparezcan en users.db (por ejemplo en una copia ajena).
+panel_uid() { local i; i=$(id -u "$1" 2>/dev/null) || return 1; (( i >= 1000 && i < 60000 )); }
+panel_acct() {   # usuario -> 0 si existe y es del estilo del panel (UID normal y sin shell)
+  panel_uid "$1" || return 1
+  [[ $(getent passwd "$1" | cut -d: -f7) =~ ^(/bin/false|/usr/bin/false|/usr/sbin/nologin|/sbin/nologin|/bin/nologin)$ ]]
+}
+
+acct_make() {   # usuario clave fecha [hash]  ->  crea la cuenta del sistema (o ajusta la existente)
+  local u=$1 p=$2 e=$3 h=${4:-}
+  if id "$u" >/dev/null 2>&1; then
+    panel_acct "$u" || return 2                                   # existe y no es del panel: no se toca
+    usermod -e "$e" "$u" >/dev/null 2>&1
+  else
+    useradd -M -s /bin/false -e "$e" "$u" 2>/dev/null || return 1
+  fi
+  # con el hash guardado la contrasena queda identica (aunque se haya cambiado fuera del panel)
+  if [[ -n $h ]] && printf '%s:%s\n' "$u" "$h" | chpasswd -e 2>/dev/null; then return 0; fi
+  printf '%s:%s\n' "$u" "$p" | chpasswd 2>/dev/null
 }
 
 # ------------------------------ Herramientas internas -----------------
@@ -1538,33 +1615,56 @@ EOF
   cat > /usr/local/bin/vps-cleanup <<'EOF'
 #!/bin/bash
 # Elimina cuentas SSH y V2Ray vencidas. Una cuenta vence a las 00:00 UTC de su fecha (igual que
-# en la tabla de cuentas del panel, donde ya sale en rojo).
+# en la tabla de cuentas del panel, donde ya sale en rojo). Las cuentas de prueba vencen a la hora
+# exacta de users.exp (usuario|segundos): en ese momento pasan a ser cuentas vencidas normales.
 #   vps-cleanup          a mano (ELIMINAR USUARIOS VENCIDOS)
-#   vps-cleanup --auto   cada minuto desde cron, salvo que este desactivado (/etc/vpspanel/autodel.off)
+#   vps-cleanup --auto   cada minuto desde cron. Con la eliminacion automatica desactivada
+#                        (/etc/vpspanel/autodel.off) las vencidas quedan bloqueadas, sin borrarse.
+# Nunca toca root ni cuentas del sistema (UID fuera de 1000-59999), aunque esten en users.db.
 BASE=/etc/vpspanel
 DB=$BASE/users.db
+PX=$BASE/users.exp
 V2DB=$BASE/v2ray.db
 V2CFG=/usr/local/etc/v2ray/config.json
-if [[ ${1:-} == --auto ]]; then
-  [[ -f $BASE/autodel.off ]] && exit 0
-  exec 9>"$BASE/cleanup.lock"; flock -n 9 || exit 0
-else
-  exec 9>"$BASE/cleanup.lock"; flock -w 30 9
-fi
+exec 9>"$BASE/cleanup.lock"
+if [[ ${1:-} == --auto ]]; then flock -n 9 || exit 0; else flock -w 30 9; fi
 today=$(date -u +%F)
+now=$(date +%s)
 vencida() { [[ $1 =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ && ! $1 > $today ]]; }   # fecha <= hoy (UTC)
+normal() { local i; i=$(id -u "$1" 2>/dev/null) || return 0; (( i >= 1000 && i < 60000 )); }   # no existe o UID normal
+rewrite() {   # archivo comando [args]  ->  reemplazo atomico: la base nunca queda a medias
+  local f=$1 t; shift
+  t=$(mktemp "$BASE/.tmp-XXXXXX") || return 1
+  if "$@" < "$f" > "$t"; then chmod 600 "$t"; mv -f "$t" "$f" && return 0; fi
+  rm -f "$t"; return 1
+}
+# Cuentas de prueba que llegaron a su hora: fecha = hoy (vencida) y el sistema las bloquea
+if [[ -s $PX ]]; then
+  while IFS='|' read -r u t; do
+    [[ $u =~ ^[a-z_][a-z0-9_-]*$ && $t =~ ^[0-9]+$ ]] && (( t <= now )) || continue
+    if grep -q "^${u}|" "$DB" 2>/dev/null; then
+      rewrite "$DB" awk -F'|' -v OFS='|' -v u="$u" -v d="$today" '$1 == u {$3 = d} 1'
+      normal "$u" && usermod -e "$today" "$u" >/dev/null 2>&1
+      logger -t vpspanel "cuenta de prueba vencida: $u"
+    fi
+    rewrite "$PX" awk -F'|' -v u="$u" '$1 != u'
+  done < "$PX"
+fi
+[[ ${1:-} == --auto && -f $BASE/autodel.off ]] && exit 0
 if [[ -s $DB ]]; then
   S=''
   while IFS='|' read -r u p e l; do
     [[ $u =~ ^[a-z_][a-z0-9_-]*$ ]] && vencida "$e" || continue
-    usermod -L "$u" 2>/dev/null                              # nadie mas entra con esa cuenta
+    if ! normal "$u"; then logger -t vpspanel "no se elimina $u: es una cuenta del sistema"; continue; fi
+    usermod -L "$u" >/dev/null 2>&1                           # nadie mas entra con esa cuenta
     [[ -n $S ]] || S=$(/usr/local/bin/vps-sessions 2>/dev/null)
     pids=$(awk -v u="$u" '$1==u {print $2}' <<< "$S")        # SSH y Dropbear (Dropbear corre como root)
     [[ -n $pids ]] && kill -9 $pids 2>/dev/null
     pkill -KILL -u "$u" 2>/dev/null
     userdel -f "$u" 2>/dev/null
     if ! id "$u" >/dev/null 2>&1; then                       # si no se pudo, se reintenta al minuto
-      sed -i "/^${u}|/d" "$DB"
+      rewrite "$DB" awk -F'|' -v u="$u" '$1 != u'
+      [[ -s $PX ]] && rewrite "$PX" awk -F'|' -v u="$u" '$1 != u'
       logger -t vpspanel "cuenta SSH vencida eliminada: $u (vencia $e)"
     fi
   done < "$DB"
@@ -1575,8 +1675,8 @@ if [[ -s $V2DB && -f $V2CFG ]]; then
     [[ $n =~ ^[a-z_][a-z0-9_-]*$ ]] && vencida "$e" || continue
     t=$(mktemp)
     if jq --arg em "$n" '.inbounds[0].settings.clients |= map(select(.email != $em))' "$V2CFG" > "$t"; then
-      cat "$t" > "$V2CFG"
-      sed -i "/^${n}|/d" "$V2DB"
+      cat "$t" > "$V2CFG"                                    # cat: conserva permisos (V2Ray corre como nobody)
+      rewrite "$V2DB" awk -F'|' -v n="$n" '$1 != n'
       logger -t vpspanel "cuenta V2Ray vencida eliminada: $n (vencia $e)"
       changed=1
     fi
@@ -1593,11 +1693,55 @@ SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 * * * * * root /usr/local/bin/vps-limiter >/dev/null 2>&1
 * * * * * root /usr/local/bin/vps-cleanup --auto >/dev/null 2>&1
+41 3 * * * root [ -x /usr/local/bin/vpspanel ] && /usr/local/bin/vpspanel --backup auto >/dev/null 2>&1
 EOF
   chmod 644 /etc/cron.d/vpspanel
   systemctl enable --now cron >/dev/null 2>&1
   install_tools
   install_firewall
+  install_rollback
+  echo "$HELPERS_V" > "$BASE/.helpers"
+}
+
+install_rollback() {   # vps-rollback: vuelve a la version anterior del panel (sirve aunque la nueva falle)
+  cat > /usr/local/bin/vps-rollback <<'EOF'
+#!/bin/bash
+# vps-rollback: vuelve a una version anterior de VPS PANEL. Antes de cada actualizacion el panel
+# guarda la version instalada en /var/backups/vpspanel/scripts. Usuarios y configuracion no cambian.
+#   vps-rollback          instala la version guardada mas reciente que sea distinta de la actual
+#   vps-rollback --list   muestra las versiones guardadas
+D=/var/backups/vpspanel/scripts
+T=/usr/local/bin/vpspanel
+[[ $EUID -eq 0 ]] || { echo " Ejecuta como root."; exit 1; }
+ver() { sed -n 's/^VERSION=\([0-9][0-9.]*\).*/\1/p' "$1" 2>/dev/null | head -1; }
+mapfile -t L < <(ls -1t "$D"/vpspanel-*.sh 2>/dev/null)
+if [[ ${1:-} == --list ]]; then
+  (( ${#L[@]} )) || { echo " No hay versiones anteriores guardadas."; exit 0; }
+  for f in "${L[@]}"; do
+    m=''; cmp -s "$f" "$T" && m='  (la instalada)'
+    printf ' %s  version %-6s %s%s\n' "$(date -r "$f" '+%d/%m/%Y %H:%M')" "$(ver "$f")" "${f##*/}" "$m"
+  done
+  exit 0
+fi
+for f in "${L[@]}"; do
+  cmp -s "$f" "$T" && continue
+  bash -n "$f" 2>/dev/null || continue                      # una copia danada no se instala
+  if [[ -s $T ]]; then                                       # la actual tambien se guarda (para volver a ella)
+    v=$(ver "$T"); c=$D/vpspanel-${v:-x}-$(sha256sum "$T" | cut -c1-12).sh
+    if [[ -f $c ]]; then touch "$c"; else cp "$T" "$c.tmp" && chmod 600 "$c.tmp" && mv -f "$c.tmp" "$c"; fi
+  fi
+  if install -m 755 "$f" "$T.rollback" && mv -f "$T.rollback" "$T"; then
+    touch "$f"
+    echo " Panel restaurado a la version $(ver "$f") (${f##*/})."
+    echo " Usuarios y configuracion no cambian. Abre el panel con: vpspanel"
+    exit 0
+  fi
+  rm -f "$T.rollback"; echo " No se pudo instalar ${f##*/}"; exit 1
+done
+echo " No hay una version anterior guardada."
+exit 1
+EOF
+  chmod 755 /usr/local/bin/vps-rollback
 }
 
 # Eliminacion automatica de cuentas vencidas: activada por defecto (se apaga con autodel.off)
@@ -1615,9 +1759,9 @@ toggle_autodel() {
   fi
 }
 
-helpers_update() {   # instalaciones anteriores: deja vps-cleanup y el cron al dia
+helpers_update() {   # instalaciones anteriores o actualizadas: vps-cleanup, vps-rollback y el cron al dia
   [[ -f $BASE/.prep ]] || return 0
-  grep -q -- 'vps-cleanup --auto' /etc/cron.d/vpspanel 2>/dev/null && return 0
+  [[ $(cat "$BASE/.helpers" 2>/dev/null) == "$HELPERS_V" ]] && return 0
   install_helpers >/dev/null 2>&1
   return 0
 }
@@ -2480,50 +2624,85 @@ ssh_create() {
   exp=$(date -d "+$d days" +%F)
   useradd -M -s /bin/false -e "$exp" "$u" || { err "No se pudo crear el usuario"; return 1; }
   echo "$u:$p" | chpasswd
-  echo "$u|$p|$exp|$l" >> "$USERDB"
+  px_del "$u"                                     # una cuenta normal no tiene hora exacta de vencimiento
+  if ! db_add "$USERDB" "$u|$p|$exp|$l"; then
+    userdel -f "$u" 2>/dev/null
+    err "No se pudo guardar $u en la base del panel; no se creo."; return 1
+  fi
   show_ssh_info "$u" "$p" "$exp" "$l"
 }
 
-# Atajo "1.1": crea al instante la siguiente cuenta de la secuencia user1, user2, user3...
-# El ultimo numero usado queda en $SEQ_F, asi la secuencia sigue igual despues de cerrar el
-# panel o reiniciar el VPS, y un numero no se reutiliza aunque su cuenta se borre o venza
-# (vps-cleanup borra las vencidas, por eso el numero no se calcula mirando users.db).
+# Atajos "1.1" (user1, user2...) y "1.2" (prueba1, prueba2...): crean al instante la siguiente
+# cuenta de su secuencia. El ultimo numero usado queda en su archivo .seq, asi la secuencia sigue
+# igual despues de cerrar el panel o reiniciar el VPS, y un numero no se reutiliza aunque su cuenta
+# se borre o venza (vps-cleanup borra las vencidas, por eso el numero no se calcula mirando
+# users.db): nadie entra con una cuenta de prueba vieja que se volvio a crear con su mismo nombre.
 # Si el nombre ya existe (por ejemplo un user5 creado a mano) se salta al siguiente libre:
 # nunca se duplica una cuenta. Solo se avanza el contador cuando la cuenta quedo creada.
-quick_make() {   # se llama con el candado tomado; imprime "usuario|fecha_de_vencimiento"
-  local last=0 n u exp
-  [[ -s $SEQ_F ]] && read -r last < "$SEQ_F"
+seq_make() {   # prefijo clave limite archivo.seq fecha [hasta]  (con el candado tomado; imprime el usuario)
+  local pre=$1 pass=$2 lim=$3 sf=$4 exp=$5 until=${6:-} last=0 n u
+  [[ -s $sf ]] && read -r last < "$sf"
   [[ $last =~ ^[0-9]+$ ]] || last=0
   n=$(( 10#$last + 1 ))
   while :; do
-    u=$QUICK_PREFIX$n
+    u=$pre$n
     grep -q "^${u}|" "$USERDB" || id "$u" >/dev/null 2>&1 || break
     n=$(( n + 1 ))
   done
-  exp=$(date -d "+$QUICK_DAYS days" +%F)
   useradd -M -s /bin/false -e "$exp" "$u" || { err "No se pudo crear el usuario $u"; return 1; }
-  if ! echo "$u:$QUICK_PASS" | chpasswd; then
+  if ! echo "$u:$pass" | chpasswd; then
     userdel -f "$u" 2>/dev/null
     err "No se pudo asignar la contrasena de $u"; return 1
   fi
-  echo "$u|$QUICK_PASS|$exp|$QUICK_LIMIT" >> "$USERDB"
-  if printf '%s\n' "$n" > "$SEQ_F.tmp"; then    # escritura atomica: el contador nunca queda a medias
-    sync "$SEQ_F.tmp" 2>/dev/null
-    mv -f "$SEQ_F.tmp" "$SEQ_F"
+  # la hora exacta va antes que la cuenta: vps-cleanup nunca ve una cuenta de prueba sin ella
+  if [[ -n $until ]]; then px_set "$u" "$until"; else px_del "$u"; fi ||
+    { userdel -f "$u" 2>/dev/null; err "No se pudo guardar el vencimiento de $u; no se creo."; return 1; }
+  if ! db_add "$USERDB" "$u|$pass|$exp|$lim"; then
+    userdel -f "$u" 2>/dev/null; px_del "$u"
+    err "No se pudo guardar $u en la base del panel; no se creo."; return 1
   fi
-  printf '%s|%s\n' "$u" "$exp"
+  if printf '%s\n' "$n" > "$sf.tmp"; then       # escritura atomica: el contador nunca queda a medias
+    sync "$sf.tmp" 2>/dev/null
+    mv -f "$sf.tmp" "$sf"
+  fi
+  printf '%s\n' "$u"
 }
 
-quick_user() {
-  local out rc u exp
+seq_user() {   # prefijo clave limite archivo.seq fecha [hasta]  ->  crea la cuenta; deja el nombre en SEQ_U
+  local out rc
+  SEQ_U=''
   ensure_base
   out=$( { flock -w 10 9 || { err "Otra sesion del panel esta creando un usuario. Intenta de nuevo"; exit 2; }
-           quick_make; } 9>"$QUICK_LOCK" )
+           seq_make "$@"; } 9>"$QUICK_LOCK" )
   rc=$?
   out=${out##*$'\n'}
-  (( rc == 0 )) && [[ $out == *"|"* ]] || return 1
-  IFS='|' read -r u exp <<< "$out"
-  show_ssh_info "$u" "$QUICK_PASS" "$exp" "$QUICK_LIMIT"
+  (( rc == 0 )) && [[ $out =~ ^[a-z_][a-z0-9_-]*$ ]] || return 1
+  SEQ_U=$out
+}
+
+quick_user() {   # 1.1: user1, user2... (QUICK_PASS, QUICK_DAYS dias, QUICK_LIMIT conexiones)
+  local exp
+  exp=$(date -d "+$QUICK_DAYS days" +%F)
+  seq_user "$QUICK_PREFIX" "$QUICK_PASS" "$QUICK_LIMIT" "$SEQ_F" "$exp" || return 1
+  show_ssh_info "$SEQ_U" "$QUICK_PASS" "$exp" "$QUICK_LIMIT"
+}
+
+dur_txt() {   # horas -> "1 dia", "2 dias", "12 horas"
+  local h=$1
+  if (( h % 24 == 0 )); then (( h == 24 )) && echo "1 dia" || echo "$(( h / 24 )) dias"
+  else echo "$h horas"; fi
+}
+
+# 1.2: prueba1, prueba2... (TEST_PASS, TEST_LIMIT conexiones) que vencen TEST_HOURS horas despues de
+# crearlas, a la hora exacta. users.db lleva como fecha el dia siguiente a esa hora (asi ni la fecha
+# ni el sistema la cortan antes) y vps-cleanup la vence a la hora exacta guardada en users.exp.
+test_user() {
+  local until exp
+  until=$(( $(date +%s) + TEST_HOURS * 3600 ))
+  exp=$(date -u -d "@$(( until + 86400 ))" +%F)
+  seq_user "$TEST_PREFIX" "$TEST_PASS" "$TEST_LIMIT" "$TEST_SEQ_F" "$exp" "$until" || return 1
+  show_ssh_info "$SEQ_U" "$TEST_PASS" "$exp" "$TEST_LIMIT" \
+    "$(date -d "@$until" '+%d/%m/%Y %H:%M') ($(dur_txt "$TEST_HOURS"))" "USUARIO DE PRUEBA CREADO!"
 }
 
 # Dias que faltan para una fecha AAAA-MM-DD: desde ahora hasta las 00:00 UTC de esa fecha
@@ -2547,8 +2726,8 @@ fdate() {   # AAAA-MM-DD -> FD="May10/27" (mes en ingles, como la referencia)
 # bloquear, LOK = bloqueada). Deja los nombres en ACCT[].
 # El archivo puede ser users.db (SSH: con clave y limite) o v2ray.db (V2Ray).
 acct_table() {   # archivo
-  local db=$1 kind=v2 n p e l d c now sta num
-  local -A LK=()
+  local db=$1 kind=v2 n p e l d c now sta num t r
+  local -A LK=() PXT=()
   [[ $db == "$USERDB" ]] && kind=ssh
   ACCT=()
   now=$(date +%s)
@@ -2556,6 +2735,9 @@ acct_table() {   # archivo
   if [[ $kind == ssh ]]; then
     if [[ -r /etc/shadow ]]; then
       while IFS=: read -r n p _; do [[ $p == '!'* ]] && LK[$n]=1; done < /etc/shadow
+    fi
+    if [[ -s $PX_DB ]]; then        # cuentas de prueba: vencen a una hora exacta (columna Dia en horas)
+      while IFS='|' read -r n t; do [[ -n $n && $t =~ ^[0-9]+$ ]] && PXT[$n]=$t; done < "$PX_DB"
     fi
     printf '%s  %s %-14s%-14s%-9s%-4s%-4s%s%s\n' "$LYE" "$num" Usuario Contrasena Fecha Dia Lim Sta "$RST"
   else
@@ -2565,8 +2747,14 @@ acct_table() {   # archivo
   while IFS='|' read -r n p e l; do
     [[ -n $n ]] || continue
     ACCT+=("$n")
-    d=$(days_left "$e" "$now"); fdate "$e"
-    if (( d < 0 )); then c=$RED; else c=$GRN; fi
+    if [[ -n ${PXT[$n]:-} ]]; then   # prueba: fecha de su hora de vencimiento y horas que faltan (24h, 5h...)
+      r=$(( PXT[$n] - now ))
+      fdate "$(date -d "@${PXT[$n]}" +%F)"
+      if (( r > 0 )); then d="$(( (r + 3599) / 3600 ))h"; c=$GRN; else d=0; c=$RED; fi
+    else
+      d=$(days_left "$e" "$now"); fdate "$e"
+      if (( d < 0 )); then c=$RED; else c=$GRN; fi
+    fi
     if [[ $kind == ssh ]]; then
       if [[ -n ${LK[$n]:-} ]]; then sta="${RED}LOK"; else sta="${GRN}ULK"; fi
       printf '%s%3d)%s-%s%-14.14s%-14.14s%s%-9s%s%-4s%s%-4s%s%s\n' \
@@ -2668,20 +2856,24 @@ ssh_confirm_delete() {   # all|sel  nombres...
 # Una cuenta solo sale de users.db si de verdad dejo de existir en el sistema; si no se pudo
 # borrar, queda en la lista para poder reintentarlo.
 ssh_remove() {   # nombres...
-  local u t list
+  local u list
   local -a gone=() failed=()
   (( $# > 20 )) && info "Eliminando $# cuentas..."
   for u in "$@"; do
     valid_name "$u" || { failed+=("$u"); continue; }
+    if id "$u" >/dev/null 2>&1 && ! panel_uid "$u"; then      # root o cuenta del sistema: nunca se borra
+      warn "$u es del sistema: solo se quita de la lista."
+      gone+=("$u"); continue
+    fi
     pkill -KILL -u "$u" 2>/dev/null
     userdel -f "$u" 2>/dev/null
     if id "$u" >/dev/null 2>&1; then failed+=("$u"); else gone+=("$u"); fi
   done
   if (( ${#gone[@]} )); then
-    t=$(mktemp)
     list=$(IFS='|'; printf '%s' "${gone[*]}")
-    awk -F'|' -v list="|$list|" 'index(list, "|" $1 "|") == 0' "$USERDB" > "$t" && cat "$t" > "$USERDB"
-    rm -f "$t"
+    db_filter "$USERDB" awk -F'|' -v list="|$list|" 'index(list, "|" $1 "|") == 0' \
+      || err "No se pudo actualizar la lista del panel."
+    [[ -s $PX_DB ]] && db_filter "$PX_DB" awk -F'|' -v list="|$list|" 'index(list, "|" $1 "|") == 0'
   fi
   if (( ${#gone[@]} == 1 )); then ok "Usuario ${gone[0]} eliminado"
   elif (( ${#gone[@]} > 1 )); then ok "${#gone[@]} usuarios eliminados"; fi
@@ -2744,7 +2936,8 @@ ssh_renew() {
   rd_def "DIAS DESDE HOY PARA $u [30]:" d 30 || return 3
   [[ $d =~ ^[0-9]+$ ]] || { err "Dias invalidos"; return 1; }
   exp=$(date -d "+$d days" +%F)
-  usermod -e "$exp" "$u" && db_set "$u" 3 "$exp" && ok "$u vence el $exp"
+  # al renovar, una cuenta de prueba pasa a ser normal (vence por fecha, ya no a una hora exacta)
+  usermod -e "$exp" "$u" && db_set "$u" 3 "$exp" && px_del "$u" && ok "$u vence el $exp"
 }
 
 ssh_passwd() {
@@ -2782,22 +2975,21 @@ v2_delete() {
   rd "ELIMINAR LA CUENTA $n? (s/N): " c
   [[ $c == [sS]* ]] || return 3
   v2_edit --arg em "$n" '.inbounds[0].settings.clients |= map(select(.email != $em))' || return 1
-  sed -i "/^${n}|/d" "$V2DB"
+  db_filter "$V2DB" awk -F'|' -v n="$n" '$1 != n' || { err "No se pudo actualizar v2ray.db"; return 1; }
   systemctl restart v2ray
   ok "Cuenta $n eliminada"
 }
 
 v2_renew() {
-  local n d exp t
+  local n d exp
   pick_account "$V2DB" || return $?
   n=$PICK
   valid_name "$n" && grep -q "^${n}|" "$V2DB" || { err "Cuenta no encontrada"; return 1; }
   rd_def "DIAS DESDE HOY PARA $n [30]:" d 30 || return 1
   [[ $d =~ ^[0-9]+$ ]] || { err "Dias invalidos"; return 1; }
   exp=$(date -d "+$d days" +%F)
-  t=$(mktemp)
-  U="$n" V="$exp" awk -F'|' -v OFS='|' '$1==ENVIRON["U"]{$3=ENVIRON["V"]}1' "$V2DB" > "$t"
-  cat "$t" > "$V2DB"; rm -f "$t"
+  db_filter "$V2DB" env U="$n" V="$exp" awk -F'|' -v OFS='|' '$1==ENVIRON["U"]{$3=ENVIRON["V"]}1' \
+    || { err "No se pudo actualizar v2ray.db"; return 1; }
   ok "$n vence el $exp"
 }
 
@@ -3126,13 +3318,22 @@ show_access() {   # pantalla posterior al primer registro
 
 # ------------------------------ Desinstalar ---------------------------
 uninstall_all() {
-  local c s u p
+  local c='' s u p keep=''
   warn "Se eliminaran el panel y sus servicios."
   warn "Tambien se borraran las cuentas SSH."
   rd "ESCRIBE SI PARA CONTINUAR: " c
   [[ $c == SI ]] || return 0
+  # copia final: si se conservan las copias, al instalar el panel otra vez los usuarios vuelven solos
+  if bk_snap antes-de-desinstalar; then [[ -n $BK_LAST ]] && ok "Copia de seguridad final: $BK_LAST"
+  else warn "No se pudo crear la copia final (quedan las anteriores)."; fi
+  echo
+  info "Con las copias, al instalar de nuevo el panel"
+  info "vuelven solos los usuarios y la configuracion."
+  rd "CONSERVAR LAS COPIAS DE SEGURIDAD? (S/n): " keep
+  NO_AUTOBK=1                                    # desde aqui no se crean mas copias automaticas
   while IFS='|' read -r u p _; do
     [[ -n $u ]] || continue
+    if id "$u" >/dev/null 2>&1 && ! panel_uid "$u"; then continue; fi   # nunca root ni cuentas del sistema
     pkill -KILL -u "$u" 2>/dev/null; userdel -f "$u" 2>/dev/null
   done < "$USERDB"
   for s in vps-dropbear vps-stunnel vps-sslws vps-badvpn vps-ws vps-socks vps-wsepro vps-slowdns \
@@ -3152,26 +3353,699 @@ uninstall_all() {
   [[ -x /usr/local/bin/vps-fw ]] && { /usr/local/bin/vps-fw udpclean "$PORT_UDP"; /usr/local/bin/vps-fw clear; }
   systemctl daemon-reload
   rm -rf /etc/udp-custom
-  rm -f /usr/local/bin/{vps-ws.py,vps-proxy.py,vps-probe,vps-fw,vps-sessions,vps-limiter,vps-cleanup,badvpn-udpgw,dnstt-server,psiphond,wireguard-go}
+  rm -f /usr/local/bin/{vps-ws.py,vps-proxy.py,vps-probe,vps-fw,vps-sessions,vps-limiter,vps-cleanup,vps-rollback,badvpn-udpgw,dnstt-server,psiphond,wireguard-go}
   rm -f /etc/cron.d/vpspanel /etc/sysctl.d/99-vpspanel.conf /etc/sysctl.d/99-vpspanel-forward.conf
   rm -f /etc/ssh/sshd_config.d/00-vpspanel.conf /etc/ssh/sshd_config.d/01-vpspanel-root.conf
   rm -f /etc/letsencrypt/renewal-hooks/{pre,post,deploy}/vpspanel.sh
   systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null
   autostart_on && sed -i '/vpspanel-autostart/d' /root/.bashrc
   rm -rf "$BASE" "$LOG_DIR"
-  rm -f /usr/local/bin/vpspanel
+  rm -f "$PANEL_BIN"
+  if [[ $keep == [nN]* ]]; then
+    rm -rf "$BK_DIR"
+    ok "Copias de seguridad borradas."
+  else
+    ok "Copias de seguridad conservadas en $BK_DIR"
+    info "Al instalar el panel otra vez, todo se recupera solo."
+  fi
   ok "Panel desinstalado (squid y v2ray quedan instalados pero detenidos)."
   exit 0
 }
 
 
+# Instala este archivo como "vpspanel". Si habia otra version instalada (actualizacion a mano con
+# el instalador nuevo), antes guarda esa version (vps-rollback) y una copia de los datos.
 self_install() {
   local me; me=$(readlink -f "$0" 2>/dev/null)
-  if [[ -f $me && $me != /usr/local/bin/vpspanel ]]; then
-    install -m755 "$me" /usr/local/bin/vpspanel
+  [[ -f $me && $me != "$PANEL_BIN" ]] || return 0
+  cmp -s "$me" "$PANEL_BIN" 2>/dev/null && return 0
+  if [[ -s $PANEL_BIN ]]; then
+    script_save "$PANEL_BIN" && install_rollback 2>/dev/null
+    bk_snap antes-de-actualizar >/dev/null 2>&1
+  fi
+  install -m 755 "$me" "$PANEL_BIN.new" && mv -f "$PANEL_BIN.new" "$PANEL_BIN"
+}
+
+
+# ------------------------------ Copias de seguridad -------------------
+# Todo lo necesario para recuperar el panel se guarda en $BK_DIR, fuera de $BASE: usuarios con su
+# contrasena (texto y hash del sistema), vencimiento y limite; cuentas V2Ray y de prueba; puertos,
+# nombre, banner, dominio y certificado; llaves de SlowDNS y Psiphon; CA y llaves de OpenVPN;
+# WireGuard con sus clientes. Cada copia es un .tar.gz autocontenido con un MANIFEST (formato,
+# version, fecha, cuentas y protocolos): sirve tambien en otro VPS.
+#   automatica: al volver al menu principal y al salir, solo si algo cambio; y una diaria (cron)
+#   por evento: antes de actualizar, restaurar o desinstalar, y a mano (COPIAS DE SEGURIDAD)
+# Restaurar UNE las cuentas (las de la copia + las actuales que no estan en ella): no borra ninguna.
+# Lo que nunca se copia ni se restaura (temporales, candados y marcas propias de este servidor):
+BK_SKIP='^(\.prep|\.helpers|[^/]*\.lock|fw\.(ports|nat)|.*\.tmp|(.*/)?\.tmp-.*)$'
+BK_DBS='^(users\.db|v2ray\.db|users\.exp|quick\.seq|test\.seq)$'   # se unen aparte al restaurar
+
+bk_files() { ls -1 "$BK_DIR"/vpspanel-*.tar.gz 2>/dev/null | LC_ALL=C sort -r; }   # la mas reciente primero
+
+mf_get() {   # clave MANIFEST  ->  valor (solo caracteres seguros: la copia puede venir de otro VPS)
+  sed -n "s/^$1=//p" "$2" 2>/dev/null | head -1 | tr -cd 'A-Za-z0-9 ._:/@+,-' | cut -c1-60
+}
+
+bk_fingerprint() {   # huella rapida (nombres, tamanos, fechas): si no cambio, no hace falta copiar
+  {                    # sin candados ni temporales (el cron abre cleanup.lock cada minuto)
+    find "$BASE" -type f ! -name '*.lock' ! -name '*.tmp' ! -name '.tmp-*' ! -name 'fw.ports' ! -name 'fw.nat' \
+      ! -name '.prep' ! -name '.helpers' -printf '%P %s %T@\n' 2>/dev/null
+    stat -c '%n %s %Y' "$OVPN_DIR/ca.crt" "$OVPN_DIR/server.key" "$WG_CONF" /etc/shadow 2>/dev/null
+  } | LC_ALL=C sort | sha256sum | cut -d' ' -f1
+}
+
+bk_collect() {   # carpeta  ->  arma ahi vpspanel-backup/ con los datos actuales del panel
+  local d=$1/vpspanel-backup f list=$1/.list
+  mkdir -p "$d/base" "$d/extra" || return 1
+  ( cd "$BASE" && find . -type f -size -5M -print0 2>/dev/null ) |
+    while IFS= read -r -d '' f; do f=${f#./}; [[ $f =~ $BK_SKIP ]] || printf '%s\0' "$f"; done > "$list"
+  tar -C "$BASE" --null -T "$list" -cf - 2>/dev/null | tar -C "$d/base" -xpf - || return 1
+  for f in ca.crt ca.key ca.srl server.crt server.key; do
+    [[ -f $OVPN_DIR/$f ]] || continue
+    mkdir -p "$d/extra/openvpn" && cp -p -- "$OVPN_DIR/$f" "$d/extra/openvpn/$f" || return 1
+  done
+  if [[ -f $WG_CONF ]]; then
+    mkdir -p "$d/extra/wireguard" && cp -p -- "$WG_CONF" "$d/extra/wireguard/wg0.conf" || return 1
+  fi
+  # contrasena de cada cuenta tal como la tiene el sistema (hash): al restaurar queda identica
+  awk -F'|' 'FILENAME == ARGV[1] { if ($1 != "") u[$1]; next }
+             { split($0, a, ":"); if (a[1] in u) print a[1] ":" a[2] }' "$USERDB" /etc/shadow > "$d/extra/shadow" 2>/dev/null
+  touch "$d/base/users.db" "$d/base/v2ray.db" "$d/base/users.exp"
+  rm -f "$list"
+  chmod -R go-rwx "$d"
+  return 0
+}
+
+bk_datahash() {   # carpeta  ->  hash del contenido (sin MANIFEST): dos copias con los mismos datos coinciden
+  ( cd "$1/vpspanel-backup" && find . -type f ! -name MANIFEST -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum ) |
+    sha256sum | cut -d' ' -f1
+}
+
+bk_manifest() {   # carpeta motivo hash
+  local d=$1/vpspanel-backup k pl='' ns nv
+  for k in "${PROTO_KEYS[@]}"; do proto_installed "$k" && pl+="$k "; done
+  ns=$(grep -c '^[^|]' "$d/base/users.db" 2>/dev/null); nv=$(grep -c '^[^|]' "$d/base/v2ray.db" 2>/dev/null)
+  {
+    echo "format=$BK_FORMAT"
+    echo "panel_version=$VERSION"
+    echo "created=$(date +%s)"
+    echo "reason=$2"
+    echo "host=$(hostname 2>/dev/null)"
+    echo "ip=${IP:-$(hostname -I 2>/dev/null | awk '{print $1}')}"
+    echo "name=$(vps_name)"
+    echo "ssh_users=${ns:-0}"
+    echo "v2_users=${nv:-0}"
+    echo "protocols=${pl% }"
+    echo "data_hash=$3"
+  } > "$d/MANIFEST"
+  chmod 600 "$d/MANIFEST"
+}
+
+_bk_snap() {   # motivo  ->  (con el candado de las copias) imprime la ruta de la copia; 3 = sin cambios
+  local why=$1 fp h tmp name='' free i
+  fp=$(bk_fingerprint)
+  [[ $why == auto && $fp == "$(cat "$BK_DIR/.fp" 2>/dev/null)" ]] && return 3
+  free=$(df -Pk "$BK_DIR" 2>/dev/null | awk 'NR == 2 {print $4}')
+  if [[ $free =~ ^[0-9]+$ ]] && (( free < 10240 )); then
+    err "Disco casi lleno (menos de 10 MB): no se crea la copia."; return 1
+  fi
+  tmp=$(mktemp -d "$BK_DIR/.stage-XXXXXX") || return 1
+  if ! bk_collect "$tmp"; then rm -rf "$tmp"; err "No se pudieron reunir los datos para la copia."; return 1; fi
+  h=$(bk_datahash "$tmp")
+  if [[ $why == auto && $h == "$(cat "$BK_DIR/.hash" 2>/dev/null)" ]]; then   # solo cambiaron fechas
+    echo "$fp" > "$BK_DIR/.fp"; rm -rf "$tmp"; return 3
+  fi
+  bk_manifest "$tmp" "$why" "$h"
+  for i in 1 2 3; do
+    name=$BK_DIR/vpspanel-$(date +%Y%m%d-%H%M%S)-$why.tar.gz
+    [[ -e $name ]] || break
+    sleep 1
+  done
+  # se escribe aparte, se comprueba que se pueda leer y recien ahi toma su nombre definitivo
+  if tar -czf "$name.part" -C "$tmp" vpspanel-backup 2>/dev/null && tar -tzf "$name.part" >/dev/null 2>&1; then
+    chmod 600 "$name.part"
+    sync "$name.part" 2>/dev/null
+    mv -f "$name.part" "$name"
+  else
+    rm -f "$name.part"; rm -rf "$tmp"; err "No se pudo escribir la copia (disco lleno?)."; return 1
+  fi
+  rm -rf "$tmp"
+  echo "$h" > "$BK_DIR/.hash"; echo "$fp" > "$BK_DIR/.fp"
+  bk_prune
+  printf '%s\n' "$name"
+}
+
+bk_snap() {   # [motivo]  ->  crea una copia ("auto": solo si algo cambio). Deja la ruta en BK_LAST
+  local why=${1:-manual} out rc
+  BK_LAST=''
+  [[ $why =~ ^[a-z-]{1,24}$ ]] || why=manual
+  [[ -s $NAME_F || -s $USERDB || -s $V2DB ]] || return 0       # panel sin datos: nada que guardar
+  mkdir -p "$BK_DIR" && chmod 700 "$BK_DIR" || { err "No se pudo crear $BK_DIR"; return 1; }
+  out=$( ( flock -w 30 7 || exit 1; _bk_snap "$why" ) 7>"$BK_DIR/.lock" )
+  rc=$?
+  (( rc == 3 )) && return 0
+  (( rc == 0 )) || return 1
+  BK_LAST=${out##*$'\n'}
+  logln "copia de seguridad ($why): $BK_LAST"
+  return 0
+}
+
+bk_prune() {   # quedan las BK_KEEP automaticas y las BK_KEEP_EV de otros motivos mas recientes
+  local f na=0 ne=0
+  while IFS= read -r f; do
+    if [[ $f == *-auto.tar.gz ]]; then na=$(( na + 1 )); (( na > BK_KEEP )) && rm -f -- "$f"
+    else ne=$(( ne + 1 )); (( ne > BK_KEEP_EV )) && rm -f -- "$f"; fi
+  done < <(bk_files)
+  find "$BK_DIR" -maxdepth 1 \( -name '*.part' -o -name '.stage-*' -o -name '.restore-*' \) -mmin +60 \
+    -exec rm -rf {} + 2>/dev/null
+  return 0
+}
+
+bk_auto() {   # copia automatica silenciosa (solo si algo cambio)
+  [[ -z ${NO_AUTOBK:-} && $EUID -eq 0 && -d $BASE ]] || return 0
+  bk_snap auto >/dev/null 2>&1
+  return 0
+}
+
+bk_valid() {   # archivo  ->  0 si es una copia valida (formato conocido, rutas seguras); el motivo en MSG
+  local f=$1 n sz list re='^vpspanel-backup(/[A-Za-z0-9._@+=,-]+)*/?$'
+  MSG=''
+  [[ -f $f && -r $f ]] || { MSG="No existe el archivo: $f"; return 1; }
+  sz=$(stat -c %s "$f" 2>/dev/null)
+  [[ $sz =~ ^[0-9]+$ ]] && (( sz > 0 && sz < 52428800 )) || { MSG="El archivo esta vacio o es demasiado grande."; return 1; }
+  list=$(tar -tzf "$f" 2>/dev/null) || { MSG="No es una copia del panel (.tar.gz danado o de otro tipo)."; return 1; }
+  while IFS= read -r n; do
+    [[ $n =~ $re && $n != *..* ]] || { MSG="La copia tiene rutas no permitidas."; return 1; }
+  done <<< "$list"
+  # solo archivos normales y carpetas (sin enlaces ni dispositivos) y hasta 100 MB descomprimida
+  tar -tvzf "$f" 2>/dev/null | awk '{ t = substr($1, 1, 1); if (t != "-" && t != "d") bad = 1; s += $3 }
+                                    END { exit (bad || s > 104857600) }' \
+    || { MSG="La copia tiene enlaces, archivos especiales o es demasiado grande."; return 1; }
+  grep -qx 'vpspanel-backup/MANIFEST' <<< "$list" || { MSG="La copia no tiene MANIFEST."; return 1; }
+  tar -xzOf "$f" vpspanel-backup/MANIFEST 2>/dev/null | grep -qx "format=$BK_FORMAT" \
+    || { MSG="El formato de la copia no es compatible con esta version del panel."; return 1; }
+  return 0
+}
+
+bk_extract() {   # archivo (ya validado)  ->  lo extrae en una carpeta temporal privada: BK_TMP
+  local d
+  BK_TMP=''
+  mkdir -p "$BK_DIR" && chmod 700 "$BK_DIR" || return 1
+  BK_TMP=$(mktemp -d "$BK_DIR/.restore-XXXXXX") || return 1
+  if tar -xzf "$1" -C "$BK_TMP" --no-same-owner 2>/dev/null && [[ -f $BK_TMP/vpspanel-backup/MANIFEST ]]; then
+    d=$BK_TMP/vpspanel-backup/base
+    mkdir -p "$d" && touch "$d/users.db" "$d/v2ray.db" "$d/users.exp"
+    return 0
+  fi
+  rm -rf "$BK_TMP"; BK_TMP=''; MSG="No se pudo extraer la copia."
+  return 1
+}
+
+bk_show() {   # MANIFEST  ->  resumen de la copia
+  local m=$1 t k pl='' first=1 l
+  t=$(mf_get created "$m"); [[ $t =~ ^[0-9]+$ ]] || t=0
+  field "FECHA:" "$(date -d "@$t" '+%d/%m/%Y %H:%M')"
+  field "MOTIVO:" "$(mf_get reason "$m")"
+  field "VPS:" "$(mf_get name "$m")  $(mf_get ip "$m")"
+  field "VERSION:" "$(mf_get panel_version "$m")"
+  field "CUENTAS:" "SSH $(mf_get ssh_users "$m")   V2RAY $(mf_get v2_users "$m")"
+  for k in $(sed -n 's/^protocols=//p' "$m" | head -1 | tr -cd 'a-z '); do
+    [[ -n ${INST[$k]:-} ]] && pl+="$(proto_label "$k") "
+  done
+  [[ -n $pl ]] || pl='ninguno'
+  while IFS= read -r l; do
+    if (( first )); then field "PROTOCOLOS:" "$l"; first=0; else printf ' %*s %s%s%s\n' "$FW" '' "$WHT" "$l" "$RST"; fi
+  done < <(fold -s -w 38 <<< "$pl")
+}
+
+bk_cfg_fp() {   # huella de la configuracion (sin las bases de cuentas): si cambia al restaurar, se aplica
+  local f
+  {
+    while IFS= read -r -d '' f; do
+      f=${f#./}
+      [[ $f =~ $BK_SKIP || $f =~ $BK_DBS ]] && continue
+      printf '%s %s\n' "$f" "$(cat "$BASE/$f" 2>/dev/null | sha256sum | cut -c1-16)"
+    done < <(cd "$BASE" && find . -type f -print0 2>/dev/null | LC_ALL=C sort -z)
+    cat "$OVPN_DIR/ca.crt" "$OVPN_DIR/server.key" "$WG_CONF" 2>/dev/null | sha256sum
+  } | sha256sum | cut -d' ' -f1
+}
+
+# Aplica una copia extraida. Configuracion: la de la copia. Cuentas: las de la copia (se crean las
+# que faltan, con su contrasena, vencimiento y limite) + las actuales que no estan en ella. Nunca
+# toca cuentas del sistema ni root. Luego aplica puertos, llaves y cuentas a lo que este instalado.
+bk_apply() {   # carpeta_extraida  ->  RST_N (cuentas SSH restauradas) y RST_BAD (no restauradas)
+  local w=$1 s=$1/vpspanel-backup f u p e l h a b k fp0 fp1 ban0 ban1
+  local -A BH=()
+  RST_N=0; RST_BAD=0
+  fp0=$(bk_cfg_fp); ban0=$(cat "$BANNER" 2>/dev/null | sha256sum)
+  # 1) configuracion de $BASE (las bases de cuentas y las secuencias se unen despues)
+  while IFS= read -r -d '' f; do
+    f=${f#./}
+    [[ $f =~ $BK_SKIP || $f =~ $BK_DBS ]] && continue
+    [[ $f == */* ]] && mkdir -p "$BASE/${f%/*}"
+    cp -p -- "$s/base/$f" "$BASE/$f.tmp" && mv -f -- "$BASE/$f.tmp" "$BASE/$f"
+  done < <(cd "$s/base" && find . -type f -print0 2>/dev/null)
+  [[ -d $BASE/wireguard ]] && chmod 700 "$BASE/wireguard"
+  # 2) cuentas SSH de la copia
+  if [[ -s $s/extra/shadow ]]; then
+    while IFS=: read -r u h; do [[ $u =~ ^[a-z_][a-z0-9_-]*$ && -n $h ]] && BH[$u]=$h; done < "$s/extra/shadow"
+  fi
+  : > "$w/acc.ssh"
+  while IFS='|' read -r u p e l; do
+    [[ -n $u ]] || continue
+    if ! [[ $u =~ ^[a-z_][a-z0-9_-]{0,31}$ && $e =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ && ${l:-1} =~ ^[0-9]+$ ]]; then
+      RST_BAD=$(( RST_BAD + 1 )); continue
+    fi
+    acct_make "$u" "$p" "$e" "${BH[$u]:-}"
+    case $? in
+      0) printf '%s|%s|%s|%s\n' "$u" "$p" "$e" "${l:-1}" >> "$w/acc.ssh"; RST_N=$(( RST_N + 1 )) ;;
+      2) warn "$u existe y no es una cuenta del panel: no se toca."; RST_BAD=$(( RST_BAD + 1 )) ;;
+      *) warn "No se pudo crear la cuenta $u."; RST_BAD=$(( RST_BAD + 1 )) ;;
+    esac
+  done < "$s/base/users.db"
+  # 3) bases de cuentas: las de la copia + las actuales que no estan en ella
+  db_filter "$USERDB" awk -F'|' 'FILENAME == ARGV[1] { a[$1]; print; next } !($1 in a)' "$w/acc.ssh" - \
+    || { err "No se pudo escribir users.db"; return 1; }
+  awk -F'|' 'FILENAME == ARGV[1] { a[$1]; next } ($1 in a) && $2 ~ /^[0-9]+$/' "$w/acc.ssh" "$s/base/users.exp" > "$w/acc.px"
+  db_filter "$PX_DB" awk -F'|' 'FILENAME == ARGV[1] { a[$1]; next } FILENAME == ARGV[2] { print; next } !($1 in a)' \
+    "$w/acc.ssh" "$w/acc.px" -
+  awk -F'|' 'NF >= 3 && $1 ~ /^[a-z_][a-z0-9_-]*$/ && $2 ~ /^[0-9a-fA-F-]+$/ && $3 ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]$/' \
+    "$s/base/v2ray.db" > "$w/acc.v2"
+  db_filter "$V2DB" awk -F'|' 'FILENAME == ARGV[1] { a[$1]; print; next } !($1 in a)' "$w/acc.v2" - \
+    || { err "No se pudo escribir v2ray.db"; return 1; }
+  for f in quick.seq test.seq; do               # las secuencias nunca retroceden (no se repiten nombres)
+    a=$(cat "$BASE/$f" 2>/dev/null); b=$(cat "$s/base/$f" 2>/dev/null)
+    [[ $a =~ ^[0-9]+$ ]] || a=0; [[ $b =~ ^[0-9]+$ ]] || b=0
+    (( 10#$b > 10#$a )) && printf '%s\n' "$(( 10#$b ))" > "$BASE/$f"
+  done
+  # 4) llaves de OpenVPN y WireGuard: los archivos que ya tienen los clientes siguen sirviendo
+  if [[ -s $s/extra/openvpn/ca.crt && -s $s/extra/openvpn/server.key ]]; then
+    mkdir -p "$OVPN_DIR" && chmod 700 "$OVPN_DIR"
+    for f in ca.crt ca.key ca.srl server.crt server.key; do
+      [[ -f $s/extra/openvpn/$f ]] && install -m 600 "$s/extra/openvpn/$f" "$OVPN_DIR/$f"
+    done
+    chmod 644 "$OVPN_DIR/ca.crt" "$OVPN_DIR/server.crt" 2>/dev/null
+  fi
+  if [[ -s $s/extra/wireguard/wg0.conf ]]; then
+    if [[ -f $WG_CONF ]]; then
+      install -m 600 "$s/extra/wireguard/wg0.conf" "$WG_CONF.tmp" && mv -f "$WG_CONF.tmp" "$WG_CONF"
+    else                                        # WireGuard sin instalar: lo recupera al instalarlo
+      mkdir -p "$BASE/wireguard" && chmod 700 "$BASE/wireguard"
+      install -m 600 "$s/extra/wireguard/wg0.conf" "$BASE/wireguard/wg0.conf.bak"
+    fi
+  fi
+  # 5) lo instalado toma los puertos, banner, llaves y cuentas restaurados (sin arrancar lo detenido)
+  load_ports
+  fp1=$(bk_cfg_fp); ban1=$(cat "$BANNER" 2>/dev/null | sha256sum)
+  if [[ -f $BASE/.prep ]]; then
+    [[ -f $V2CFG ]] && v2_write_config
+    if [[ $fp0 != "$fp1" ]]; then
+      info "Aplicando la configuracion a los servicios..."
+      [[ $ban0 != "$ban1" ]] && cfg_ssh
+      for k in dropbear ws socks wsepro squid ssl v2ray badvpn openvpn wireguard slowdns udp psiphon; do apply_proto "$k"; done
+    elif [[ -f $V2CFG ]] && v2_test; then
+      systemctl try-restart v2ray >/dev/null 2>&1
+    fi
+    fw_sync
+  fi
+  return 0
+}
+
+bk_restore() {   # archivo [si]  ->  restaura una copia (pide confirmacion salvo "si"); 3 = cancelado
+  local f=$1 yes=${2:-} c='' rc
+  bk_valid "$f" || { err "$MSG"; return 1; }
+  bk_extract "$f" || { err "$MSG"; return 1; }
+  bk_show "$BK_TMP/vpspanel-backup/MANIFEST"
+  line_dash
+  info "Vuelven las cuentas de la copia (clave, vencimiento"
+  info "y limite); las actuales que no esten se conservan."
+  info "Antes se guarda el estado actual para deshacerlo."
+  if [[ $yes != si ]]; then
+    rd "ESCRIBE SI PARA RESTAURAR: " c
+    [[ $c == SI ]] || { rm -rf "$BK_TMP"; return 3; }
+  fi
+  log_use copias "Restaurar ${f##*/}"
+  if ! bk_snap antes-de-restaurar; then
+    rm -rf "$BK_TMP"; err "No se pudo guardar el estado actual: no se restauro nada."; return 1
+  fi
+  [[ -n $BK_LAST ]] && ok "Estado actual guardado en ${BK_LAST##*/}"
+  bk_apply "$BK_TMP"; rc=$?
+  rm -rf "$BK_TMP"
+  if (( rc != 0 )); then err "La restauracion no termino."; info "Estado anterior: ${BK_LAST:-$BK_DIR}"; return 1; fi
+  ok "Copia restaurada: $RST_N cuentas SSH recuperadas."
+  info "Total en el panel: $(grep -c '^[^|]' "$USERDB") SSH y $(grep -c '^[^|]' "$V2DB") V2Ray."
+  (( RST_BAD )) && warn "$RST_BAD cuentas no se restauraron (detalle arriba)."
+  bk_auto
+  return 0
+}
+
+bk_pick() {   # lista las copias guardadas y deja la elegida en PICK; 3 = volver
+  local f t i=0 sel m num=$'N\xc2\xb0'
+  local -a L=()
+  PICK=''
+  mapfile -t L < <(bk_files | head -n 20)
+  (( ${#L[@]} )) || { warn "Todavia no hay copias guardadas."; return 1; }
+  m=$(mktemp)
+  printf '%s  %s %-17s%-21s%5s%5s%s\n' "$LYE" "$num" FECHA MOTIVO SSH V2R "$RST"
+  line_dash
+  for f in "${L[@]}"; do
+    i=$(( i + 1 ))
+    tar -xzOf "$f" vpspanel-backup/MANIFEST > "$m" 2>/dev/null
+    t=$(mf_get created "$m"); [[ $t =~ ^[0-9]+$ ]] || t=0
+    printf '%s%3d)%s %s%-17s%s%-21s%s%5s%5s%s\n' "$GRN" "$i" "$RST" "$WHT" "$(date -d "@$t" '+%d/%m/%Y %H:%M')" \
+      "$GRY" "$(mf_get reason "$m" | cut -c1-20)" "$GRN" "$(mf_get ssh_users "$m")" "$(mf_get v2_users "$m")" "$RST"
+  done
+  rm -f "$m"
+  menu_end
+  rd "NUMERO DE LA COPIA: " sel || return 3
+  sel=${sel//[[:space:]]/}
+  [[ $sel =~ ^[0-9]+$ ]] || return 3
+  sel=$(( 10#$sel ))
+  (( sel >= 1 && sel <= ${#L[@]} )) || return 3
+  PICK=${L[sel-1]}
+}
+
+bk_summary() {   # cabecera de COPIAS DE SEGURIDAD
+  local f n m t
+  n=$(bk_files | wc -l)
+  field "CARPETA:" "$BK_DIR"
+  field "COPIAS:" "$n guardadas (se crean solas cuando algo cambia)"
+  f=$(bk_files | head -1)
+  if [[ -n $f ]]; then
+    m=$(mktemp); tar -xzOf "$f" vpspanel-backup/MANIFEST > "$m" 2>/dev/null
+    t=$(mf_get created "$m"); [[ $t =~ ^[0-9]+$ ]] || t=0
+    field "ULTIMA:" "$(date -d "@$t" '+%d/%m/%Y %H:%M')  SSH $(mf_get ssh_users "$m")  V2RAY $(mf_get v2_users "$m")"
+    rm -f "$m"
   fi
 }
 
+menu_backup() {
+  local o path='' rc
+  while :; do
+    sub_header "COPIAS DE SEGURIDAD"
+    bk_summary
+    line_eq
+    item 1 "CREAR UNA COPIA AHORA"
+    item 2 "RESTAURAR UNA COPIA GUARDADA" "$GRN"
+    item 3 "RESTAURAR DESDE UN ARCHIVO (OTRO VPS)"
+    line_dash
+    item 4 "VOLVER A LA VERSION ANTERIOR DEL PANEL"
+    menu_end
+    ask o || return
+    case $o in
+      1) sub_header "CREAR UNA COPIA"
+         if bk_snap manual && [[ -n $BK_LAST ]]; then
+           ok "Copia creada: $BK_LAST"
+           info "Descargala por SFTP para guardarla fuera del VPS."
+         else
+           err "No se pudo crear la copia."
+         fi ;;
+      2) sub_header "RESTAURAR UNA COPIA"
+         bk_pick || { rc=$?; (( rc == 3 )) && continue; pause; continue; }
+         sub_header "RESTAURAR UNA COPIA"
+         bk_restore "$PICK"; [[ $? == 3 ]] && continue ;;
+      3) sub_header "RESTAURAR DESDE UN ARCHIVO"
+         echo " Sube el archivo .tar.gz al VPS (SFTP) y escribe su ruta,"
+         echo " por ejemplo: /root/vpspanel-20261114-031500-manual.tar.gz"
+         echo
+         rd "RUTA DEL ARCHIVO: " path || continue
+         [[ -n $path && $path != 0 ]] || continue
+         sub_header "RESTAURAR DESDE UN ARCHIVO"
+         bk_restore "$path"; [[ $? == 3 ]] && continue ;;
+      4) sub_header "VERSION ANTERIOR DEL PANEL"
+         panel_rollback; rc=$?
+         (( rc == 3 )) && continue
+         if (( rc == 0 )); then pause; exec "$PANEL_BIN"; fi ;;
+      0) return ;;
+      *) continue ;;
+    esac
+    pause
+  done
+}
+
+# ---- Al abrir el panel: recuperacion tras reinstalar y revision de la base de cuentas ------
+data_recover() {   # panel sin datos (instalado de nuevo) y con copias: recupera la ultima valida
+  local f=''
+  REC_MAN=''
+  [[ -s $NAME_F || -s $USERDB || -s $V2DB ]] && return 1          # el panel ya tiene datos
+  [[ -d $BK_DIR ]] || return 1
+  while IFS= read -r f; do bk_valid "$f" && break; f=''; done < <(bk_files)
+  [[ -n $f ]] || return 1
+  bk_extract "$f" || return 1
+  log_use copias "Recuperacion automatica desde ${f##*/}"
+  info "Copia de seguridad encontrada: recuperando datos..."
+  if ! bk_apply "$BK_TMP"; then
+    rm -rf "$BK_TMP"; err "No se pudo recuperar ${f##*/}"; return 1
+  fi
+  REC_MAN=$(mktemp)
+  cp "$BK_TMP/vpspanel-backup/MANIFEST" "$REC_MAN"
+  rm -rf "$BK_TMP"
+  ok "Recuperadas $RST_N cuentas SSH y $(grep -c '^[^|]' "$V2DB") V2Ray."
+  info "Copia: ${f##*/}"
+  logln "recuperacion automatica: ${f##*/} ($RST_N cuentas SSH)"
+  return 0
+}
+
+reinstall_protos() {   # claves...  ->  instala esos protocolos con los puertos y llaves recuperados
+  local k n=0
+  local -a bad=()
+  ensure_base || return 1
+  [[ -s $BASE/slowdns/ns ]] && SLOWDNS_NS=$(head -n1 "$BASE/slowdns/ns")   # sin volver a preguntar el NS
+  for k in dropbear ssl badvpn ws socks wsepro squid v2ray udp slowdns openvpn wireguard psiphon; do
+    [[ " $* " == *" $k "* ]] || continue
+    n=$(( n + 1 ))
+    printf '\n %s[%d/%d]%s %s%s%s\n' "$YEL" "$n" "$#" "$RST" "$WHT" "$(proto_label "$k")" "$RST"
+    "${INST[$k]}" || bad+=("$(proto_label "$k")")
+  done
+  fw_sync
+  echo
+  if (( ${#bad[@]} )); then warn "Con fallos: ${bad[*]}"; info "Reparalos en PREPARACION DEL SISTEMA."
+  else ok "Protocolos instalados con la configuracion recuperada"; fi
+}
+
+data_check() {   # base de cuentas y cuentas del sistema en orden; si no, ofrece repararlo
+  local f='' u p e l t c='' now today tmp
+  local -a lost=() gone=() glines=()
+  local -A SYS=() PXT=() BH=()
+  now=$(date +%s); today=$(date -u +%F)
+  while IFS=: read -r u _; do SYS[$u]=1; done < <(getent passwd)
+  f=$(bk_files | head -1)
+  [[ -n $f ]] && ! bk_valid "$f" && f=''
+  # a) users.db quedo vacia, pero siguen en el servidor cuentas del panel que estan en la ultima copia
+  if [[ -n $f ]] && ! grep -q '^[^|]' "$USERDB" 2>/dev/null; then
+    while IFS='|' read -r u p e l; do
+      [[ $u =~ ^[a-z_][a-z0-9_-]{0,31}$ && -n ${SYS[$u]:-} ]] && panel_acct "$u" && lost+=("$u")
+    done < <(tar -xzOf "$f" vpspanel-backup/base/users.db 2>/dev/null)
+  fi
+  # b) cuentas vigentes de users.db que no existen en el sistema (sistema reinstalado o borradas a mano)
+  if [[ -s $PX_DB ]]; then while IFS='|' read -r u t; do PXT[$u]=$t; done < "$PX_DB"; fi
+  while IFS='|' read -r u p e l; do
+    [[ $u =~ ^[a-z_][a-z0-9_-]{0,31}$ && $e =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ && -z ${SYS[$u]:-} ]] || continue
+    [[ $e > $today ]] || continue                                  # vencida: vps-cleanup la quita sola
+    t=${PXT[$u]:-}; [[ $t =~ ^[0-9]+$ ]] && (( t <= now )) && continue   # prueba ya vencida
+    gone+=("$u"); glines+=("$u|$p|$e")
+  done < "$USERDB"
+  (( ${#lost[@]} + ${#gone[@]} )) || return 0
+  cls
+  title "REVISION DE CUENTAS" "$YEL"
+  if (( ${#lost[@]} )); then
+    warn "La lista de cuentas del panel esta vacia, pero"
+    warn "${#lost[@]} cuentas siguen en el servidor. Se pueden"
+    warn "recuperar desde la ultima copia:"
+    names_grid 9 "${lost[@]}"
+    rd "RECUPERAR LA LISTA DESDE LA COPIA? (S/n): " c
+    if [[ $c != [nN]* ]]; then
+      tmp=$(mktemp)
+      tar -xzOf "$f" vpspanel-backup/base/users.db 2>/dev/null |
+        awk -F'|' -v list="|$(IFS='|'; printf '%s' "${lost[*]}")|" 'index(list, "|" $1 "|") > 0' > "$tmp"
+      db_filter "$USERDB" awk -F'|' 'FILENAME == ARGV[1] { a[$1]; print; next } !($1 in a)' "$tmp" -
+      tar -xzOf "$f" vpspanel-backup/base/users.exp 2>/dev/null |
+        awk -F'|' 'FILENAME == ARGV[1] { a[$1]; next } ($1 in a)' "$tmp" - > "$tmp.px"
+      db_filter "$PX_DB" awk -F'|' 'FILENAME == ARGV[1] { a[$1]; print; next } !($1 in a)' "$tmp.px" -
+      rm -f "$tmp" "$tmp.px"
+      ok "Lista recuperada: $(grep -c '^[^|]' "$USERDB") cuentas"
+    fi
+    echo
+  fi
+  if (( ${#gone[@]} )); then
+    warn "${#gone[@]} cuentas del panel no existen en el servidor"
+    warn "(sistema reinstalado o borradas fuera del panel):"
+    names_grid 9 "${gone[@]}"
+    echo " S = volver a crearlas (misma contrasena, vencimiento y limite)"
+    echo " N = quitarlas de la lista del panel"
+    rd "VOLVER A CREARLAS? (S/n): " c
+    if [[ $c == [nN]* ]]; then
+      t=$(IFS='|'; printf '%s' "${gone[*]}")
+      db_filter "$USERDB" awk -F'|' -v list="|$t|" 'index(list, "|" $1 "|") == 0'
+      [[ -s $PX_DB ]] && db_filter "$PX_DB" awk -F'|' -v list="|$t|" 'index(list, "|" $1 "|") == 0'
+      ok "${#gone[@]} cuentas quitadas de la lista"
+    else
+      if [[ -n $f ]]; then   # hash de la ultima copia: la contrasena queda identica a la original
+        while IFS=: read -r u t; do [[ -n $u && -n $t ]] && BH[$u]=$t; done < <(tar -xzOf "$f" vpspanel-backup/extra/shadow 2>/dev/null)
+      fi
+      c=0
+      for t in "${glines[@]}"; do
+        IFS='|' read -r u p e <<< "$t"
+        if acct_make "$u" "$p" "$e" "${BH[$u]:-}"; then c=$(( c + 1 )); else warn "No se pudo crear $u"; fi
+      done
+      ok "$c cuentas creadas de nuevo"
+    fi
+  fi
+  pause
+}
+
+data_startup() {   # al abrir el panel: recuperacion tras reinstalar o revision de la base de cuentas
+  local o='' k pl=''
+  if data_recover; then
+    if [[ -t 0 && -t 1 ]]; then
+      cls
+      title "RECUPERACION AUTOMATICA" "$GRN"
+      echo " El panel estaba sin datos y habia una copia de seguridad: se"
+      echo " recuperaron los usuarios (con su contrasena, vencimiento y"
+      echo " limite), los puertos, el nombre, las llaves y los clientes."
+      echo
+      bk_show "$REC_MAN"
+      for k in $(sed -n 's/^protocols=//p' "$REC_MAN" | head -1 | tr -cd 'a-z '); do
+        [[ -n ${INST[$k]:-} ]] && ! proto_installed "$k" && pl+="$k "
+      done
+      line_eq
+      if [[ -n $pl ]]; then
+        echo " Los protocolos que tenia el panel no estan instalados ahora."
+        item 1 "INSTALARLOS CON LA MISMA CONFIGURACION" "$GRN"
+        item 0 "CONTINUAR SIN INSTALAR"
+        line_eq
+        ask o && [[ $o == 1 ]] && { reinstall_protos $pl; pause; }
+      else
+        pause
+      fi
+    fi
+    rm -f "$REC_MAN"
+    return 0
+  fi
+  [[ -t 0 && -t 1 ]] && data_check
+  return 0
+}
+
+# ------------------------------ Actualizar el panel -------------------
+# Descarga el instalador nuevo (solo https) o lo toma de un archivo del VPS, comprueba que sea un
+# script valido (no una pagina web, sintaxis correcta, carga sin errores), guarda una copia de los
+# datos y la version actual (vps-rollback), lo instala de una sola vez y abre la version nueva, que
+# reinstala sus herramientas sola. Usuarios, cuentas y configuracion no se tocan.
+ver_of() { sed -n 's/^VERSION=\([0-9][0-9.]*\).*/\1/p' "$1" 2>/dev/null | head -1; }
+ver_lt() { [[ $1 != "$2" && $(printf '%s\n%s\n' "$1" "$2" | sort -V | head -1) == "$1" ]]; }   # a < b
+
+script_save() {   # [archivo]  ->  guarda esa version del panel para poder volver a ella (vps-rollback)
+  local src=${1:-$PANEL_BIN} v dst
+  [[ -s $src ]] || return 0
+  mkdir -p "$SCRIPT_BK" && chmod 700 "$BK_DIR" "$SCRIPT_BK" || return 1
+  v=$(ver_of "$src")
+  dst=$SCRIPT_BK/vpspanel-${v:-x}-$(sha256sum "$src" | cut -c1-12).sh
+  if [[ -f $dst ]]; then touch "$dst"
+  else cp -- "$src" "$dst.tmp" && chmod 600 "$dst.tmp" && mv -f "$dst.tmp" "$dst" || return 1; fi
+  ls -1t "$SCRIPT_BK"/vpspanel-*.sh 2>/dev/null | tail -n +6 | xargs -r rm -f --   # se guardan las 5 ultimas
+  return 0
+}
+
+upd_fetch() {   # enlace|ruta destino
+  local src=$1 dst=$2
+  case $src in
+    https://*)
+      run "Descargando el instalador" curl -fsSL --proto '=https' --proto-redir '=https' --tlsv1.2 \
+        --retry 2 --connect-timeout 15 --max-time 180 --max-filesize 10485760 -o "$dst" "$src" ;;
+    http://*)
+      err "El enlace debe ser https://"; info "Una descarga http sin cifrar se puede alterar."; return 1 ;;
+    *)
+      [[ -f $src ]] || { err "No es un enlace https:// ni un archivo de este VPS: $src"; return 1; }
+      cp -- "$src" "$dst" ;;
+  esac
+}
+
+upd_check() {   # archivo  ->  0 si es un instalador valido; version en NEWV, motivo en MSG
+  local f=$1 out
+  NEWV=''; MSG=''
+  [[ -s $f ]] || { MSG="El archivo descargado esta vacio."; return 1; }
+  if head -c 4096 "$f" | grep -qiE '<!doctype html|<html|<head>'; then
+    MSG="El enlace abre una pagina web, no el script. Usa el enlace directo (RAW) del archivo."; return 1
+  fi
+  head -n1 "$f" | grep -qE '^#!.*(bash|sh)' || { MSG="El archivo no es un script de bash (no empieza con #!)."; return 1; }
+  if ! out=$(bash -n "$f" 2>&1); then MSG="El script tiene errores de sintaxis: $(head -n2 <<< "$out")"; return 1; fi
+  NEWV=$(ver_of "$f")
+  if grep -q 'VPSPANEL_SOURCE_ONLY' "$f"; then   # carga de prueba: define todo sin abrir el menu
+    if ! out=$(cd / && VPSPANEL_SOURCE_ONLY=1 timeout 30 bash -c 'source "$1"' _ "$f" 2>&1 </dev/null); then
+      MSG="El script nuevo falla al cargar: $(tail -n2 <<< "$out")"; return 1
+    fi
+  fi
+  return 0
+}
+
+panel_update() {   # [enlace|archivo]  ->  0 = actualizado (falta abrir la version nueva); 3 = cancelado
+  local src=${1:-} def tmp c='' sum need='' cur
+  cur=$(ver_of "$PANEL_BIN"); cur=${cur:-$VERSION}    # la instalada (otra sesion pudo actualizar ya)
+  def=${UPDATE_URL:-$(head -n1 "$BASE/update.url" 2>/dev/null)}
+  if [[ -z $src ]]; then
+    field "VERSION:" "$cur (instalada)"
+    [[ -n $def ]] && field "ENLACE:" "${def:0:38}$( (( ${#def} > 38 )) && echo ...)"
+    echo
+    echo " Pega el enlace RAW del instalador nuevo (https://...) o la"
+    echo " ruta de un archivo del VPS. Usuarios y configuracion se"
+    echo " conservan; antes se guarda una copia de todo."
+    [[ -n $def ]] && echo " ENTER = usar el mismo enlace de la ultima vez."
+    echo
+    rd "ENLACE: " src || return 3
+    src=${src//[[:space:]]/}
+    [[ -z $src ]] && src=$def
+    [[ -n $src && $src != 0 ]] || return 3
+  fi
+  log_use actualizacion "Actualizar desde $src"
+  tmp=$(mktemp) || return 1
+  if ! upd_fetch "$src" "$tmp"; then rm -f "$tmp"; return 1; fi
+  if ! upd_check "$tmp"; then err "$MSG"; logln "rechazado: $MSG"; rm -f "$tmp"; return 1; fi
+  sum=$(sha256sum "$tmp" | cut -d' ' -f1)
+  field "NUEVA:" "version ${NEWV:-desconocida}"
+  printf ' %sSHA256:%s\n %s%s%s\n' "$BLU" "$RST" "$GRY" "$sum" "$RST"   # para compararlo con el publicado
+  if cmp -s "$tmp" "$PANEL_BIN"; then
+    rm -f "$tmp"; ok "Ya tienes instalada esta misma version."; return 2
+  fi
+  if ! grep -q 'VPSPANEL_ACTIVE' "$tmp"; then warn "El archivo no parece ser VPS PANEL."; need=1
+  elif [[ -z $NEWV ]]; then warn "No se pudo leer la version del archivo nuevo."; need=1
+  elif ver_lt "$NEWV" "$cur"; then warn "Es una version ANTERIOR a la instalada ($cur)."; need=1
+  elif [[ $NEWV == "$cur" ]]; then info "Misma version ($cur) con cambios: se reinstala."
+  fi
+  if [[ -n $need ]]; then
+    if [[ ! -t 0 ]]; then rm -f "$tmp"; err "Sin confirmacion no se instala (usa el menu)."; return 1; fi
+    rd "ESCRIBE SI PARA INSTALARLA DE TODOS MODOS: " c
+    [[ $c == SI ]] || { rm -f "$tmp"; return 3; }
+  elif [[ -t 0 ]]; then
+    rd "ACTUALIZAR AHORA? (S/n): " c
+    [[ $c == [nN]* ]] && { rm -f "$tmp"; return 3; }
+  fi
+  # 1) copia de los datos y de la version actual: sin ellas no se actualiza
+  if ! bk_snap antes-de-actualizar; then rm -f "$tmp"; err "No se pudo crear la copia de seguridad: no se actualiza."; return 1; fi
+  [[ -n $BK_LAST ]] && ok "Copia de seguridad: ${BK_LAST##*/}"
+  if ! script_save "$PANEL_BIN"; then rm -f "$tmp"; err "No se pudo guardar la version actual: no se actualiza."; return 1; fi
+  install_rollback 2>/dev/null
+  # 2) se instala de una sola vez (esta sesion sigue con la version anterior hasta reabrir)
+  if ! { install -m 755 "$tmp" "$PANEL_BIN.new" && mv -f "$PANEL_BIN.new" "$PANEL_BIN"; }; then
+    rm -f "$PANEL_BIN.new" "$tmp"; err "No se pudo instalar la version nueva (sigue la anterior)."; return 1
+  fi
+  rm -f "$tmp"
+  [[ $src == https://* ]] && printf '%s\n' "$src" > "$BASE/update.url"
+  logln "actualizado: $cur -> ${NEWV:-?} (sha256 $sum) desde $src"
+  ok "Panel actualizado: $cur -> ${NEWV:-?}"
+  info "Si algo falla: vps-rollback vuelve a la anterior."
+  return 0
+}
+
+panel_rollback() {   # vuelve a la version anterior del panel (vps-rollback); 3 = cancelado
+  local c=''
+  [[ -x /usr/local/bin/vps-rollback ]] || install_rollback
+  /usr/local/bin/vps-rollback --list
+  echo
+  info "Usuarios y configuracion no cambian."
+  rd "VOLVER A LA VERSION ANTERIOR? (s/N): " c
+  [[ $c == [sS]* ]] || return 3
+  /usr/local/bin/vps-rollback
+}
 
 # ------------------------- Registro del VPS ---------------------------
 name_check() {   # nombre -> 0 si sirve; si no, deja el motivo en MSG
@@ -3202,7 +4076,9 @@ register_vps() {
       warn "$MSG"; sleep 2; continue
     fi
     sub_header "REGISTRO DE VPS"
-    center_grad "=====>>>> ${name^^} <<<<====="
+    echo " Asi se vera el titulo del panel:"
+    echo
+    brand "$name"
     echo
     rd "CONFIRMAR ESTE NOMBRE? [S/n]: " ans || return 1
     [[ $ans == [nN]* ]] && continue
@@ -3391,16 +4267,16 @@ install_all() {
 }
 
 # --------------------------- Cuentas SSH / Dropbear -------------------
-show_ssh_info() { # usuario clave expira limite
+show_ssh_info() { # usuario clave expira limite [texto del vencimiento] [titulo]
   local FW=24   # etiquetas mas anchas en esta pantalla
   cls
-  title "USUARIO CREADO CON EXITO!" "$GRN"
+  title "${6:-USUARIO CREADO CON EXITO!}" "$GRN"
   field "IP:" "$IP" "$PNK"
   [[ -s $DOMAIN_F ]] && field "DOMINIO:" "$(get_host)"
   field "NOMBRE DE USUARIO:" "$1"
   field "CONTRASENA DE USUARIO:" "$2"
   field "CONEXIONES:" "$4"
-  field "EXPIRA EN:" "${3:8:2}/${3:5:2}/${3:0:4}"
+  field "EXPIRA EN:" "${5:-${3:8:2}/${3:5:2}/${3:0:4}}"
   section "PUERTOS"
   cols "1:$(pcell SSH "$SSH_PORT")"     "21:$(pcell DROPBEAR "$PORT_DROPBEAR")"
   cols "1:$(pcell SSL "$PORT_SSL")"     "21:$(pcell WEBSOCKET "$PORT_WS")"
@@ -3476,7 +4352,7 @@ v2_create() {
   exp=$(date -d "+$d days" +%F)
   v2_edit --arg id "$id" --arg em "$n" \
     '.inbounds[0].settings.clients += [{"id":$id,"alterId":0,"email":$em}]' || return 1
-  echo "$n|$id|$exp" >> "$V2DB"
+  db_add "$V2DB" "$n|$id|$exp" || { err "No se pudo guardar la cuenta en v2ray.db"; return 1; }
   systemctl restart v2ray
   cls
   title "CUENTA V2RAY CREADA CON EXITO!" "$GRN"
@@ -3710,13 +4586,13 @@ ports_reset() {
 }
 
 v2_path_set() {
-  local p
+  local np=''   # no puede llamarse "p": rd usa una variable local con ese nombre y la respuesta se perdia
   proto_installed v2ray || { err "V2Ray no esta instalado."; return 1; }
-  rd "Nuevo path de V2Ray [$V2PATH]: " p
-  [[ -z $p ]] && { info "Sin cambios"; return 0; }
-  [[ $p == /* ]] || p="/$p"
-  [[ $p =~ ^/[A-Za-z0-9._~/-]{1,40}$ ]] || { err "Path invalido (letras, numeros y . _ ~ - /)"; return 1; }
-  V2PATH=$p; save_ports
+  rd "Nuevo path de V2Ray [$V2PATH]: " np
+  [[ -z $np ]] && { info "Sin cambios"; return 0; }
+  [[ $np == /* ]] || np="/$np"
+  [[ $np =~ ^/[A-Za-z0-9._~/-]{1,40}$ ]] || { err "Path invalido (letras, numeros y . _ ~ - /)"; return 1; }
+  V2PATH=$np; save_ports
   ok "Path de V2Ray: $V2PATH"
   apply_proto v2ray
   info "Vuelve a copiar los enlaces: Cuentas V2Ray > Listar."
@@ -3949,10 +4825,8 @@ header() {
   is_hidden server || sys_stats
 
   cls
-  # Titulo
-  line_eq
-  center_grad "=====>>>> ${name^^} <<<<====="
-  line_eq
+  # Titulo: el nombre del VPS en blanco, entre las mismas lineas que el resto del panel
+  brand "$name"
 
   # Datos del servidor: SISTEMA / MEMORIA / PROCESADOR
   if ! is_hidden server; then
@@ -3978,6 +4852,7 @@ header() {
   # Menu
   item_m 1 "ADMINISTRAR CUENTAS (SSH/DROPBEAR)"
   item_m 1.1 "CREAR USUARIO RAPIDO"
+  item_m 1.2 "CREAR USUARIO DE PRUEBA"
   item_m 2 "ADMINISTRAR CUENTAS (V2ray)"
   line_dash
   item_m 3 "PREPARACION DEL SISTEMA" "$HL_GRY"
@@ -3985,6 +4860,8 @@ header() {
   printf ' %s[4]%s %s>%s %s[!]%s %sDESINSTALAR PANEL%s\n' "$GRN" "$RST" "$RED" "$RST" "$YEL" "$RST" "$RED" "$RST"
   line_dash
   item_m 5 "INSTALAR TODOS LOS PROTOCOLOS"
+  printf ' %s[8]%s %s>%s %sACTUALIZAR PANEL%s %sv%s%s\n' "$GRN" "$RST" "$RED" "$RST" "$WHT" "$RST" "$GRY" "$VERSION" "$RST"
+  item_m 9 "COPIAS DE SEGURIDAD"
   line_eq
   printf ' %s0)%s %sSALIR DEL VPS%s  %s6)%s %sSALIR DEL SCRIPT%s  %s7)%s %sREBOOT VPS%s\n' \
     "$GRN" "$RST" "$BTN_GRAY" "$RST" "$GRN" "$RST" "$BTN_RED" "$RST" "$GRN" "$RST" "$BTN_BLUE" "$RST"
@@ -3993,6 +4870,7 @@ header() {
 
 exit_vps() {   # cierra el panel y la sesion SSH que lo abrio
   local p
+  bk_auto                                         # antes de cortar la sesion
   cls
   p=$(ps -o comm= -p "$PPID" 2>/dev/null)
   case $p in bash|-bash|sh|dash|ash|zsh) kill -HUP "$PPID" 2>/dev/null ;; esac
@@ -4000,43 +4878,87 @@ exit_vps() {   # cierra el panel y la sesion SSH que lo abrio
 }
 
 main_menu() {
-  local o c=''
+  local o c='' rc
   while :; do
+    bk_auto                                       # copia automatica si algo cambio
     header
     ask o m || exit 0
     case $o in
       1) menu_ssh ;;
       1.1) sub_header "CREAR USUARIO RAPIDO"; quick_user; pause ;;
+      1.2) sub_header "CREAR USUARIO DE PRUEBA"; test_user; pause ;;
       2) menu_v2 ;;
       3) ensure_base; menu_system ;;
       4) sub_header "DESINSTALAR PANEL"; uninstall_all; pause ;;
       5) sub_header "INSTALACION COMPLETA"; install_all; pause ;;
       6) cls; exit 0 ;;
-      7) rd "REINICIAR EL VPS AHORA? (s/N): " c; [[ $c == [sS] ]] && reboot ;;
+      7) rd "REINICIAR EL VPS AHORA? (s/N): " c; [[ $c == [sS] ]] && { bk_auto; reboot; } ;;
+      8) sub_header "ACTUALIZAR PANEL"; panel_update; rc=$?
+         (( rc == 3 )) && continue
+         if (( rc == 0 )); then                   # se abre la version nueva (integra sus herramientas)
+           pause; cls; exec "$PANEL_BIN"
+         fi
+         pause ;;
+      9) menu_backup ;;
       0) exit_vps ;;
     esac
   done
 }
 
-usage() { echo "Uso: $0 [--install-all]"; }
+on_exit() {   # al salir: cursor visible, colores normales y copia automatica si algo cambio
+  [[ -t 1 ]] && printf '\e[?25h\e[0m'
+  bk_auto
+  return 0
+}
+
+usage() {
+  cat <<EOF
+Uso: $0 [opcion]
+  (sin opcion)          abre el panel
+  --install-all         instala todos los protocolos sin preguntar
+  --backup [motivo]     crea una copia de seguridad (el cron diario usa: --backup auto)
+  --restore ARCHIVO     restaura una copia de seguridad (.tar.gz, tambien de otro VPS)
+  --update [ENLACE]     actualiza el panel desde el enlace RAW del instalador nuevo
+  --rollback            vuelve a la version anterior del panel
+EOF
+}
 
 main() {
+  local rc
   preflight
+  if [[ ${1:-} == --backup ]]; then              # cron diario o a mano: sin red ni menus
+    init_fs; load_ports; init_ui; helpers_update
+    if bk_snap "${2:-manual}"; then
+      if [[ -n $BK_LAST ]]; then echo "Copia creada: $BK_LAST"; else echo "Sin cambios desde la ultima copia."; fi
+      exit 0
+    fi
+    echo "No se pudo crear la copia de seguridad." >&2; exit 1
+  fi
   init_fs
   load_ports
   init_ui
-  trap '[[ -t 1 ]] && printf "\e[?25h\e[0m"' EXIT
+  trap on_exit EXIT
   init_env
   self_install
   autostart_default
   banner_migrate
   helpers_update
   case "${1:-}" in
-    --install-all) default_name; INSTALL_AUTO=1; install_all; exit 0 ;;
+    --install-all) data_recover; default_name; INSTALL_AUTO=1; install_all; exit 0 ;;
+    --restore)     [[ -n ${2:-} ]] || { usage; exit 1; }
+                   if [[ -t 0 ]]; then bk_restore "$2"; else bk_restore "$2" si; fi
+                   exit $? ;;
+    --update)      panel_update "${2:-$(head -n1 "$BASE/update.url" 2>/dev/null)}"; rc=$?
+                   (( rc == 0 )) && [[ -t 0 && -t 1 ]] && { pause; exec "$PANEL_BIN"; }
+                   (( rc == 2 )) && rc=0
+                   exit $rc ;;
+    --rollback)    [[ -x /usr/local/bin/vps-rollback ]] || install_rollback
+                   NO_AUTOBK=1; exec /usr/local/bin/vps-rollback ;;
     -h|--help)     usage; exit 0 ;;
     "") ;;
     *) usage; exit 1 ;;
   esac
+  data_startup
   if [[ ! -s $NAME_F ]]; then
     if [[ -t 0 && -t 1 ]]; then register_vps || exit 1; else default_name; fi
   fi
