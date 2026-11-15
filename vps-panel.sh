@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ======================================================================
-#  VPS PANEL v3.5.0 - instalador y administrador de protocolos para tuneles
+#  VPS PANEL v3.5.1 - instalador y administrador de protocolos para tuneles
 #  Compatible con HTTP Custom y apps similares.
 #  SSH, Dropbear, SSL, WebSocket, SOCKS Python, WS-ePro, Squid, V2Ray,
 #  BadVPN-UDPGW, UDP Custom, SlowDNS, OpenVPN, WireGuard y Psiphon
@@ -24,6 +24,10 @@
 #  Opcion 0: toda pantalla con opciones o preguntas muestra "[0] > VOLVER" y el 0 vuelve a la anterior
 #  sin cambiar nada (tambien en las preguntas de varios pasos: usuario, clave, dias, puertos...).
 #  En LIMITE DE CONEXIONES el 0 tambien vuelve atras: para no limitar las conexiones se escribe 999.
+#  Proxy de WebSocket, SOCKS, WS-ePro y SSL (vps-proxy.py): el payload puede empezar con cualquier
+#  metodo HTTP ("GET / HTTP/1.1", "CF-RAY / HTTP/1.1", "BMOVE / HTTP/1.1"...). Responde 101 (o 200 en
+#  SOCKS) y pasa el resto al SSH. Al actualizar el panel, el archivo nuevo se instala solo al abrirlo
+#  (HELPERS_V); el servicio en marcha lo usa cuando se reinicia (por ejemplo: systemctl restart vps-ws).
 #  Los puertos se cambian en Preparacion del sistema y se guardan en /etc/vpspanel/ports.conf
 #    UDPCUSTOM_URL=<url> vpspanel      (opcional) usar otro binario de udp-custom
 #    SLOWDNS_NS=<ns> vpspanel --install-all   (opcional) incluir SlowDNS sin preguntar
@@ -72,7 +76,7 @@ export VPSPANEL_ACTIVE=1
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}
 
 # ------------------------------ Configuracion -------------------------
-VERSION=3.5.0
+VERSION=3.5.1
 PREP_V=3          # version de la preparacion del sistema (se repite si cambia)
 NAME_MAX=24        # largo maximo del nombre del VPS (se muestra en el titulo)
 DEF_PASS=xxxx      # contrasena por defecto de las cuentas SSH (ENTER en el campo la escribe sola)
@@ -111,7 +115,7 @@ BK_KEEP_EV=15              # copias manuales y de antes de actualizar, restaurar
 BK_FORMAT=1                # formato de las copias (MANIFEST: format=1)
 SCRIPT_BK=$BK_DIR/scripts  # versiones anteriores del panel (vps-rollback)
 PANEL_BIN=${VPSPANEL_BIN:-/usr/local/bin/vpspanel}
-HELPERS_V=2                # version de vps-cleanup, vps-rollback y el cron: si cambia, se reinstalan solos
+HELPERS_V=3                # version de vps-cleanup, vps-rollback, el cron y vps-proxy.py: si cambia, se reinstalan solos
 # Enlace RAW del instalador en tu repositorio: en ACTUALIZAR PANEL basta con ENTER. Si alguna vez
 # actualizas desde otro enlace, el panel recuerda ese (/etc/vpspanel/update.url) y lo usa primero.
 UPDATE_URL='https://raw.githubusercontent.com/kevinred09/vps-panel-happyservers/main/vps-panel.sh'
@@ -895,8 +899,8 @@ install_tools() {   # motor de proxy (WebSocket/SOCKS/SSL) y pruebas de conexion
 
 Acepta en el mismo puerto:
   - SSH directo (el cliente habla primero o espera el banner del servidor)
-  - payload HTTP / WebSocket ("GET / HTTP/1.1 ... Upgrade: websocket"), incluso varios
-    seguidos ([split]) o con el banner SSH en el mismo envio
+  - payload HTTP / WebSocket ("GET / HTTP/1.1 ... Upgrade: websocket") con cualquier metodo
+    (GET, CF-RAY, BMOVE...), incluso varios seguidos ([split]) o con el banner SSH en el mismo envio
   - CONNECT host:puerto (responde 200)
   - SOCKS5 sin autenticacion (con --socks)
 y reenvia todo a un puerto local (SSH o Dropbear). Solo se llega a puertos de este VPS que
@@ -914,6 +918,7 @@ import asyncio
 import base64
 import hashlib
 import os
+import re
 import socket
 import struct
 import sys
@@ -963,9 +968,23 @@ def split_hostport(value):
         return h, None
 
 
+# Los payloads de las apps de tunel usan metodos inventados ("CF-RAY / HTTP/1.1", BMOVE...): ademas de
+# los de METHODS se acepta cualquier primera linea con forma de peticion "METODO destino HTTP/x.y".
+REQ_LINE = re.compile(rb"[A-Za-z][A-Za-z0-9_.-]{0,31} +\S+ +HTTP/[0-9.]+[ \t]*$")
+REQ_PART = re.compile(rb"[A-Za-z][A-Za-z0-9_.-]{0,31} +[/*]")   # primera linea aun incompleta ("CF-RAY /")
+
+
 def is_http(data):
-    head = data.lstrip(b"\r\n")[:16]
-    return any(head.startswith(m + b" ") for m in METHODS)
+    head = data.lstrip(b"\r\n")[:2048]
+    if head.startswith(b"SSH-"):                  # un banner SSH nunca es HTTP
+        return False
+    if any(head.startswith(m + b" ") for m in METHODS):
+        return True
+    first, sep, _ = head.partition(b"\n")
+    first = first.rstrip(b"\r")
+    if sep:                                       # linea completa: "METODO destino HTTP/x.y"
+        return REQ_LINE.match(first) is not None
+    return REQ_PART.match(first) is not None      # llegaron pocos bytes: "CF-RAY /"
 
 
 def pick_target(head, current):
