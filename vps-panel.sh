@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ======================================================================
-#  VPS PANEL v3.4.1 - instalador y administrador de protocolos para tuneles
+#  VPS PANEL v3.5.0 - instalador y administrador de protocolos para tuneles
 #  Compatible con HTTP Custom y apps similares.
 #  SSH, Dropbear, SSL, WebSocket, SOCKS Python, WS-ePro, Squid, V2Ray,
 #  BadVPN-UDPGW, UDP Custom, SlowDNS, OpenVPN, WireGuard y Psiphon
@@ -39,6 +39,12 @@
 #  los usuarios (con su contrasena, vencimiento y limite), los puertos, llaves y clientes.
 #  Actualizar (opcion 8): con el enlace RAW del instalador nuevo (https). Antes se guardan los
 #  datos y la version actual; si algo sale mal, "vps-rollback" vuelve a la version anterior.
+#  Aviso de actualizacion: el panel revisa tu GitHub en segundo plano (al abrirse y, con el menu
+#  abierto, cada 5 minutos). Si lo publicado es distinto de lo instalado, en el lugar de la opcion 8
+#  aparece "ACTUALIZACION DISPONIBLE >>>": al pulsarla se descarga y se instala la ultima version
+#  sin pedir el enlace, con la misma copia de seguridad y el mismo vps-rollback de siempre. No se
+#  ofrece un archivo roto, que no sea VPS PANEL o de una version menor. GitHub tarda hasta 5 minutos
+#  en servir un archivo recien subido. Sin internet no pasa nada: la opcion 8 sigue como siempre.
 #    vpspanel --backup               crear una copia ahora
 #    vpspanel --restore ARCHIVO      restaurar una copia (tambien una traida de otro VPS)
 #    vpspanel --update [ENLACE]      actualizar el panel
@@ -63,7 +69,7 @@ export VPSPANEL_ACTIVE=1
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}
 
 # ------------------------------ Configuracion -------------------------
-VERSION=3.4.1
+VERSION=3.5.0
 PREP_V=3          # version de la preparacion del sistema (se repite si cambia)
 NAME_MAX=24        # largo maximo del nombre del VPS (se muestra en el titulo)
 DEF_PASS=xxxx      # contrasena por defecto de las cuentas SSH (ENTER en el campo la escribe sola)
@@ -106,6 +112,12 @@ HELPERS_V=2                # version de vps-cleanup, vps-rollback y el cron: si 
 # Enlace RAW del instalador en tu repositorio: en ACTUALIZAR PANEL basta con ENTER. Si alguna vez
 # actualizas desde otro enlace, el panel recuerda ese (/etc/vpspanel/update.url) y lo usa primero.
 UPDATE_URL='https://raw.githubusercontent.com/kevinred09/vps-panel-happyservers/main/vps-panel.sh'
+# Aviso de version nueva: lo ultimo que se vio en GitHub se guarda en /run (se borra al reiniciar y
+# no entra en las copias de seguridad). UPD_EVERY: segundos minimos entre dos revisiones.
+UPD_EVERY=300
+UPD_DIR=${VPSPANEL_UPDDIR:-/run/vpspanel}
+UPD_AVAIL=$UPD_DIR/avail   # "sha256 version" de lo publicado (no existe si lo publicado no sirve)
+UPD_STAMP=$UPD_DIR/stamp   # su fecha es la de la ultima revision
 
 # Optimizacion de red (ver el bloque "Optimizacion de red")
 NETOPT_V=1                 # version de la optimizacion: si cambia, se vuelve a aplicar sola
@@ -3807,7 +3819,7 @@ uninstall_all() {
   rm -f /etc/letsencrypt/renewal-hooks/{pre,post,deploy}/vpspanel.sh
   systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null
   autostart_on && sed -i '/vpspanel-autostart/d' /root/.bashrc
-  rm -rf "$BASE" "$LOG_DIR"
+  rm -rf "$BASE" "$LOG_DIR" "$UPD_DIR"
   rm -f "$PANEL_BIN"
   if [[ $keep == [nN]* ]]; then
     rm -rf "$BK_DIR"
@@ -4408,7 +4420,8 @@ upd_fetch() {   # enlace|ruta destino
   esac
 }
 
-upd_check() {   # archivo  ->  0 si es un instalador valido; version en NEWV, motivo en MSG
+upd_check() {   # archivo [quick]  ->  0 si es un instalador valido; version en NEWV, motivo en MSG
+                # quick: sin la carga de prueba (la revision silenciosa nunca ejecuta lo descargado)
   local f=$1 out
   NEWV=''; MSG=''
   [[ -s $f ]] || { MSG="El archivo descargado esta vacio."; return 1; }
@@ -4418,7 +4431,7 @@ upd_check() {   # archivo  ->  0 si es un instalador valido; version en NEWV, mo
   head -n1 "$f" | grep -qE '^#!.*(bash|sh)' || { MSG="El archivo no es un script de bash (no empieza con #!)."; return 1; }
   if ! out=$(bash -n "$f" 2>&1); then MSG="El script tiene errores de sintaxis: $(head -n2 <<< "$out")"; return 1; fi
   NEWV=$(ver_of "$f")
-  if grep -q 'VPSPANEL_SOURCE_ONLY' "$f"; then   # carga de prueba: define todo sin abrir el menu
+  if [[ ${2:-} != quick ]] && grep -q 'VPSPANEL_SOURCE_ONLY' "$f"; then   # carga de prueba: define todo sin abrir el menu
     if ! out=$(cd / && VPSPANEL_SOURCE_ONLY=1 timeout 30 bash -c 'source "$1"' _ "$f" 2>&1 </dev/null); then
       MSG="El script nuevo falla al cargar: $(tail -n2 <<< "$out")"; return 1
     fi
@@ -4430,6 +4443,65 @@ upd_default() {   # enlace por defecto: el ultimo con el que se actualizo, o el 
   local d
   d=$(head -n1 "$BASE/update.url" 2>/dev/null)
   printf '%s' "${d:-$UPDATE_URL}"
+}
+
+# ---- Aviso de version nueva ("ACTUALIZACION DISPONIBLE >>>" en el menu principal) -------------
+# upd_refresh revisa en segundo plano el mismo enlace que usa ACTUALIZAR PANEL, como mucho una vez
+# cada UPD_EVERY segundos, y upd_probe deja en $UPD_AVAIL el SHA256 y la version de lo publicado.
+# upd_pending compara eso con lo instalado sin usar la red, asi dibujar el menu nunca se demora.
+# La revision solo descarga y comprueba el archivo (sintaxis y que sea VPS PANEL): no ejecuta nada
+# de lo descargado. Una version menor, un archivo roto o ajeno a VPS PANEL no se ofrecen.
+upd_probe() {   # sin pantalla ni cambios en el panel: guarda "sha256 version" de lo publicado
+  local url tmp sum
+  url=$(upd_default)
+  [[ $url == https://* ]] || return 1                          # solo se vigila un enlace https
+  mkdir -p "$UPD_DIR" 2>/dev/null && chmod 700 "$UPD_DIR" 2>/dev/null || return 1
+  tmp=$(mktemp "$UPD_DIR/probe-XXXXXX") || return 1
+  if curl -fsSL --proto '=https' --proto-redir '=https' --tlsv1.2 --connect-timeout 5 \
+       --max-time 25 --max-filesize 10485760 -o "$tmp" "$url" 2>/dev/null; then
+    if upd_check "$tmp" quick && grep -q 'VPSPANEL_ACTIVE' "$tmp"; then
+      sum=$(sha256sum "$tmp" | cut -d' ' -f1)
+      printf '%s %s\n' "$sum" "${NEWV:--}" > "$UPD_AVAIL.tmp" && mv -f "$UPD_AVAIL.tmp" "$UPD_AVAIL"
+    else
+      rm -f "$UPD_AVAIL"                                       # lo publicado no sirve: no se ofrece
+    fi
+  fi                                                           # sin internet: queda el ultimo resultado
+  rm -f "$tmp"
+  return 0
+}
+
+upd_due() {   # 0 si la ultima revision tiene mas de UPD_EVERY segundos (o no hay ninguna)
+  local t now
+  t=$(stat -c %Y "$UPD_STAMP" 2>/dev/null) || return 0
+  [[ $t =~ ^[0-9]+$ ]] || return 0
+  now=$(date +%s)
+  (( now < t || now - t >= UPD_EVERY ))
+}
+
+upd_refresh() {   # [wait]  ->  si toca, revisa GitHub en segundo plano; "wait" espera hasta 3 s
+  local i                 # (solo la primera vez) para que el aviso ya salga en la primera pantalla
+  upd_due || return 0
+  mkdir -p "$UPD_DIR" 2>/dev/null && chmod 700 "$UPD_DIR" 2>/dev/null || return 0
+  : > "$UPD_STAMP"                                             # se anota ya: no se lanza otra revision encima
+  ( upd_probe ) >/dev/null 2>&1 </dev/null &
+  UPD_PID=$!
+  if [[ ${1:-} == wait ]]; then
+    for (( i = 0; i < 30; i++ )); do kill -0 "$UPD_PID" 2>/dev/null || break; sleep 0.1; done
+  fi
+  return 0
+}
+
+upd_pending() {   # 0 si lo publicado en GitHub es distinto de lo instalado (lee lo guardado: sin red)
+  local rsum='' rver='' csum cur
+  [[ -s $UPD_AVAIL ]] && read -r rsum rver < "$UPD_AVAIL"
+  [[ $rsum =~ ^[0-9a-f]{64}$ ]] || return 1
+  csum=$(sha256sum "$PANEL_BIN" 2>/dev/null | cut -d' ' -f1)
+  [[ -n $csum && $csum != "$rsum" ]] || return 1               # igual a lo instalado (o no hay panel instalado)
+  cur=$(ver_of "$PANEL_BIN")
+  if [[ $rver =~ ^[0-9][0-9.]*$ && $cur =~ ^[0-9][0-9.]*$ ]] && ver_lt "$rver" "$cur"; then
+    return 1                                                   # lo publicado es una version anterior
+  fi
+  return 0
 }
 
 # Lo que se pega en ACTUALIZAR PANEL: el enlace solo, el comando de instalacion completo
@@ -4449,8 +4521,9 @@ upd_src() {
   printf '%s' "$s"
 }
 
-panel_update() {   # [enlace|archivo]  ->  0 = actualizado (falta abrir la version nueva); 3 = cancelado
-  local src=${1:-} def tmp c='' sum need='' cur raw
+panel_update() {   # [enlace|archivo] [si]  ->  0 = actualizado (falta abrir la version nueva); 3 = cancelado
+                   # si: sin la pregunta "ACTUALIZAR AHORA?" (lo usa ACTUALIZACION DISPONIBLE: pulsarla ya es el si)
+  local src=${1:-} yes=${2:-} def tmp c='' sum need='' cur raw
   cur=$(ver_of "$PANEL_BIN"); cur=${cur:-$VERSION}    # la instalada (otra sesion pudo actualizar ya)
   def=$(upd_default)
   if [[ -z $src ]]; then
@@ -4474,6 +4547,7 @@ panel_update() {   # [enlace|archivo]  ->  0 = actualizado (falta abrir la versi
     [[ -n $raw && $src != "$raw" ]] && info "Enlace: $src"
   else
     src=$(upd_src "$src")
+    [[ $yes == si ]] && field "ACTUAL:" "version $cur"
   fi
   log_use actualizacion "Actualizar desde $src"
   tmp=$(mktemp) || return 1
@@ -4496,7 +4570,7 @@ panel_update() {   # [enlace|archivo]  ->  0 = actualizado (falta abrir la versi
     if [[ ! -t 0 ]]; then rm -f "$tmp"; err "Sin confirmacion no se instala (usa el menu)."; return 1; fi
     rd "ESCRIBE SI PARA INSTALARLA DE TODOS MODOS: " c
     [[ $c == SI ]] || { rm -f "$tmp"; return 3; }
-  elif [[ -t 0 ]]; then
+  elif [[ -t 0 && $yes != si ]]; then
     rd "ACTUALIZAR AHORA? (S/n): " c
     [[ $c == [nN]* ]] && { rm -f "$tmp"; return 3; }
   fi
@@ -5342,7 +5416,11 @@ header() {
   printf ' %s[4]%s %s>%s %s[!]%s %sDESINSTALAR PANEL%s\n' "$GRN" "$RST" "$RED" "$RST" "$YEL" "$RST" "$RED" "$RST"
   line_dash
   item_m 5 "INSTALAR TODOS LOS PROTOCOLOS"
-  printf ' %s[8]%s %s>%s %sACTUALIZAR PANEL%s %sv%s%s\n' "$GRN" "$RST" "$RED" "$RST" "$WHT" "$RST" "$GRY" "$VERSION" "$RST"
+  if upd_pending; then                            # hay algo distinto publicado en GitHub (ver "Aviso de version nueva")
+    item_m 8 "ACTUALIZACION DISPONIBLE ${RED}>>>"
+  else
+    printf ' %s[8]%s %s>%s %sACTUALIZAR PANEL%s %sv%s%s\n' "$GRN" "$RST" "$RED" "$RST" "$WHT" "$RST" "$GRY" "$VERSION" "$RST"
+  fi
   item_m 9 "COPIAS DE SEGURIDAD"
   line_eq
   printf ' %s0)%s %sSALIR DEL VPS%s  %s6)%s %sSALIR DEL SCRIPT%s  %s7)%s %sREBOOT VPS%s\n' \
@@ -5360,9 +5438,10 @@ exit_vps() {   # cierra el panel y la sesion SSH que lo abrio
 }
 
 main_menu() {
-  local o c='' rc
+  local o c='' rc first=1
   while :; do
     bk_auto                                       # copia automatica si algo cambio
+    if (( first )); then upd_refresh wait; first=0; else upd_refresh; fi   # revisa GitHub (la 1a vez espera un poco)
     header
     ask o m || exit 0
     case $o in
@@ -5375,7 +5454,10 @@ main_menu() {
       5) sub_header "INSTALACION COMPLETA"; install_all; pause ;;
       6) cls; exit 0 ;;
       7) rd "REINICIAR EL VPS AHORA? (s/N): " c; [[ $c == [sS] ]] && { bk_auto; reboot; } ;;
-      8) sub_header "ACTUALIZAR PANEL"; panel_update; rc=$?
+      8) sub_header "ACTUALIZAR PANEL"
+         if upd_pending; then panel_update "$(upd_default)" si   # ACTUALIZACION DISPONIBLE: directo, sin pedir el enlace
+         else panel_update; fi
+         rc=$?
          (( rc == 3 )) && continue
          if (( rc == 0 )); then                   # se abre la version nueva (integra sus herramientas)
            pause; cls; exec "$PANEL_BIN"
