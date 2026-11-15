@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ======================================================================
-#  VPS PANEL v3.5.2 - instalador y administrador de protocolos para tuneles
+#  VPS PANEL v3.5.3 - instalador y administrador de protocolos para tuneles
 #  Compatible con HTTP Custom y apps similares.
 #  SSH, Dropbear, SSL, WebSocket, SOCKS Python, WS-ePro, Squid, V2Ray,
 #  BadVPN-UDPGW, UDP Custom, SlowDNS, OpenVPN, WireGuard y Psiphon
@@ -28,7 +28,9 @@
 #  ("GET / HTTP/1.1", "CF-RAY / HTTP/1.1", "HTTP/2.0  200"...), con o sin linea vacia al final (si no llega
 #  nada mas en 1 s se da por completo). Responde 101 (o 200 en SOCKS) y pasa el resto al SSH; lo binario
 #  (TLS, SOCKS5) y el banner SSH siguen directo. Al actualizar el panel, el archivo nuevo se instala solo al
-#  abrirlo (HELPERS_V); el servicio en marcha lo usa cuando se reinicia (por ejemplo: systemctl restart vps-ws).
+#  abrirlo (HELPERS_V) y los proxies (vps-ws, vps-socks, vps-wsepro, SSL) que sigan con el motor anterior se
+#  reinician solos (un corte de 1-2 s). Una VPS nueva no necesita nada: el motor se escribe antes de crear los
+#  servicios.
 #  Los puertos se cambian en Preparacion del sistema y se guardan en /etc/vpspanel/ports.conf
 #    UDPCUSTOM_URL=<url> vpspanel      (opcional) usar otro binario de udp-custom
 #    SLOWDNS_NS=<ns> vpspanel --install-all   (opcional) incluir SlowDNS sin preguntar
@@ -77,7 +79,7 @@ export VPSPANEL_ACTIVE=1
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}
 
 # ------------------------------ Configuracion -------------------------
-VERSION=3.5.2
+VERSION=3.5.3
 PREP_V=3          # version de la preparacion del sistema (se repite si cambia)
 NAME_MAX=24        # largo maximo del nombre del VPS (se muestra en el titulo)
 DEF_PASS=xxxx      # contrasena por defecto de las cuentas SSH (ENTER en el campo la escribe sola)
@@ -116,7 +118,7 @@ BK_KEEP_EV=15              # copias manuales y de antes de actualizar, restaurar
 BK_FORMAT=1                # formato de las copias (MANIFEST: format=1)
 SCRIPT_BK=$BK_DIR/scripts  # versiones anteriores del panel (vps-rollback)
 PANEL_BIN=${VPSPANEL_BIN:-/usr/local/bin/vpspanel}
-HELPERS_V=4                # version de vps-cleanup, vps-rollback, el cron y vps-proxy.py: si cambia, se reinstalan solos
+HELPERS_V=5                # version de vps-cleanup, vps-rollback, el cron y vps-proxy.py: si cambia, se reinstalan solos
 # Enlace RAW del instalador en tu repositorio: en ACTUALIZAR PANEL basta con ENTER. Si alguna vez
 # actualizas desde otro enlace, el panel recuerda ese (/etc/vpspanel/update.url) y lo usa primero.
 UPDATE_URL='https://raw.githubusercontent.com/kevinred09/vps-panel-happyservers/main/vps-panel.sh'
@@ -893,8 +895,19 @@ acct_make() {   # usuario clave fecha [hash]  ->  crea la cuenta del sistema (o 
 }
 
 # ------------------------------ Herramientas internas -----------------
+# Instala un archivo solo si cambia (asi su fecha marca la ultima version real del motor) y de una vez:
+# un servicio que arranque en ese momento nunca lee un archivo a medio escribir.
+tool_put() {   # origen destino
+  if cmp -s "$1" "$2" 2>/dev/null; then chmod 755 "$2"; return 0; fi
+  if install -m 755 "$1" "$2.new" && mv -f "$2.new" "$2"; then return 0; fi
+  rm -f "$2.new"; logln "no se pudo instalar $2 (disco lleno?): se conserva el anterior"
+  return 1
+}
+
 install_tools() {   # motor de proxy (WebSocket/SOCKS/SSL) y pruebas de conexion
-  cat > /usr/local/bin/vps-proxy.py <<'PYEOF'
+  local t
+  t=$(mktemp) || return 1
+  cat > "$t" <<'PYEOF' || { rm -f "$t"; return 1; }
 #!/usr/bin/env python3
 """vps-proxy: proxy de VPS PANEL para apps de tunel (HTTP Custom y similares).
 
@@ -1243,7 +1256,8 @@ def main():
 if __name__ == "__main__":
     main()
 PYEOF
-  cat > /usr/local/bin/vps-probe <<'PYEOF'
+  tool_put "$t" /usr/local/bin/vps-proxy.py
+  cat > "$t" <<'PYEOF' || { rm -f "$t"; return 1; }
 #!/usr/bin/env python3
 """vps-probe: pruebas de conexion reales de los protocolos de VPS PANEL (uso interno).
 
@@ -1550,7 +1564,8 @@ def main():
 if __name__ == "__main__":
     sys.exit(main())
 PYEOF
-  chmod 755 /usr/local/bin/vps-proxy.py /usr/local/bin/vps-probe
+  tool_put "$t" /usr/local/bin/vps-probe
+  rm -f "$t"
 }
 
 install_firewall() {   # vps-fw y el servicio que reaplica las reglas al arrancar
@@ -1833,10 +1848,33 @@ toggle_autodel() {
   fi
 }
 
-helpers_update() {   # instalaciones anteriores o actualizadas: vps-cleanup, vps-rollback y el cron al dia
+# Los proxies (vps-ws, vps-socks, vps-wsepro y el de SSL) cargan vps-proxy.py al arrancar. Si el archivo se
+# renovo despues de que arrancaran, siguen con el motor anterior: se reinician solo esos (un corte de 1-2 s).
+# La fecha del archivo es la de su ultimo cambio real (tool_put); se compara con la edad del proceso.
+proxy_refresh() {
+  local f=/usr/local/bin/vps-proxy.py par u r pid age fage fm
+  [[ -n ${NOSTART:-} || ! -f $f ]] && return 0
+  fm=$(stat -c %Y "$f" 2>/dev/null)
+  [[ $fm =~ ^[0-9]+$ ]] || return 0
+  fage=$(( $(date +%s) - fm ))
+  for par in vps-ws:vps-ws vps-socks:vps-socks vps-wsepro:vps-wsepro vps-sslws:vps-stunnel; do
+    u=${par%%:*}; r=${par#*:}                    # r: la unidad que se reinicia (SSL: stunnel arrastra a vps-sslws)
+    systemctl is-active --quiet "$u" 2>/dev/null || continue
+    pid=$(systemctl show -p MainPID "$u" 2>/dev/null | cut -d= -f2)
+    [[ $pid =~ ^[1-9][0-9]*$ ]] || continue
+    age=$(ps -o etimes= -p "$pid" 2>/dev/null | tr -d ' ')
+    [[ $age =~ ^[0-9]+$ ]] && (( age > fage )) || continue
+    systemctl restart "$r" >> "$LOG" 2>&1
+    logln "proxy reiniciado ($r): usaba un vps-proxy.py anterior"
+  done
+  return 0
+}
+
+helpers_update() {   # instalaciones anteriores o actualizadas: vps-cleanup, vps-rollback, el cron y el motor de los proxies
   [[ -f $BASE/.prep ]] || return 0
   [[ $(cat "$BASE/.helpers" 2>/dev/null) == "$HELPERS_V" ]] && return 0
   install_helpers >/dev/null 2>&1
+  proxy_refresh
   return 0
 }
 
