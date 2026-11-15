@@ -15,7 +15,7 @@
 #  defecto ([30], [1]...) ENTER escribe ese valor en el campo para que quede a la vista.
 #  Atajo "1.1" en el menu principal: crea al instante user1, user2, user3... (contrasena xxxx,
 #  30 dias, 1 conexion) sin preguntar nada. La secuencia se guarda en /etc/vpspanel/quick.seq.
-#  Atajo "1.2": cuentas de prueba prueba1, prueba2, prueba3... (contrasena xxx, 3 conexiones) que
+#  Atajo "1.2": cuentas de prueba prueba1, prueba2, prueba3... (contrasena xxxx, 3 conexiones) que
 #  duran 24 horas exactas desde que se crean (no hasta medianoche). La hora exacta de cada una
 #  queda en /etc/vpspanel/users.exp y la secuencia en /etc/vpspanel/test.seq.
 #  Usuarios SSH: la opcion 2 elimina varios a la vez (1,5,6,9) y la 8 elimina todos. En la 2,
@@ -88,7 +88,7 @@ QUICK_LOCK=$BASE/quick.lock  # candado: dos sesiones del panel no pueden tomar e
 
 # Atajo "1.2" del menu principal: cuentas de prueba prueba1, prueba2, prueba3... sin preguntar nada
 TEST_PREFIX=prueba         # nombre base; el numero lo pone su propia secuencia
-TEST_PASS=xxx              # contrasena fija
+TEST_PASS=xxxx             # contrasena fija
 TEST_HOURS=24              # duracion exacta en horas (24 = 1 dia): vence a esa hora, no a medianoche
 TEST_LIMIT=3               # conexiones simultaneas
 TEST_SEQ_F=$BASE/test.seq  # ultimo numero usado de prueba1, prueba2... (no se reutilizan)
