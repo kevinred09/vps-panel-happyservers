@@ -21,6 +21,9 @@
 #  Usuarios SSH: la opcion 2 elimina varios a la vez (1,5,6,9) y la 8 elimina todos. En la 2,
 #  hasta 3 usuarios (DEL_NOWARN) se borran directo, sin advertencia; con mas de 3 sale la
 #  advertencia y se esperan 3 segundos (DEL_WAIT_SEL). En la 8 la espera es de 7 (DEL_WAIT).
+#  Opcion 0: toda pantalla con opciones o preguntas muestra "[0] > VOLVER" y el 0 vuelve a la anterior
+#  sin cambiar nada (tambien en las preguntas de varios pasos: usuario, clave, dias, puertos...).
+#  En LIMITE DE CONEXIONES el 0 tambien vuelve atras: para no limitar las conexiones se escribe 999.
 #  Los puertos se cambian en Preparacion del sistema y se guardan en /etc/vpspanel/ports.conf
 #    UDPCUSTOM_URL=<url> vpspanel      (opcional) usar otro binario de udp-custom
 #    SLOWDNS_NS=<ns> vpspanel --install-all   (opcional) incluir SlowDNS sin preguntar
@@ -369,6 +372,11 @@ menu_end() {   # [texto] [estilo]  ->  pie de los submenus: "[0] > VOLVER" (boto
   line_eq
 }
 
+menu_end1() {   # como menu_end, para cuando la barra del titulo ya esta justo arriba (evita la linea doble)
+  item 0 "${1:-VOLVER}" "${2:-$BTN_RED}"
+  line_eq
+}
+
 # ---- Datos en columnas -----------------------------------------------
 pcell() { printf '%s%s:%s %s%s%s' "$RED" "$1" "$RST" "$GRN" "$2" "$RST"; }                  # ETIQUETA: puerto
 field() { printf ' %s%-*s%s %s%s%s\n' "$BLU" "$FW" "$1" "$RST" "${3:-$WHT}" "$2" "$RST"; }  # ETIQUETA valor [color]
@@ -412,6 +420,13 @@ rd_def() {   # texto variable defecto  ->  pregunta; ENTER en el campo vacio esc
   printf -v "$2" '%s' "$v"
 }
 rd_pass() { rd_def "$1" "$2" "$DEF_PASS"; }   # contrasena: ENTER escribe xxxx
+
+# Entradas con 0 = volver: devuelven 3 si se escribe 0 (o se cierra la entrada). Los menus no piden
+# ENTER cuando una accion devuelve 3: vuelven directo a la pantalla anterior sin cambiar nada.
+# Igual que rd y rd_def, la variable destino no puede llamarse "p" (rd0) ni "t" o "v" (rd_def0).
+rd0()      { rd "$@" || return 3; [[ ${!2} == 0 ]] && return 3; return 0; }
+rd_def0()  { rd_def "$@" || return 3; [[ ${!2} == 0 ]] && return 3; return 0; }
+rd_pass0() { rd_def0 "$1" "$2" "$DEF_PASS"; }
 
 ask() {   # variable [estilo]  ->  pide la opcion del menu (los numeros se normalizan: 01 pasa a 1)
   local r txt='Seleccione una Opcion:' col=$WHT
@@ -2263,7 +2278,7 @@ inst_slowdns() {
   cur=$(cat "$BASE/slowdns/ns" 2>/dev/null)
   if [[ -n ${SLOWDNS_NS:-} ]]; then ns=$SLOWDNS_NS
   else
-    rd "NameServer (NS) del dominio, ej. ns.midominio.com${cur:+ [$cur]}: " ns
+    rd0 "NameServer (NS) del dominio, ej. ns.midominio.com${cur:+ [$cur]}: " ns || return 3
     ns=${ns:-$cur}
   fi
   [[ $ns =~ ^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]] || { err "NameServer invalido"; return 1; }
@@ -2506,7 +2521,7 @@ wg_clients() { awk '/^### Client /{print $3}' "$WG_CONF" 2>/dev/null; }
 wg_add() {
   local n ip i used spub cpriv psk f
   [[ -f $WG_CONF ]] || { err "WireGuard no esta instalado."; return 1; }
-  rd "NOMBRE DEL CLIENTE: " n
+  rd0 "NOMBRE DEL CLIENTE: " n || return 3
   [[ $n =~ ^[A-Za-z0-9_-]{1,15}$ ]] || { err "Nombre invalido (1-15 caracteres: letras, numeros, _ -)"; return 1; }
   wg_clients | grep -qx "$n" && { err "El cliente ya existe"; return 1; }
   used=$(grep -oE "AllowedIPs *= *${WG_NET//./\\.}\.[0-9]+" "$WG_CONF" | awk -F. '{print $NF}')
@@ -2552,7 +2567,7 @@ wg_del() {
   [[ -f $WG_CONF ]] || { err "WireGuard no esta instalado."; return 1; }
   wg_clients | grep -q . || { warn "No hay clientes"; return 1; }
   printf ' %s%s%s\n' "$LYE" "$(wg_clients | paste -sd' ' -)" "$RST"
-  rd "CLIENTE A ELIMINAR: " n
+  rd0 "CLIENTE A ELIMINAR: " n || return 3
   [[ -n $n ]] && wg_clients | grep -qx "$n" || { err "Cliente no encontrado"; return 1; }
   t=$(mktemp)
   awk -v n="$n" '/^### Client /{skip = ($3 == n)} !skip' "$WG_CONF" > "$t" && cat "$t" > "$WG_CONF"
@@ -2569,7 +2584,8 @@ wg_list() {
     printf ' %s%-16s%s %s\n' "$WHT" "$n" "$RST" \
       "$(awk -v n="$n" '/^### Client /{c = ($3 == n)} c && /^AllowedIPs/{print $3; exit}' "$WG_CONF")"
   done < <(wg_clients)
-  rd "VER LA CONFIGURACION DE (ENTER = ninguno): " sel
+  rd "VER LA CONFIGURACION DE (ENTER = ninguno, 0 = volver): " sel
+  [[ $sel == 0 ]] && return 3
   [[ -n $sel ]] && wg_print "$sel"
   return 0
 }
@@ -2645,11 +2661,11 @@ ssh_create() {
   [[ -n $u && $u != 0 ]] || return 3
   valid_name "$u" || { err "Usuario invalido (3-31 caracteres: a-z 0-9 _ -)"; return 1; }
   if id "$u" >/dev/null 2>&1; then err "El usuario ya existe"; return 1; fi
-  rd_pass "CONTRASENA:" p || return 1
+  rd_pass0 "CONTRASENA:" p || return 3
   [[ $p != *"|"* && -n $p ]] || { err "La contrasena no puede contener '|'"; return 1; }
-  rd_def "DIAS DE VALIDEZ [30]:" d 30 || return 3
+  rd_def0 "DIAS DE VALIDEZ [30]:" d 30 || return 3
   [[ $d =~ ^[0-9]+$ ]] || { err "Dias invalidos"; return 1; }
-  rd_def "LIMITE DE CONEXIONES [1]:" l 1 || return 3
+  rd_def0 "LIMITE DE CONEXIONES [1] (999 = SIN LIMITE):" l 1 || return 3
   [[ $l =~ ^[0-9]+$ ]] || { err "Limite invalido"; return 1; }
   exp=$(date -d "+$d days" +%F)
   useradd -M -s /bin/false -e "$exp" "$u" || { err "No se pudo crear el usuario"; return 1; }
@@ -2873,6 +2889,7 @@ ssh_confirm_delete() {   # all|sel  nombres...
   warn "Esta accion NO se puede deshacer."
   echo
   warn_wait "$secs"
+  menu_end VOLVER "$BTN_REDW"
   if [[ $mode == all ]]; then
     rd "ESCRIBE SI PARA ELIMINAR TODAS LAS CUENTAS: " c || return 3
     [[ $c == SI ]] || return 3
@@ -2963,7 +2980,7 @@ ssh_renew() {
   pick_account "$USERDB" || return $?
   u=$PICK
   valid_name "$u" && grep -q "^${u}|" "$USERDB" || { err "Usuario no encontrado"; return 1; }
-  rd_def "DIAS DESDE HOY PARA $u [30]:" d 30 || return 3
+  rd_def0 "DIAS DESDE HOY PARA $u [30]:" d 30 || return 3
   [[ $d =~ ^[0-9]+$ ]] || { err "Dias invalidos"; return 1; }
   exp=$(date -d "+$d days" +%F)
   # al renovar, una cuenta de prueba pasa a ser normal (vence por fecha, ya no a una hora exacta)
@@ -2972,9 +2989,11 @@ ssh_renew() {
 
 ssh_passwd() {
   local u p
-  rd "USUARIO: " u
+  menu_end1 VOLVER "$BTN_REDW"
+  rd0 "USUARIO: " u || return 3
+  [[ -n $u ]] || return 3
   valid_name "$u" && grep -q "^${u}|" "$USERDB" || { err "Usuario no encontrado"; return 1; }
-  rd_pass "NUEVA CONTRASENA:" p || return 1
+  rd_pass0 "NUEVA CONTRASENA:" p || return 3
   [[ $p != *"|"* && -n $p ]] || { err "La contrasena no puede contener '|'"; return 1; }
   echo "$u:$p" | chpasswd && db_set "$u" 2 "$p" && ok "Nueva contrasena de $u: $p"
 }
@@ -3015,7 +3034,7 @@ v2_renew() {
   pick_account "$V2DB" || return $?
   n=$PICK
   valid_name "$n" && grep -q "^${n}|" "$V2DB" || { err "Cuenta no encontrada"; return 1; }
-  rd_def "DIAS DESDE HOY PARA $n [30]:" d 30 || return 1
+  rd_def0 "DIAS DESDE HOY PARA $n [30]:" d 30 || return 3
   [[ $d =~ ^[0-9]+$ ]] || { err "Dias invalidos"; return 1; }
   exp=$(date -d "+$d days" +%F)
   db_filter "$V2DB" env U="$n" V="$exp" awk -F'|' -v OFS='|' '$1==ENVIRON["U"]{$3=ENVIRON["V"]}1' \
@@ -3156,9 +3175,13 @@ cfg_banner() {
   menu_end
   ask o || return 3
   case $o in
-    1) echo " Escribe el banner (HTML permitido). Linea vacia para terminar:"
+    1) echo " Escribe el banner (HTML permitido). Linea vacia para terminar (0 = volver):"
        txt=""
-       while IFS= read -r l; do [[ -z $l ]] && break; txt+="$l"$'\n'; done
+       while IFS= read -r l; do
+         [[ -z $l ]] && break
+         [[ -z $txt && $l == 0 ]] && return 3
+         txt+="$l"$'\n'
+       done
        [[ -n $txt ]] || { err "Banner vacio"; return 1; }
        printf '%s' "$txt" > "$BANNER"
        banner_apply
@@ -3588,13 +3611,15 @@ menu_netopt() {   # PREPARACION DEL SISTEMA > OPTIMIZAR RED
       1) sub_header "OPTIMIZACION DE RED"
          if is_on udp || is_on badvpn; then
            info "UDP Custom y BadVPN se reinician: sus usuarios se reconectan solos."
+           menu_end
            rd "APLICAR AHORA? (S/n): " c
-           [[ $c == [nN]* ]] && continue
+           [[ $c == [nN0]* ]] && continue
          fi
          netopt_apply ;;
       2) sub_header "VELOCIDAD DEL VPS"; net_speed ;;
       3) netopt_on || continue
          sub_header "VALORES ORIGINALES"
+         menu_end1
          rd "QUITAR LA OPTIMIZACION Y VOLVER A LOS VALORES DEL SISTEMA? (s/N): " c
          [[ $c == [sS]* ]] || continue
          netopt_revert
@@ -3610,7 +3635,8 @@ menu_netopt() {   # PREPARACION DEL SISTEMA > OPTIMIZAR RED
 
 cfg_swap() {
   local s
-  rd_def "Tamano de swap en MB [1024]:" s 1024 || return 1
+  menu_end1
+  rd_def0 "Tamano de swap en MB [1024]:" s 1024 || return 3
   [[ $s =~ ^[0-9]+$ ]] || { err "Tamano invalido"; return 1; }
   swapoff /swapfile 2>/dev/null; rm -f /swapfile
   fallocate -l "${s}M" /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count="$s" status=none
@@ -3632,8 +3658,9 @@ cfg_cache() {
 
 cfg_dns() {
   local d1 d2
-  rd_def "DNS primario [1.1.1.1]:" d1 1.1.1.1 || return 1
-  rd_def "DNS secundario [8.8.8.8]:" d2 8.8.8.8 || return 1
+  menu_end1
+  rd_def0 "DNS primario [1.1.1.1]:" d1 1.1.1.1 || return 3
+  rd_def0 "DNS secundario [8.8.8.8]:" d2 8.8.8.8 || return 3
   if systemctl is-active --quiet systemd-resolved; then
     mkdir -p /etc/systemd/resolved.conf.d
     printf '[Resolve]\nDNS=%s %s\n' "$d1" "$d2" > /etc/systemd/resolved.conf.d/vpspanel.conf
@@ -3649,7 +3676,8 @@ cfg_domain() {
   ensure_base || return 1
   log_use dominio "Dominio y certificado"
   local d rc
-  rd "Dominio (vacio = certificado autofirmado con la IP): " d
+  menu_end1
+  rd0 "Dominio (vacio = certificado autofirmado con la IP): " d || return 3
   if [[ -z $d ]]; then
     rm -f "$DOMAIN_F"
     mk_selfsigned "$IP"
@@ -3705,6 +3733,10 @@ EOF
 }
 
 cfg_root() {
+  local c
+  info "Se activa el acceso root por contrasena y se cambia su clave."
+  menu_end
+  rd0 "ENTER PARA CONTINUAR: " c || return 3
   cat > /etc/ssh/sshd_config.d/01-vpspanel-root.conf <<EOF
 PermitRootLogin yes
 EOF
@@ -3779,15 +3811,17 @@ uninstall_all() {
   local c='' s u p keep=''
   warn "Se eliminaran el panel y sus servicios."
   warn "Tambien se borraran las cuentas SSH."
+  menu_end
   rd "ESCRIBE SI PARA CONTINUAR: " c
-  [[ $c == SI ]] || return 0
+  [[ $c == SI ]] || return 3
   # copia final: si se conservan las copias, al instalar el panel otra vez los usuarios vuelven solos
   if bk_snap antes-de-desinstalar; then [[ -n $BK_LAST ]] && ok "Copia de seguridad final: $BK_LAST"
   else warn "No se pudo crear la copia final (quedan las anteriores)."; fi
   echo
   info "Con las copias, al instalar de nuevo el panel"
   info "vuelven solos los usuarios y la configuracion."
-  rd "CONSERVAR LAS COPIAS DE SEGURIDAD? (S/n): " keep
+  menu_end
+  rd0 "CONSERVAR LAS COPIAS DE SEGURIDAD? (S/n): " keep || return 3
   NO_AUTOBK=1                                    # desde aqui no se crean mas copias automaticas
   netopt_on && netopt_revert >/dev/null 2>&1     # el kernel y la red vuelven a los valores que tenian
   while IFS='|' read -r u p _; do
@@ -4141,6 +4175,7 @@ bk_restore() {   # archivo [si]  ->  restaura una copia (pide confirmacion salvo
   info "y limite); las actuales que no esten se conservan."
   info "Antes se guarda el estado actual para deshacerlo."
   if [[ $yes != si ]]; then
+    menu_end
     rd "ESCRIBE SI PARA RESTAURAR: " c
     [[ $c == SI ]] || { rm -rf "$BK_TMP"; return 3; }
   fi
@@ -4227,7 +4262,7 @@ menu_backup() {
       3) sub_header "RESTAURAR DESDE UN ARCHIVO"
          echo " Sube el archivo .tar.gz al VPS (SFTP) y escribe su ruta,"
          echo " por ejemplo: /root/vpspanel-20261114-031500-manual.tar.gz"
-         echo
+         menu_end
          rd "RUTA DEL ARCHIVO: " path || continue
          [[ -n $path && $path != 0 ]] || continue
          sub_header "RESTAURAR DESDE UN ARCHIVO"
@@ -4313,8 +4348,10 @@ data_check() {   # base de cuentas y cuentas del sistema en orden; si no, ofrece
     warn "${#lost[@]} cuentas siguen en el servidor. Se pueden"
     warn "recuperar desde la ultima copia:"
     names_grid 9 "${lost[@]}"
+    echo " Con 0 se omite: se vuelve a preguntar al abrir el panel."
+    menu_end OMITIR
     rd "RECUPERAR LA LISTA DESDE LA COPIA? (S/n): " c
-    if [[ $c != [nN]* ]]; then
+    if [[ $c != [nN0]* ]]; then
       tmp=$(mktemp)
       tar -xzOf "$f" vpspanel-backup/base/users.db 2>/dev/null |
         awk -F'|' -v list="|$(IFS='|'; printf '%s' "${lost[*]}")|" 'index(list, "|" $1 "|") > 0' > "$tmp"
@@ -4333,8 +4370,12 @@ data_check() {   # base de cuentas y cuentas del sistema en orden; si no, ofrece
     names_grid 9 "${gone[@]}"
     echo " S = volver a crearlas (misma contrasena, vencimiento y limite)"
     echo " N = quitarlas de la lista del panel"
+    echo " Con 0 se omite: se vuelve a preguntar al abrir el panel."
+    menu_end OMITIR
     rd "VOLVER A CREARLAS? (S/n): " c
-    if [[ $c == [nN]* ]]; then
+    if [[ $c == 0 ]]; then
+      :                                              # omitir: no se cambia nada
+    elif [[ $c == [nN]* ]]; then
       t=$(IFS='|'; printf '%s' "${gone[*]}")
       db_filter "$USERDB" awk -F'|' -v list="|$t|" 'index(list, "|" $1 "|") == 0'
       [[ -s $PX_DB ]] && db_filter "$PX_DB" awk -F'|' -v list="|$t|" 'index(list, "|" $1 "|") == 0'
@@ -4539,7 +4580,7 @@ panel_update() {   # [enlace|archivo] [si]  ->  0 = actualizado (falta abrir la 
     fi
     echo " Usuarios y configuracion se conservan; antes se guarda una"
     echo " copia de todo."
-    echo
+    menu_end
     rd "ENLACE: " raw || return 3
     src=$(upd_src "$raw")
     [[ -z $src ]] && src=$def
@@ -4568,11 +4609,13 @@ panel_update() {   # [enlace|archivo] [si]  ->  0 = actualizado (falta abrir la 
   fi
   if [[ -n $need ]]; then
     if [[ ! -t 0 ]]; then rm -f "$tmp"; err "Sin confirmacion no se instala (usa el menu)."; return 1; fi
+    menu_end
     rd "ESCRIBE SI PARA INSTALARLA DE TODOS MODOS: " c
     [[ $c == SI ]] || { rm -f "$tmp"; return 3; }
   elif [[ -t 0 && $yes != si ]]; then
+    menu_end
     rd "ACTUALIZAR AHORA? (S/n): " c
-    [[ $c == [nN]* ]] && { rm -f "$tmp"; return 3; }
+    [[ $c == [nN0]* ]] && { rm -f "$tmp"; return 3; }
   fi
   # 1) copia de los datos y de la version actual: sin ellas no se actualiza
   if ! bk_snap antes-de-actualizar; then rm -f "$tmp"; err "No se pudo crear la copia de seguridad: no se actualiza."; return 1; fi
@@ -4597,6 +4640,7 @@ panel_rollback() {   # vuelve a la version anterior del panel (vps-rollback); 3 
   /usr/local/bin/vps-rollback --list
   echo
   info "Usuarios y configuracion no cambian."
+  menu_end "VOLVER AL MENU"
   rd "VOLVER A LA VERSION ANTERIOR? (s/N): " c
   [[ $c == [sS]* ]] || return 3
   /usr/local/bin/vps-rollback
@@ -4623,10 +4667,11 @@ register_vps() {
       echo " Presiona ENTER para conservarlo."
     fi
     echo " Maximo $NAME_MAX caracteres (letras, numeros, . _ -)"
-    echo
+    if (( first )); then echo; else menu_end; fi         # con un nombre ya registrado se puede volver (0)
     rd "NOMBRE DEL VPS: " name || { err "No hay entrada disponible"; return 1; }
     read -ra w <<< "$name"; name="${w[*]:-}"            # quita espacios sobrantes
     if [[ -z $name && -n $cur ]]; then return 0; fi
+    if (( ! first )) && [[ $name == 0 ]]; then return 3; fi
     if ! name_check "$name"; then
       warn "$MSG"; sleep 2; continue
     fi
@@ -4635,8 +4680,9 @@ register_vps() {
     echo
     brand "$name"
     echo
+    menu_end
     rd "CONFIRMAR ESTE NOMBRE? [S/n]: " ans || return 1
-    [[ $ans == [nN]* ]] && continue
+    [[ $ans == [nN0]* ]] && continue
     printf '%s\n' "$name" > "$NAME_F"
     [[ -s $REG_F ]] || date +%d/%m/%Y > "$REG_F"
     echo
@@ -4794,12 +4840,14 @@ install_all() {
       line_eq
       item 1 "INSTALAR AHORA"
       item 2 "CAMBIAR PUERTOS"
-      menu_end CANCELAR
+      menu_end VOLVER
       ask a || return 1
       case $a in
         1) break ;;
-        2) sub_header "CAMBIAR PUERTOS"; ports_wizard; pause; sub_header "INSTALACION COMPLETA" ;;
-        0) return 0 ;;
+        2) sub_header "CAMBIAR PUERTOS"
+           ports_wizard && pause                 # 0 = volver: sin pedir ENTER
+           sub_header "INSTALACION COMPLETA" ;;
+        0) return 3 ;;
         *) sub_header "INSTALACION COMPLETA" ;;
       esac
     done
@@ -4886,7 +4934,7 @@ menu_ssh() {
       4) sub_header "ELIMINAR USUARIOS VENCIDOS";     /usr/local/bin/vps-cleanup && ok "Usuarios vencidos eliminados" ;;
       5) sub_header "DETALLES DE TODOS USUARIOS";     ssh_list ;;
       6) sub_header "MONITOR DE USUARIOS CONECTADOS"; ssh_online ;;
-      7) sub_header "CAMBIAR CONTRASENA";             ssh_passwd ;;
+      7) sub_header "CAMBIAR CONTRASENA";             ssh_passwd; [[ $? == 3 ]] && continue ;;
       8) sub_header "ELIMINAR TODOS LOS USUARIOS";    ssh_delete_all; [[ $? == 3 ]] && continue ;;
       0) return ;;
       *) continue ;;
@@ -4899,10 +4947,12 @@ menu_ssh() {
 v2_create() {
   v2_need || return 1
   local n d id exp
-  rd "NOMBRE DE LA CUENTA: " n
+  menu_end1 VOLVER "$BTN_REDW"
+  rd0 "NOMBRE DE LA CUENTA: " n || return 3
+  [[ -n $n ]] || return 3
   valid_name "$n" || { err "Nombre invalido (3-31 caracteres: a-z 0-9 _ -)"; return 1; }
   if grep -q "^${n}|" "$V2DB"; then err "La cuenta ya existe"; return 1; fi
-  rd_def "DIAS DE VALIDEZ [30]:" d 30 || return 1
+  rd_def0 "DIAS DE VALIDEZ [30]:" d 30 || return 3
   [[ $d =~ ^[0-9]+$ ]] || { err "Dias invalidos"; return 1; }
   id=$(cat /proc/sys/kernel/random/uuid)
   exp=$(date -d "+$d days" +%F)
@@ -4950,7 +5000,7 @@ menu_v2() {
     menu_end VOLVER "$BTN_REDW"
     ask o u || return
     case $o in
-      1) sub_header "NUEVA CUENTA V2RAY";        v2_create ;;
+      1) sub_header "NUEVA CUENTA V2RAY";        v2_create; [[ $? == 3 ]] && continue ;;
       2) sub_header "REMOVER CUENTA V2RAY";      v2_delete; [[ $? == 3 ]] && continue ;;
       3) sub_header "RENOVAR CUENTA V2RAY";      v2_renew;  [[ $? == 3 ]] && continue ;;
       4) sub_header "DETALLES DE CUENTAS V2RAY"; v2_list ;;
@@ -5099,7 +5149,7 @@ apply_chain() {   # clave -> la aplica y tambien a los que dependen de su puerto
 
 proto_port() {   # clave
   local k=$1 v cur; cur=$(pget "$k")
-  rd "Nuevo puerto para ${k^^} [$cur]: " v || return 1
+  rd0 "Nuevo puerto para ${k^^} [$cur]: " v || return 3
   [[ -z $v ]] && { info "Sin cambios"; return 0; }
   port_check "$k" "$v" || { err "$MSG"; return 1; }
   [[ $PCHK == "$cur" ]] && { info "Sin cambios"; return 0; }
@@ -5108,17 +5158,24 @@ proto_port() {   # clave
   if proto_installed "$k"; then info "Aplicando (se reinician los servicios afectados)..."; apply_chain "$k"; fi
 }
 
-ports_wizard() {   # pregunta el puerto de cada protocolo; ENTER conserva el actual
-  local k v cur
+ports_wizard() {   # pregunta el puerto de cada protocolo; ENTER conserva el actual; 0 vuelve sin guardar (3)
+  local k v cur r
   local -a ch=()
-  printf '\n %sENTER = conservar el valor actual.%s\n\n' "$BLU" "$RST"
+  local -A was=()
+  printf '\n %sENTER = conservar el valor actual.%s\n' "$BLU" "$RST"
+  printf ' %s0 = volver sin guardar los cambios.%s\n' "$BLU" "$RST"
+  menu_end
   for k in "${PORT_KEYS[@]}"; do
     cur=$(pget "$k")
     while :; do
       rd "$(printf '%-10s' "${k^^}") [$cur]: " v || return 1
+      if [[ $v == 0 ]]; then                    # volver: lo cambiado en esta pantalla queda como estaba
+        for r in "${ch[@]}"; do port_set "$r" "${was[$r]}"; done
+        return 3
+      fi
       [[ -z $v ]] && break
       if port_check "$k" "$v"; then
-        [[ $PCHK != "$cur" ]] && { port_set "$k" "$PCHK"; cur=$PCHK; ch+=("$k"); }
+        [[ $PCHK != "$cur" ]] && { was[$k]=$cur; port_set "$k" "$PCHK"; cur=$PCHK; ch+=("$k"); }
         break
       fi
       warn "$MSG"
@@ -5131,8 +5188,9 @@ ports_wizard() {   # pregunta el puerto de cada protocolo; ENTER conserva el act
 
 ports_reset() {
   local k c
+  menu_end1
   rd "Restaurar los puertos por defecto? (s/N): " c
-  [[ $c == [sS] ]] || return 0
+  [[ $c == [sS] ]] || return 3
   for k in "${PORT_KEYS[@]}"; do printf -v "${PVAR[$k]}" '%s' "${PDEF[$k]}"; done
   V2PATH=/v2ray
   save_ports
@@ -5144,7 +5202,7 @@ ports_reset() {
 v2_path_set() {
   local np=''   # no puede llamarse "p": rd usa una variable local con ese nombre y la respuesta se perdia
   proto_installed v2ray || { err "V2Ray no esta instalado."; return 1; }
-  rd "Nuevo path de V2Ray [$V2PATH]: " np
+  rd0 "Nuevo path de V2Ray [$V2PATH]: " np || return 3
   [[ -z $np ]] && { info "Sin cambios"; return 0; }
   [[ $np == /* ]] || np="/$np"
   [[ $np =~ ^/[A-Za-z0-9._~/-]{1,40}$ ]] || { err "Path invalido (letras, numeros y . _ ~ - /)"; return 1; }
@@ -5158,7 +5216,7 @@ slowdns_ns() {
   local ns
   [[ -x /usr/local/bin/dnstt-server ]] || { err "SlowDNS no esta instalado."; return 1; }
   info "NameServer actual: $(cat "$BASE/slowdns/ns" 2>/dev/null || echo -)"
-  rd "Nuevo NameServer (NS), ej. ns.midominio.com: " ns
+  rd0 "Nuevo NameServer (NS), ej. ns.midominio.com: " ns || return 3
   [[ $ns =~ ^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]] || { err "NameServer invalido"; return 1; }
   echo "$ns" > "$BASE/slowdns/ns"
   log_use slowdns "Cambiar NameServer"
@@ -5222,6 +5280,7 @@ proto_menu() {   # clave nombre   (administrador de un protocolo)
       diag)      sub_header "DIAGNOSTICO: $nm"; proto_diag "$k" ;;
       uninstall) proto_uninstall "$k"; [[ $? == 3 ]] && continue ;;
     esac
+    [[ $? == 3 ]] && continue                   # 0 = volver dentro de la accion: sin pedir ENTER
     pause
   done
 }
@@ -5321,6 +5380,7 @@ menu_system() {   # PREPARACION DEL SISTEMA: puertos activos, protocolos y confi
           fi
           continue ;;
     esac
+    [[ $? == 3 ]] && continue                   # 0 = volver dentro de la accion: sin pedir ENTER
     pause
   done
 }
@@ -5450,10 +5510,11 @@ main_menu() {
       1.2) sub_header "CREAR USUARIO DE PRUEBA"; test_user; pause ;;
       2) menu_v2 ;;
       3) ensure_base; menu_system ;;
-      4) sub_header "DESINSTALAR PANEL"; uninstall_all; pause ;;
-      5) sub_header "INSTALACION COMPLETA"; install_all; pause ;;
+      4) sub_header "DESINSTALAR PANEL"; uninstall_all; [[ $? == 3 ]] && continue; pause ;;
+      5) sub_header "INSTALACION COMPLETA"; install_all; [[ $? == 3 ]] && continue; pause ;;
       6) cls; exit 0 ;;
-      7) rd "REINICIAR EL VPS AHORA? (s/N): " c; [[ $c == [sS] ]] && { bk_auto; reboot; } ;;
+      7) sub_header "REINICIAR VPS"; menu_end1
+         rd "REINICIAR EL VPS AHORA? (s/N): " c; [[ $c == [sS] ]] && { bk_auto; reboot; } ;;
       8) sub_header "ACTUALIZAR PANEL"
          if upd_pending; then panel_update "$(upd_default)" si   # ACTUALIZACION DISPONIBLE: directo, sin pedir el enlace
          else panel_update; fi
