@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ======================================================================
-#  VPS PANEL v3.6.0 - instalador y administrador de protocolos para tuneles
+#  VPS PANEL v3.6.1 - instalador y administrador de protocolos para tuneles
 #  Compatible con HTTP Custom y apps similares.
 #  SSH, Dropbear, SSL, WebSocket, SOCKS Python, WS-ePro, Squid, V2Ray,
 #  BadVPN-UDPGW, UDP Custom, SlowDNS, OpenVPN, WireGuard y Psiphon
@@ -87,6 +87,10 @@
 #  Al actualizar desde una version anterior estos ajustes se aplican solos a lo ya instalado: cada
 #  servicio que cambia se reinicia una vez (sus usuarios se reconectan).
 #
+#  3.6.1: con varias sesiones abiertas solo una aplica cambios a la vez (la otra espera), lo que
+#  corrige el aviso "cannot stat health.list.tmp". El diagnostico de red cuenta las perdidas UDP
+#  despues de reiniciar los servicios y, con la CPU llena, muestra que programas la usan.
+#
 #  Interfaz: replica el panel de referencia (colores RGB exactos, lineas de 53
 #  columnas). Todo el aspecto visual esta en el bloque "Interfaz".
 #    VPSPANEL_COLOR=256 vpspanel       terminal sin colores de 24 bits (aproximado)
@@ -100,7 +104,7 @@ export VPSPANEL_ACTIVE=1
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}
 
 # ------------------------------ Configuracion -------------------------
-VERSION=3.6.0
+VERSION=3.6.1
 PREP_V=3          # version de la preparacion del sistema (se repite si cambia)
 NAME_MAX=24        # largo maximo del nombre del VPS (se muestra en el titulo)
 DEF_PASS=xxxx      # contrasena por defecto de las cuentas SSH (ENTER en el campo la escribe sola)
@@ -754,8 +758,9 @@ fw_ports_of() {   # clave -> lineas puerto/proto que deben quedar abiertas
 # Lista de servicios que revisa el vigilante (vps-probe watch): "unidad|prueba|puerto|dato". Solo
 # actua sobre los habilitados: lo que se detiene desde el panel queda detenido.
 health_sync() {
-  local k t x f=$BASE/health.list
+  local k t x tmp f=$BASE/health.list
   [[ -d $BASE ]] || return 0
+  tmp=$(mktemp "$BASE/.tmp-XXXXXX") || return 0   # nombre propio: otra sesion puede estar escribiendo
   {
     if systemctl cat ssh >/dev/null 2>&1; then echo 'ssh|failed|0|'; else echo 'sshd|failed|0|'; fi
     for k in "${PROTO_KEYS[@]}"; do
@@ -778,7 +783,8 @@ health_sync() {
       echo "$(svc_unit "$k")|$t|$(svc_port "$k")|$x"
     done
     echo 'vps-firewall|failed|0|'
-  } > "$f.tmp" 2>/dev/null && mv -f "$f.tmp" "$f"
+  } > "$tmp" 2>/dev/null && chmod 644 "$tmp" && mv -f "$tmp" "$f"
+  [[ -e $tmp ]] && rm -f "$tmp"                    # solo si no se pudo escribir
   return 0
 }
 
@@ -974,6 +980,29 @@ mkunit() { # nombre descripcion exec [directivas extra de [Service]] [directivas
   } > "/etc/systemd/system/$name.service"
   systemctl daemon-reload
   svc_restart "$name"
+}
+
+# ---- Una sola sesion del panel a la vez cambia la instalacion ------------------------
+# Con el auto-inicio cada conexion SSH abre el panel: dos sesiones podian aplicar a la vez la
+# optimizacion o los ajustes de una version nueva y reiniciar los mismos servicios (3.6.1: la
+# segunda espera). No se pide nada por pantalla mientras se tiene el candado.
+panel_lock() {   # se puede anidar; cada panel_lock lleva su panel_unlock
+  PANEL_DEPTH=$(( ${PANEL_DEPTH:-0} + 1 ))
+  (( PANEL_DEPTH == 1 )) || return 0
+  run_dir && { exec {PANEL_FD}> "$RUN_DIR/panel.lock"; } 2>/dev/null || return 0   # sin candado: se sigue
+  flock -n "$PANEL_FD" && return 0
+  info "Otra sesion del panel esta aplicando cambios: esperando a que termine..."
+  flock -w "${PANEL_WAIT:-300}" "$PANEL_FD" || warn "La otra sesion tarda demasiado: se continua."
+  return 0
+}
+
+panel_unlock() {
+  (( ${PANEL_DEPTH:-0} > 0 )) || return 0
+  PANEL_DEPTH=$(( PANEL_DEPTH - 1 ))
+  (( PANEL_DEPTH == 0 )) && [[ -n ${PANEL_FD:-} ]] || return 0
+  flock -u "$PANEL_FD"               # libera aunque algun programa lanzado haya heredado el candado
+  exec {PANEL_FD}>&-
+  PANEL_FD=''
 }
 
 # ---- Bases de cuentas (users.db, v2ray.db, users.exp): escritura segura --------------
@@ -4360,6 +4389,7 @@ rps_state() {   # si | no | na (no hace falta: un nucleo o tarjeta con varias co
 netopt_apply() {   # [quiet]
   local quiet=${1:-} k v m cur tgt hs b
   local -a conf=() badk=()
+  panel_lock
   NETOPT_BUF=''                    # cambiaron los buffers UDP: UDP Custom se reinicia para usarlos
   log_use red "Optimizacion de red"
   NETOPT_OK=0; NETOPT_BAD=0
@@ -4420,6 +4450,9 @@ netopt_apply() {   # [quiet]
   if proxy_installed && ! uvloop_ok && uvloop_install; then
     systemctl try-restart vps-ws vps-socks vps-wsepro vps-stunnel >> "$LOG" 2>&1
   fi
+  # las perdidas se cuentan desde aqui: sin los paquetes caidos mientras se reiniciaban los servicios
+  echo "$(net_drops) $(date +%s)" > "$BASE/.netopt.base"
+  panel_unlock
   return 0
 }
 
@@ -4455,11 +4488,16 @@ netopt_revert() {   # vuelve a los valores que tenia el sistema antes de la opti
   return 0
 }
 
+netopt_due() {   # 0 si falta aplicarla (primera vez o version nueva) y el administrador no la deshizo
+  [[ ! -f $BASE/netopt.off && $(cat "$BASE/.netopt" 2>/dev/null) != "$NETOPT_V" ]]
+}
+
 netopt_update() {   # [quiet]  ->  la aplica sola la primera vez o cuando cambia su version
   local -a act=()
-  [[ -f $BASE/netopt.off ]] && return 0                       # el administrador la deshizo
-  [[ $(cat "$BASE/.netopt" 2>/dev/null) == "$NETOPT_V" ]] && return 0
-  if [[ -n ${1:-} || ! -t 0 || ! -t 1 ]]; then netopt_apply quiet; return 0; fi
+  netopt_due || return 0
+  panel_lock
+  netopt_due || { panel_unlock; return 0; }                   # la aplico otra sesion mientras se esperaba
+  if [[ -n ${1:-} || ! -t 0 || ! -t 1 ]]; then netopt_apply quiet; panel_unlock; return 0; fi
   is_on udp && act+=("UDP Custom"); is_on badvpn && act+=("BadVPN")
   cls
   title "OPTIMIZACION DE RED" "$GRN"
@@ -4472,6 +4510,7 @@ netopt_update() {   # [quiet]  ->  la aplica sola la primera vez o cuando cambia
   esac
   echo
   netopt_apply
+  panel_unlock                                                # la pausa no hace esperar a otras sesiones
   echo
   netopt_diag
   pause
@@ -4484,15 +4523,34 @@ udp_skmem() {   # puerto  ->  "buffer descartes" del socket UDP que escucha en e
   printf '%s %s\n' "$(sed -n 's/.*rb\([0-9]*\).*/\1/p' <<< "$s")" "$(sed -n 's/.*,d\([0-9]*\).*/\1/p' <<< "$s")"
 }
 
-cpu_sample() {   # -> "uso% robado%" medidos durante 1 segundo
+cpu_top() {   # total irq antes despues (/proc/N/stat)  ->  "programa 40%, programa 20%" (desde el 5%)
+  { printf '%s\n' "$3"; echo ::; printf '%s\n' "$4"; } | awk -v t="$1" -v irq="$2" '
+    $0 == "::" { fin = 1; next }
+    !match($0, /^[0-9]+ \(.*\)/) { next }
+    { s = substr($0, 1, RLENGTH); i = index(s, "("); n = substr(s, i + 1, length(s) - i - 1)
+      split(substr($0, RLENGTH + 2), f, " "); j = f[12] + f[13]
+      if (!fin) a[$1] = j; else { d = j - a[$1]; if (d > 0 && d <= t) c[n] += d } }
+    END { if (irq > 0) c["red (kernel)"] += irq       # interrupciones: casi todo es mover paquetes
+          for (q = 0; q < 2; q++) {
+            m = ""; for (n in c) if (c[n] * 100 >= t * 5 && (m == "" || c[n] > c[m])) m = n
+            if (m == "") break
+            v = m; gsub(/[^A-Za-z0-9_.:\/() +-]/, "?", v)
+            out = out (q ? ", " : "") v " " int(c[m] * 100 / t) "%"; delete c[m] }
+          print out }'
+}
+
+cpu_sample() {   # -> "uso% robado% programas" medidos durante 1 segundo (los que mas CPU usan)
   local -a x y
-  local i t=0 idle st
+  local i t=0 idle st p1 p2
+  p1=$(cat /proc/[0-9]*/stat 2>/dev/null)
   read -ra x < /proc/stat; sleep 1; read -ra y < /proc/stat
+  p2=$(cat /proc/[0-9]*/stat 2>/dev/null)
   for i in 1 2 3 4 5 6 7 8; do t=$(( t + ${y[i]:-0} - ${x[i]:-0} )); done
   idle=$(( ${y[4]:-0} - ${x[4]:-0} + ${y[5]:-0} - ${x[5]:-0} ))   # inactivo + espera de disco
   st=$(( ${y[8]:-0} - ${x[8]:-0} ))                               # tiempo que el proveedor no le dio al VPS
   (( t > 0 )) || t=1
-  echo "$(( (t - idle - st) * 100 / t )) $(( st * 100 / t ))"
+  i=$(( ${y[6]:-0} - ${x[6]:-0} + ${y[7]:-0} - ${x[7]:-0} ))     # interrupciones (red)
+  echo "$(( (t - idle - st) * 100 / t )) $(( st * 100 / t )) $(cpu_top "$t" "$i" "$p1" "$p2")"
 }
 
 net_drops() {   # -> "udp cola": paquetes UDP descartados por buffer lleno y por cola de entrada llena
@@ -4517,15 +4575,16 @@ nline() {   # etiqueta valor ok|warn|bad|na  ->  fila del diagnostico
 
 # Diagnostico de cada VPS: que esta limitando la velocidad, con datos medidos (no supuestos).
 netopt_diag() {
-  local dev n r q virt aes cpu st v x s rb d cnt max pct w st2 bx bd since FW=13
+  local dev n r q virt aes cpu st top v x s rb d cnt max pct w st2 bx bd since FW=13
   dev=$(net_dev); n=$(nproc 2>/dev/null || echo 1); r=$(ram_mb)
   q=$(ls -d /sys/class/net/"${dev:-none}"/queues/rx-* 2>/dev/null | wc -l)
   virt=$(systemd-detect-virt 2>/dev/null); virt=${virt:-desconocido}
   if grep -qw aes /proc/cpuinfo 2>/dev/null; then aes=si; else aes=no; fi
-  read -r cpu st <<< "$(cpu_sample)"
+  read -r cpu st top <<< "$(cpu_sample)"
   field "VPS:" "${virt^^}, $n CPU, $(fmt_mb "${r:-0}") RAM, kernel $(uname -r | cut -d- -f1)"
   s=$GRN; (( st >= 10 || cpu >= 85 )) && s=$YEL
   field "CPU:" "uso ${cpu}%, robado ${st}%, AES-NI $aes" "$s"
+  (( cpu >= 85 )) && [[ -n $top ]] && field "MAS CPU:" "${top:0:38}" "$YEL"
   case $(rps_state) in
     si) x="RPS activo" ;; no) x="RPS apagado: 1 nucleo" ;; *) x="sin RPS (no hace falta)" ;;
   esac
@@ -6617,7 +6676,7 @@ main() {
   local rc
   preflight
   if [[ ${1:-} == --backup ]]; then              # cron diario o a mano: sin red ni menus
-    init_fs; load_ports; init_ui; helpers_update
+    init_fs; load_ports; init_ui; panel_lock; helpers_update; panel_unlock
     if bk_snap "${2:-manual}"; then
       if [[ -n $BK_LAST ]]; then echo "Copia creada: $BK_LAST"; else echo "Sin cambios desde la ultima copia."; fi
       exit 0
@@ -6629,10 +6688,12 @@ main() {
   init_ui
   trap on_exit EXIT
   init_env
+  panel_lock                      # espera si otra sesion esta aplicando cambios
   self_install
   autostart_default
   banner_migrate
   helpers_update
+  panel_unlock
   case "${1:-}" in
     --install-all) data_recover; default_name; INSTALL_AUTO=1; netopt_update quiet; install_all; exit 0 ;;
     --restore)     [[ -n ${2:-} ]] || { usage; exit 1; }
