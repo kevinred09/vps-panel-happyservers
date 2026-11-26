@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ======================================================================
-#  VPS PANEL v3.5.3 - instalador y administrador de protocolos para tuneles
+#  VPS PANEL v3.6.0 - instalador y administrador de protocolos para tuneles
 #  Compatible con HTTP Custom y apps similares.
 #  SSH, Dropbear, SSL, WebSocket, SOCKS Python, WS-ePro, Squid, V2Ray,
 #  BadVPN-UDPGW, UDP Custom, SlowDNS, OpenVPN, WireGuard y Psiphon
@@ -66,6 +66,27 @@
 #  RAM y TCP con BBR.
 #  Muestra donde esta el cuello de botella de cada VPS y se puede deshacer.
 #
+#  Rendimiento y estabilidad (3.6.0):
+#  - Proxy (WebSocket, SOCKS, WS-ePro y SSL): motor nuevo sin tareas intermedias, con uvloop
+#    (python3-uvloop, opcional) y un proceso por nucleo segun la RAM. Hacia SSH/Dropbear sale desde
+#    127.x.y.z (una direccion por cliente): el limite de Dropbear de 5 inicios de sesion a la vez por
+#    IP ya no frena a todos los usuarios juntos.
+#  - AUTO-REPARAR (PREPARACION DEL SISTEMA > 28, activado): cada minuto levanta los servicios caidos
+#    y reinicia el que falle su prueba de conexion 3 veces seguidas (/var/log/vpspanel/watchdog.log).
+#  - Menos cortes: al reinstalar o aplicar cambios un servicio solo se reinicia si algo cambio (o si
+#    no responde) y el firewall solo se vuelve a poner si cambiaron sus reglas. En las VPN se ajusta
+#    el MSS (evita paginas que no cargan).
+#  - SSL recuerda las sesiones TLS (reconexion rapida) y detecta clientes caidos; Squid admite mas
+#    conexiones y systemd lo levanta si se cae; V2Ray no registra cada conexion y aguanta mas las
+#    conexiones sin trafico; OpenVPN TCP sin retardo (tcp-nodelay) y ChaCha20 primero sin AES.
+#  - Red: buffers iniciales mas grandes y mas conexiones nuevas a la vez (se suma a lo de arriba).
+#  - Limite de conexiones: una conexion de mas se corta a los 2-3 minutos (deja reconectar sin
+#    cortar la sesion nueva mientras se cierra la caida).
+#  - Panel mas rapido: estado de los servicios en una sola consulta, listas de cuentas sin lanzar un
+#    programa por fila y la IP publica recordada 1 hora.
+#  Al actualizar desde una version anterior estos ajustes se aplican solos a lo ya instalado: cada
+#  servicio que cambia se reinicia una vez (sus usuarios se reconectan).
+#
 #  Interfaz: replica el panel de referencia (colores RGB exactos, lineas de 53
 #  columnas). Todo el aspecto visual esta en el bloque "Interfaz".
 #    VPSPANEL_COLOR=256 vpspanel       terminal sin colores de 24 bits (aproximado)
@@ -79,12 +100,13 @@ export VPSPANEL_ACTIVE=1
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}
 
 # ------------------------------ Configuracion -------------------------
-VERSION=3.5.3
+VERSION=3.6.0
 PREP_V=3          # version de la preparacion del sistema (se repite si cambia)
 NAME_MAX=24        # largo maximo del nombre del VPS (se muestra en el titulo)
 DEF_PASS=xxxx      # contrasena por defecto de las cuentas SSH (ENTER en el campo la escribe sola)
 BASE=${VPSPANEL_BASE:-/etc/vpspanel}
 LOG_DIR=${VPSPANEL_LOGDIR:-/var/log/vpspanel}   # registros de instalacion y errores
+RUN_DIR=${VPSPANEL_RUN:-/run/vpspanel}          # estado temporal (se borra al reiniciar el VPS)
 USERDB=$BASE/users.db
 V2DB=$BASE/v2ray.db
 BANNER=$BASE/banner
@@ -118,7 +140,7 @@ BK_KEEP_EV=15              # copias manuales y de antes de actualizar, restaurar
 BK_FORMAT=1                # formato de las copias (MANIFEST: format=1)
 SCRIPT_BK=$BK_DIR/scripts  # versiones anteriores del panel (vps-rollback)
 PANEL_BIN=${VPSPANEL_BIN:-/usr/local/bin/vpspanel}
-HELPERS_V=5                # version de vps-cleanup, vps-rollback, el cron y vps-proxy.py: si cambia, se reinstalan solos
+HELPERS_V=6                # version de los ayudantes (vps-proxy.py, cron...) y ajustes de servicios: si cambia, se aplican solos
 # Enlace RAW del instalador en tu repositorio: en ACTUALIZAR PANEL basta con ENTER. Si alguna vez
 # actualizas desde otro enlace, el panel recuerda ese (/etc/vpspanel/update.url) y lo usa primero.
 UPDATE_URL='https://raw.githubusercontent.com/kevinred09/vps-panel-happyservers/main/vps-panel.sh'
@@ -127,10 +149,10 @@ UPDATE_URL='https://raw.githubusercontent.com/kevinred09/vps-panel-happyservers/
 UPD_EVERY=300
 UPD_DIR=${VPSPANEL_UPDDIR:-/run/vpspanel}
 UPD_AVAIL=$UPD_DIR/avail   # "sha256 version" de lo publicado (no existe si lo publicado no sirve)
-UPD_STAMP=$UPD_DIR/stamp   # su fecha es la de la ultima revision
+UPD_STAMP=$UPD_DIR/stamp   # hora (en segundos) de la ultima revision
 
 # Optimizacion de red (ver el bloque "Optimizacion de red")
-NETOPT_V=1                 # version de la optimizacion: si cambia, se vuelve a aplicar sola
+NETOPT_V=2                 # version de la optimizacion: si cambia, se vuelve a aplicar sola
 NETOPT_CONF=/etc/sysctl.d/60-vpspanel-red.conf   # el /etc/sysctl.conf del administrador sigue mandando
 NETOPT_MODS=/etc/modules-load.d/vpspanel.conf     # modulos que se cargan antes de aplicar los ajustes
 NETOPT_HASH=/etc/modprobe.d/vpspanel.conf         # tamano de la tabla de conntrack al cargar el modulo
@@ -467,20 +489,31 @@ spin() {   # mensaje comando [args...]  ->  ejecuta el comando mostrando "Mensaj
 init_fs() {
   mkdir -p "$BASE" "$LOG_DIR"
   chmod 700 "$LOG_DIR" 2>/dev/null
-  touch "$USERDB" "$V2DB" "$PX_DB"
+  local f
+  for f in "$USERDB" "$V2DB" "$PX_DB"; do   # sin cambiar su fecha: asi no parece que los datos cambiaron
+    [[ -e $f ]] || : >> "$f"
+  done
   chmod 600 "$USERDB" "$V2DB" "$PX_DB"
   # restos de escrituras cortadas (un corte nunca deja la base a medias: se escribe en .tmp-*)
   find "$BASE" -maxdepth 2 -name '.tmp-*' -mmin +10 -delete 2>/dev/null
   return 0
 }
 
+public_ip() {   # IP publica; se recuerda 1 hora para no consultarla en cada apertura del panel
+  local ip='' t='' now f=$RUN_DIR/ip re='^[0-9]+(\.[0-9]+){3}$'
+  printf -v now '%(%s)T' -1
+  if { read -r t ip < "$f"; } 2>/dev/null && [[ $t =~ ^[0-9]+$ && $ip =~ $re ]] && (( now >= t && now - t < 3600 )); then
+    echo "$ip"; return 0
+  fi
+  ip=$(curl -4fsS --max-time 4 https://api.ipify.org 2>/dev/null | tr -d '[:space:]')
+  [[ $ip =~ $re ]] || ip=$(curl -4fsS --max-time 4 https://ipv4.icanhazip.com 2>/dev/null | tr -d '[:space:]')
+  [[ $ip =~ $re ]] || return 1
+  run_dir && { echo "$now $ip" > "$f"; } 2>/dev/null
+  echo "$ip"
+}
 init_env() {
   local ip=${VPSPANEL_IP:-}
-  if [[ -z $ip ]]; then
-    ip=$(curl -4fsS --max-time 4 https://api.ipify.org 2>/dev/null | tr -d '[:space:]')
-    [[ $ip =~ ^[0-9]+(\.[0-9]+){3}$ ]] || ip=$(curl -4fsS --max-time 4 https://ipv4.icanhazip.com 2>/dev/null | tr -d '[:space:]')
-    [[ $ip =~ ^[0-9]+(\.[0-9]+){3}$ ]] || ip=$(hostname -I 2>/dev/null | awk '{print $1}')
-  fi
+  [[ -n $ip ]] || ip=$(public_ip) || ip=$(hostname -I 2>/dev/null | awk '{print $1}')
   IP=$ip
   OS_NAME=$(grep -m1 '^PRETTY_NAME=' /etc/os-release 2>/dev/null | cut -d'"' -f2)
   OS_NAME=${OS_NAME:-Linux}
@@ -493,10 +526,15 @@ preflight() {
   command -v systemctl >/dev/null 2>&1 || { echo "Se requiere systemd."; exit 1; }
 }
 
-vps_name() { cat "$NAME_F" 2>/dev/null; }
+vps_name() { local n=''; { IFS= read -r n < "$NAME_F"; } 2>/dev/null; printf '%s\n' "$n"; }
 
 # Vista del panel: el nombre, los datos del servidor y la lista de servicios se pueden ocultar.
-is_hidden()   { grep -qx "$1" "$HIDE_F" 2>/dev/null; }            # name | server | services
+is_hidden() {   # name | server | services
+  local l
+  [[ -s $HIDE_F ]] || return 1
+  while IFS= read -r l || [[ -n $l ]]; do [[ $l == "$1" ]] && return 0; done < "$HIDE_F"
+  return 1
+}
 toggle_hide() { if is_hidden "$1"; then sed -i "/^$1\$/d" "$HIDE_F"; else echo "$1" >> "$HIDE_F"; fi; }
 is_shown()    { ! is_hidden "$1"; }                                # lo contrario de is_hidden
 
@@ -636,7 +674,25 @@ svc_unit() {   # clave -> unidad de systemd real
   esac
 }
 
-is_on() { systemctl is-active --quiet "$(svc_unit "$1")"; }
+declare -A SVC_ON=()     # estados leidos de una vez mientras se pinta una pantalla (vacio fuera de eso)
+svc_snapshot() {   # una sola llamada a systemctl para todos los servicios de la pantalla
+  local k i
+  local -a u=() st=()
+  SVC_ON=()
+  for k in "${SHOW_KEYS[@]}"; do
+    if [[ $k == openvpn ]]; then u+=("$(svc_unit openvpn)"); else u+=("${SVC[$k]}"); fi
+  done
+  mapfile -t st < <(systemctl is-active "${u[@]}" 2>/dev/null)
+  (( ${#st[@]} == ${#u[@]} )) || return 0           # respuesta inesperada: se consulta uno por uno
+  for i in "${!SHOW_KEYS[@]}"; do SVC_ON[${SHOW_KEYS[i]}]=${st[i]}; done
+}
+is_on() {
+  case ${SVC_ON[$1]:-} in
+    '')               systemctl is-active --quiet "$(svc_unit "$1")" ;;
+    active|reloading) return 0 ;;
+    *)                return 1 ;;
+  esac
+}
 
 get_host() { local d; d=$(cat "$DOMAIN_F" 2>/dev/null); echo "${d:-$IP}"; }
 
@@ -695,8 +751,40 @@ fw_ports_of() {   # clave -> lineas puerto/proto que deben quedar abiertas
   esac
 }
 
+# Lista de servicios que revisa el vigilante (vps-probe watch): "unidad|prueba|puerto|dato". Solo
+# actua sobre los habilitados: lo que se detiene desde el panel queda detenido.
+health_sync() {
+  local k t x f=$BASE/health.list
+  [[ -d $BASE ]] || return 0
+  {
+    if systemctl cat ssh >/dev/null 2>&1; then echo 'ssh|failed|0|'; else echo 'sshd|failed|0|'; fi
+    for k in "${PROTO_KEYS[@]}"; do
+      proto_installed "$k" || continue
+      x=''
+      case $k in
+        dropbear)        t=banner ;;
+        ssl)             t=tlshello ;;
+        ws|socks|wsepro) t=hello ;;
+        squid)           t=http ;;
+        v2ray)           t=v2ws; x=$V2PATH ;;
+        badvpn)          t=udpgw ;;
+        udp)             t=udp ;;
+        slowdns)         t=dns; x=$(cat "$BASE/slowdns/ns" 2>/dev/null) ;;
+        openvpn)         t=ovpn; x=$(ovpn_proto) ;;
+        wireguard)       t=wg; x=wg0 ;;
+        psiphon)         t=tcp ;;
+        *)               t=failed ;;
+      esac
+      echo "$(svc_unit "$k")|$t|$(svc_port "$k")|$x"
+    done
+    echo 'vps-firewall|failed|0|'
+  } > "$f.tmp" 2>/dev/null && mv -f "$f.tmp" "$f"
+  return 0
+}
+
 fw_sync() {   # recalcula los puertos abiertos segun lo instalado y los aplica
   local k
+  health_sync
   [[ -x /usr/local/bin/vps-fw ]] || return 0
   {
     echo "$SSH_PORT/tcp"
@@ -773,12 +861,15 @@ svc_report() {   # clave -> estado real del servicio, quien ocupa su puerto y su
 }
 
 verify() { # clave nombre  ->  espera a que quede activo, escuchando y respondiendo de verdad
-  local k=$1 nm=${2:-$1} unit st why='' i max=${VERIFY_WAIT:-20} r0 r1
+  local k=$1 nm=${2:-$1} unit st why='' i max=${VERIFY_WAIT:-20} r0 r1 skip=$SVC_SKIP
+  local -a espera=(0.2 0.3 0.5)       # responde en cuanto esta listo; la espera total sigue siendo la misma
+  SVC_SKIP=''
+  health_sync
   if [[ -n ${NOSTART:-} ]]; then info "$nm: configuracion actualizada (servicio detenido)"; return 0; fi
   unit=$(svc_unit "$k")
   r0=$(systemctl show -p NRestarts --value "$unit" 2>/dev/null)
-  for (( i = 0; i < max; i++ )); do
-    sleep 1
+  for (( i = 0; i < max + 2; i++ )); do
+    sleep "${espera[i]:-1}"
     st=$(systemctl show -p ActiveState --value "$unit" 2>/dev/null)
     case $st in
       active)
@@ -791,6 +882,12 @@ verify() { # clave nombre  ->  espera a que quede activo, escuchando y respondie
       *) why="el servicio no termina de iniciar (estado: ${st:-desconocido})" ;;
     esac
   done
+  if [[ -n $skip && $skip == "$unit" ]]; then   # no se reinicio y no responde: ahora si
+    logln "$nm no responde ($why): se reinicia"
+    FORCE_RESTART=1 svc_restart "$unit"
+    verify "$k" "$nm"
+    return
+  fi
   r1=$(systemctl show -p NRestarts --value "$unit" 2>/dev/null)
   if [[ ${r0:-0} =~ ^[0-9]+$ && ${r1:-0} =~ ^[0-9]+$ ]] && (( ${r1:-0} > ${r0:-0} )); then
     why="el servicio se cierra solo al iniciar (systemd lo reinicio $(( r1 - r0 )) veces)"
@@ -802,11 +899,53 @@ verify() { # clave nombre  ->  espera a que quede activo, escuchando y respondie
 }
 
 # ------------------------------ systemd -------------------------------
-svc_restart() {   # unidad -> la habilita y la reinicia (no hace nada con NOSTART)
+# Un servicio solo se reinicia si cambio algo de lo que carga al arrancar (unidad, configuracion,
+# llaves o programa), si no esta funcionando o al REPARAR: volver a aplicar la configuracion
+# (puertos, restaurar, optimizar) no corta a los usuarios sin motivo.
+svc_deps() {   # unidad -> archivos que carga al arrancar
+  case $1 in
+    vps-dropbear)          printf '%s\n' "$(banner_path)" /etc/dropbear/dropbear_*_host_key ;;
+    vps-ws|vps-socks|vps-wsepro) echo /usr/local/bin/vps-proxy.py ;;
+    vps-stunnel)           printf '%s\n' "$BASE/stunnel.conf" "$CERT" /etc/systemd/system/vps-sslws.service /usr/local/bin/vps-proxy.py ;;
+    vps-badvpn)            echo /usr/local/bin/badvpn-udpgw ;;
+    vps-slowdns)           printf '%s\n' /usr/local/bin/dnstt-server "$BASE/slowdns/server.key" ;;
+    udp-custom)            printf '%s\n' /etc/udp-custom/config.json /etc/udp-custom/udp-custom ;;
+    vps-psiphon)           printf '%s\n' "$PSI_DIR/psiphond.config" /usr/local/bin/psiphond ;;
+    squid)                 printf '%s\n' /etc/squid/squid.conf /etc/squid/conf.d/*.conf ;;
+    v2ray)                 printf '%s\n' "$V2CFG" /usr/local/bin/v2ray ;;
+    openvpn-server@server) printf '%s\n' "$OVPN_DIR"/{server.conf,ca.crt,server.crt,server.key} /etc/pam.d/openvpn-vpspanel ;;
+    wg-quick@wg0)          echo "$WG_CONF" ;;
+  esac
+}
+svc_units() { case $1 in vps-stunnel) echo "vps-stunnel vps-sslws" ;; *) echo "$1" ;; esac; }
+svc_running() { local u; for u in $(svc_units "$1"); do systemctl is-active --quiet "$u" 2>/dev/null || return 1; done; }
+svc_stamp() {   # unidad -> huella de lo que carga y de su ejecucion actual (InvocationID)
+  local u=$1 f
+  local -a deps=()
+  mapfile -t deps < <(svc_deps "$u")
+  {
+    for f in "/etc/systemd/system/$u.service" "/etc/systemd/system/$u.service.d/"*.conf "${deps[@]}"; do
+      [[ -f $f ]] && { echo "$f"; sha256sum < "$f"; }
+    done
+    for f in $(svc_units "$u"); do systemctl show -p InvocationID --value "$f" 2>/dev/null; done
+  } | sha256sum | cut -d' ' -f1
+}
+
+SVC_SKIP=''          # unidad que no se reinicio por estar igual (verify la reinicia si no responde)
+run_dir() { [[ -d $RUN_DIR ]] || mkdir -m 700 "$RUN_DIR" 2>/dev/null || [[ -d $RUN_DIR ]]; }
+svc_restart() {   # unidad -> la habilita y la reinicia si hace falta (no hace nada con NOSTART)
+  local f=$RUN_DIR/stamp.$1
+  SVC_SKIP=''
   [[ -n ${NOSTART:-} ]] && return 0
   systemctl reset-failed "$1" >/dev/null 2>&1
   systemctl enable "$1" >> "$LOG" 2>&1
+  if [[ -z ${FORCE:-}${FORCE_RESTART:-} && -s $f ]] && svc_running "$1" && [[ $(< "$f") == "$(svc_stamp "$1")" ]]; then
+    logln "$1: sin cambios, no se reinicia"
+    SVC_SKIP=$1
+    return 0
+  fi
   systemctl restart "$1" >> "$LOG" 2>&1
+  run_dir && svc_stamp "$1" > "$f" 2>/dev/null
   return 0
 }
 
@@ -827,6 +966,8 @@ mkunit() { # nombre descripcion exec [directivas extra de [Service]] [directivas
     echo "Restart=always"
     echo "RestartSec=2"
     echo "LimitNOFILE=$(unit_nofile)"
+    echo "TasksMax=infinity"
+    echo "OOMScoreAdjust=-250"
     echo
     echo "[Install]"
     echo "WantedBy=multi-user.target"
@@ -904,6 +1045,20 @@ tool_put() {   # origen destino
   return 1
 }
 
+uvloop_ok() { "$(command -v python3 || echo /usr/bin/python3)" -c 'import uvloop' >/dev/null 2>&1; }
+
+uvloop_install() {   # opcional: con python3-uvloop los proxies usan mucha menos CPU; sin el funcionan igual
+  local -a o=(apt-get install -y -o DPkg::Lock::Timeout=60 --no-install-recommends python3-uvloop)
+  uvloop_ok && return 0
+  command -v apt-get >/dev/null 2>&1 || return 1
+  if apt_busy; then logln "uvloop: apt esta ocupado; se instalara en otra ocasion"; return 1; fi
+  RUN_QUIET=1 run "Instalando uvloop (proxy mas rapido)" "${o[@]}" ||
+    { [[ -z ${APT_FRESH:-} ]] && apt_update >/dev/null 2>&1 && RUN_QUIET=1 run "Instalando uvloop" "${o[@]}"; }
+  uvloop_ok
+}
+
+proxy_installed() { proto_installed ws || proto_installed socks || proto_installed wsepro || proto_installed ssl; }
+
 install_tools() {   # motor de proxy (WebSocket/SOCKS/SSL) y pruebas de conexion
   local t
   t=$(mktemp) || return 1
@@ -921,29 +1076,57 @@ Acepta en el mismo puerto:
 y reenvia todo a un puerto local (SSH o Dropbear). Solo se llega a puertos de este VPS que
 esten permitidos: no es un proxy abierto.
 
+Rendimiento: tras el saludo los datos pasan de un socket al otro sin tareas intermedias; usa
+uvloop si esta instalado (python3-uvloop) y reparte las conexiones entre varios procesos en
+VPS con varios nucleos. Hacia el destino local sale desde 127.x.y.z (una direccion por
+cliente) para que el limite de Dropbear de 5 inicios de sesion simultaneos por IP no se
+aplique a todos los usuarios juntos.
+
 Uso: vps-proxy.py -l ESCUCHA -t DESTINO [-a PUERTOS] [-s 101|200] [--self IPS] [--socks]
+                  [-w PROCESOS] [--no-spread]
   -l   puerto (todas las interfaces, IPv4 e IPv6), IP:puerto o unix:/ruta/socket
   -t   puerto local por defecto (127.0.0.1)
   -a   otros puertos locales permitidos, separados por comas (CONNECT, X-Real-Host, SOCKS5)
   -s   respuesta a payloads sin Upgrade ni CONNECT: 101 (WebSocket) o 200
+  -w   procesos de trabajo (0 = automatico segun nucleos y RAM)
   --self  IPs propias del VPS separadas por comas (CONNECT a la IP publica = local)
+  --no-spread  sale siempre desde 127.0.0.1
 """
 import argparse
 import asyncio
 import base64
+import gc
 import hashlib
+import itertools
 import os
 import re
+import signal
 import socket
 import struct
 import sys
+import time
+import zlib
+
+try:
+    import uvloop                 # opcional: bastante menos CPU por conexion
+except Exception:                 # sin el paquete (o roto) se usa asyncio
+    uvloop = None
 
 BUF = 65536
 FIRST_WAIT = 3.0      # cliente SSH que espera el banner del servidor
 NEXT_WAIT = 1.0       # despues de responder un payload, espera mas datos
-HEAD_WAIT = 10.0      # tiempo maximo para completar una cabecera HTTP
+HEAD_WAIT = 10.0      # tiempo maximo de espera de cada paso de SOCKS5
+HANDSHAKE_MAX = 60.0  # tiempo total maximo del saludo (un cliente que gotea bytes no ocupa sitio)
 MAX_ROUNDS = 8        # payloads seguidos que se aceptan en una conexion
 MAX_HEAD = 65536
+EARLY_MAX = 262144    # datos del cliente que se guardan mientras no hay destino (despues se pausa)
+RETRY_WAITS = (0.0, 0.3, 1.0)   # reintentos hacia el destino local (SSH o Dropbear reiniciandose)
+CONNECT_TIMEOUT = 8.0
+SPREAD_TIMEOUT = 3.0  # primera prueba desde 127.x.y.z; si no funciona se usa 127.0.0.1
+CLOSE_TIMEOUT = 120.0 # un cliente que dejo de recibir se corta pasado este tiempo
+BACKLOG = 4096        # conexiones en espera de ser aceptadas (asyncio usa 100 si no se indica)
+KEEP_IDLE, KEEP_INTVL, KEEP_CNT = 60, 30, 8   # keepalive TCP: mantiene el NAT movil; 5 min = muerto
+BIND_NO_PORT = getattr(socket, "IP_BIND_ADDRESS_NO_PORT", 24)
 GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 METHODS = (b"GET", b"POST", b"PUT", b"HEAD", b"CONNECT", b"OPTIONS", b"PATCH", b"DELETE",
            b"TRACE", b"PROPFIND", b"MOVE", b"COPY", b"LOCK", b"UNLOCK", b"MKCOL", b"ACL")
@@ -953,6 +1136,9 @@ ALLOWED = set()
 STATUS = 101
 SOCKS = False
 SELF = {"127.0.0.1", "localhost", "::1", "0.0.0.0", "::", "ip6-localhost"}
+SPREAD = True         # salir hacia el destino desde 127.x.y.z
+SPREAD_OK = False     # ya funciono al menos una vez en este proceso
+SERIAL = itertools.count()
 
 
 def log(msg):
@@ -1044,213 +1230,554 @@ def make_response(head):
     return b"HTTP/1.1 200 Connection established\r\n\r\n"
 
 
-def tune(writer):
-    sock = writer.get_extra_info("socket")
+# ------------------------------ Sockets ---------------------------------------
+def tune(transport, client):
+    sock = transport.get_extra_info("socket")
     if sock is None or sock.family == getattr(socket, "AF_UNIX", -1):
         return
-    for lvl, opt in ((socket.IPPROTO_TCP, socket.TCP_NODELAY), (socket.SOL_SOCKET, socket.SO_KEEPALIVE)):
+    opts = [(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1), (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)]
+    if client and hasattr(socket, "TCP_KEEPIDLE"):
+        opts += [(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, KEEP_IDLE),
+                 (socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, KEEP_INTVL),
+                 (socket.IPPROTO_TCP, socket.TCP_KEEPCNT, KEEP_CNT)]
+    for lvl, opt, val in opts:
         try:
-            sock.setsockopt(lvl, opt, 1)
+            sock.setsockopt(lvl, opt, val)
         except OSError:
             pass
 
 
-async def read_some(reader, timeout):
-    """Lee lo que llegue; None si se agota el tiempo, b'' si el cliente cerro."""
+def pause(transport):
     try:
-        return await asyncio.wait_for(reader.read(BUF), timeout)
-    except asyncio.TimeoutError:
-        return None
-
-
-async def read_exact(reader, buf, n):
-    while len(buf) < n:
-        more = await read_some(reader, HEAD_WAIT)
-        if not more:
-            raise ConnectionError("cerrado")
-        buf += more
-    return buf
-
-
-async def socks5(reader, writer, buf):
-    """Negocia SOCKS5 (sin autenticacion). Devuelve (destino, sobrante) o None."""
-    buf = await read_exact(reader, buf, 2)
-    buf = await read_exact(reader, buf, 2 + buf[1])
-    methods, buf = buf[2:2 + buf[1]], buf[2 + buf[1]:]
-    if 0 not in methods:
-        writer.write(b"\x05\xff")
-        await writer.drain()
-        return None
-    writer.write(b"\x05\x00")
-    await writer.drain()
-    buf = await read_exact(reader, buf, 4)
-    cmd, atyp = buf[1], buf[3]
-    if atyp == 1:
-        buf = await read_exact(reader, buf, 10)
-        host, rest = socket.inet_ntoa(buf[4:8]), buf[8:]
-    elif atyp == 3:
-        buf = await read_exact(reader, buf, 5)
-        n = buf[4]
-        buf = await read_exact(reader, buf, 5 + n + 2)
-        host, rest = buf[5:5 + n].decode("latin1"), buf[5 + n:]
-    elif atyp == 4:
-        buf = await read_exact(reader, buf, 22)
-        host, rest = socket.inet_ntop(socket.AF_INET6, buf[4:20]), buf[20:]
-    else:
-        writer.write(b"\x05\x08\x00\x01\x00\x00\x00\x00\x00\x00")
-        await writer.drain()
-        return None
-    port = struct.unpack(">H", rest[:2])[0]
-    rest = rest[2:]
-    target = local_target(host, port) if cmd == 1 else None
-    if target is None:
-        code = 0x07 if cmd != 1 else 0x02            # comando no soportado / no permitido
-        writer.write(bytes([5, code, 0, 1, 0, 0, 0, 0, 0, 0]))
-        await writer.drain()
-        return None
-    writer.write(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
-    await writer.drain()
-    return target, rest
-
-
-async def pipe(reader, writer):
-    try:
-        while True:
-            data = await reader.read(BUF)
-            if not data:
-                break
-            writer.write(data)
-            await writer.drain()
+        if not transport.is_closing():
+            transport.pause_reading()
     except Exception:
         pass
-    finally:
-        try:
-            writer.close()
-        except Exception:
-            pass
 
 
-async def handle(reader, writer):
-    tune(writer)
-    remote = None
-    target = ("127.0.0.1", DEFAULT)
+def resume(transport):
     try:
-        buf = await read_some(reader, FIRST_WAIT)
-        if buf == b"":
+        if not transport.is_closing():
+            transport.resume_reading()
+    except Exception:
+        pass
+
+
+def finish(transport):
+    """Cierra entregando lo pendiente; si el otro lado ya no recibe, lo corta mas tarde."""
+    if transport is None or transport.is_closing():
+        return
+    try:
+        transport.close()
+        if transport.get_write_buffer_size():
+            asyncio.get_event_loop().call_later(CLOSE_TIMEOUT, transport.abort)
+    except Exception:
+        pass
+
+
+def source_for(peer):
+    """Direccion 127.x.y.z de salida: la misma para cada IP de cliente; distinta si no se sabe (SSL)."""
+    if isinstance(peer, tuple) and peer:
+        key = str(peer[0]).encode()
+    else:
+        key = b"%d-%d" % (os.getpid(), next(SERIAL))
+    h = zlib.crc32(key)
+    return "127.%d.%d.%d" % (1 + h % 254, (h >> 8) % 256, 1 + (h >> 16) % 254)
+
+
+# ------------------------------ Conexiones ------------------------------------
+class Upstream(asyncio.Protocol):
+    """Punta hacia SSH/Dropbear: lo que llega va directo al cliente."""
+
+    def __init__(self, client):
+        self.client = client
+        self.transport = None
+        self.adopted = False        # es la conexion que usa el cliente (no un intento descartado)
+        self.dead = False
+
+    def connection_made(self, transport):
+        self.transport = transport
+        tune(transport, False)
+
+    def data_received(self, data):
+        out = self.client.transport
+        if not out.is_closing():
+            out.write(data)
+
+    def eof_received(self):
+        return False
+
+    def connection_lost(self, exc):
+        self.dead = True
+        if self.adopted:
+            finish(self.client.transport)
+
+    def pause_writing(self):        # el destino no da abasto: se deja de leer del cliente
+        pause(self.client.transport)
+
+    def resume_writing(self):
+        resume(self.client.transport)
+
+
+class Client(asyncio.Protocol):
+    """Punta del cliente: primero el saludo (payload/SOCKS5) y despues reenvio directo."""
+
+    def __init__(self, loop):
+        self.loop = loop
+        self.transport = None
+        self.peer = None            # transporte hacia el destino
+        self.relay = False
+        self.buf = bytearray()
+        self.held = False           # lectura pausada porque el saludo acumulo demasiado
+        self.slow = False           # el cliente no da abasto (su cola de envio esta llena)
+        self.eof = False
+        self.lost = False
+        self.exc = None
+        self.waiter = None
+        self.task = None
+
+    def connection_made(self, transport):
+        self.transport = transport
+        tune(transport, True)
+        self.task = self.loop.create_task(self.run())
+
+    def wake(self):
+        w = self.waiter
+        if w is not None and not w.done():
+            w.set_result(None)
+
+    def data_received(self, data):
+        if self.relay:
+            if not self.peer.is_closing():
+                self.peer.write(data)
             return
+        self.buf += data
+        if len(self.buf) >= EARLY_MAX and not self.held:
+            self.held = True
+            pause(self.transport)
+        self.wake()
+
+    def eof_received(self):
+        self.eof = True
+        self.wake()
+        return not self.relay       # durante el saludo todavia se puede responder
+
+    def connection_lost(self, exc):
+        self.eof = self.lost = True
+        self.exc = exc
+        self.wake()
+        finish(self.peer)
+
+    def pause_writing(self):        # el cliente no da abasto: se deja de leer del destino
+        self.slow = True
+        if self.peer is not None:
+            pause(self.peer)
+
+    def resume_writing(self):
+        self.slow = False
+        if self.peer is not None:
+            resume(self.peer)
+
+    async def read(self, timeout):
+        """Lo que haya llegado (hasta BUF); None si se agota el tiempo, b'' si el cliente cerro."""
+        if not self.buf and not self.eof:
+            self.waiter = self.loop.create_future()
+            try:
+                await asyncio.wait_for(self.waiter, timeout)
+            except asyncio.TimeoutError:
+                return None
+            finally:
+                self.waiter = None
+        if self.exc is not None:
+            raise self.exc
+        data = bytes(self.buf[:BUF])
+        del self.buf[:BUF]
+        if self.held and len(self.buf) < EARLY_MAX:
+            self.held = False
+            resume(self.transport)
+        return data
+
+    def send(self, data):
+        if self.lost:
+            raise ConnectionResetError("cliente desconectado")
+        self.transport.write(data)
+
+    async def read_exact(self, buf, n):
+        while len(buf) < n:
+            more = await self.read(HEAD_WAIT)
+            if not more:
+                raise ConnectionError("cerrado")
+            buf += more
+        return buf
+
+    async def socks5(self, buf):
+        """Negocia SOCKS5 (sin autenticacion). Devuelve (destino, sobrante) o None."""
+        buf = await self.read_exact(buf, 2)
+        buf = await self.read_exact(buf, 2 + buf[1])
+        methods, buf = buf[2:2 + buf[1]], buf[2 + buf[1]:]
+        if 0 not in methods:
+            self.send(b"\x05\xff")
+            return None
+        self.send(b"\x05\x00")
+        buf = await self.read_exact(buf, 4)
+        cmd, atyp = buf[1], buf[3]
+        if atyp == 1:
+            buf = await self.read_exact(buf, 10)
+            host, rest = socket.inet_ntoa(buf[4:8]), buf[8:]
+        elif atyp == 3:
+            buf = await self.read_exact(buf, 5)
+            n = buf[4]
+            buf = await self.read_exact(buf, 5 + n + 2)
+            host, rest = buf[5:5 + n].decode("latin1"), buf[5 + n:]
+        elif atyp == 4:
+            buf = await self.read_exact(buf, 22)
+            host, rest = socket.inet_ntop(socket.AF_INET6, buf[4:20]), buf[20:]
+        else:
+            self.send(b"\x05\x08\x00\x01\x00\x00\x00\x00\x00\x00")
+            return None
+        port = struct.unpack(">H", rest[:2])[0]
+        rest = rest[2:]
+        target = local_target(host, port) if cmd == 1 else None
+        if target is None:
+            code = 0x07 if cmd != 1 else 0x02            # comando no soportado / no permitido
+            self.send(bytes([5, code, 0, 1, 0, 0, 0, 0, 0, 0]))
+            return None
+        self.send(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
+        return target, rest
+
+    async def handshake(self):
+        """(destino, datos ya recibidos para el) o None si hay que cerrar."""
+        target = ("127.0.0.1", DEFAULT)
+        buf = await self.read(FIRST_WAIT)
+        if buf == b"":
+            return None
         buf = buf or b""                              # None: SSH directo, el servidor habla primero
 
         if buf[:1] == b"\x05" and SOCKS:
-            res = await socks5(reader, writer, buf)
+            return await self.socks5(buf)
+        rounds = 0
+        while buf and is_http(buf) and rounds < MAX_ROUNDS:
+            buf = buf.lstrip(b"\r\n")
+            m = HEAD_END.search(buf)
+            while m is None:                      # cabecera incompleta ([split]) o payload sin linea vacia
+                more = await self.read(NEXT_WAIT)
+                if more == b"" or len(buf) > MAX_HEAD:
+                    return None
+                if more is None:                  # ya no llega nada: lo recibido es el payload completo
+                    break
+                ini = max(0, len(buf) - 8)        # sigue buscando donde se quedo (no desde el principio)
+                buf += more
+                m = HEAD_END.search(buf, ini)
+            if m:
+                head, buf = buf[:m.start()], buf[m.end():]
+            else:
+                head, buf = buf, b""
+            head = NL.sub(b"\r\n", head)          # saltos LF o CRLF: las cabeceras se leen igual
+            target = pick_target(head, target)
+            self.send(make_response(head))
+            rounds += 1
+            buf = buf.lstrip(b"\r\n")
+            if not buf:                           # espera el siguiente payload o el banner SSH
+                more = await self.read(NEXT_WAIT)
+                if more == b"":
+                    return None
+                buf = (more or b"").lstrip(b"\r\n")
+        if buf and not buf.startswith(b"SSH-") and is_http(buf):
+            return None                           # demasiados payloads
+        return target, buf
+
+    async def open_once(self, target, source, timeout):
+        if not source:
+            _, up = await asyncio.wait_for(
+                self.loop.create_connection(lambda: Upstream(self), target[0], target[1]), timeout)
+            return up
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            s.setblocking(False)
+            try:      # el puerto se elige al conectar: no se agotan aunque haya miles en TIME_WAIT
+                s.setsockopt(socket.IPPROTO_IP, BIND_NO_PORT, 1)
+            except OSError:
+                pass
+            s.bind((source, 0))
+            await asyncio.wait_for(self.loop.sock_connect(s, target), timeout)
+            _, up = await self.loop.create_connection(lambda: Upstream(self), sock=s)
+        except BaseException:
+            s.close()
+            raise
+        return up
+
+    async def connect(self, target):
+        """Conecta con el destino local, con reintentos cortos si se esta reiniciando."""
+        global SPREAD, SPREAD_OK
+        source = source_for(self.transport.get_extra_info("peername")) if SPREAD else None
+        for attempt, wait in enumerate(RETRY_WAITS):
+            if wait:
+                await asyncio.sleep(wait)
+            if self.lost:
+                raise ConnectionResetError("cliente desconectado")
+            try:
+                if source and SPREAD:
+                    try:
+                        up = await self.open_once(target, source, CONNECT_TIMEOUT if SPREAD_OK else SPREAD_TIMEOUT)
+                        SPREAD_OK = True
+                        return up
+                    except ConnectionRefusedError:
+                        raise                     # el destino esta caido: no es culpa de la direccion
+                    except (OSError, asyncio.TimeoutError) as e:
+                        if SPREAD_OK:
+                            raise
+                        up = await self.open_once(target, None, CONNECT_TIMEOUT)
+                        SPREAD = False            # desde 127.x.y.z no se puede, desde 127.0.0.1 si
+                        log("no se puede salir desde 127.x.y.z (%r): se usa 127.0.0.1" % e)
+                        return up
+                return await self.open_once(target, None, CONNECT_TIMEOUT)
+            except (OSError, asyncio.TimeoutError):
+                if attempt == len(RETRY_WAITS) - 1:
+                    raise
+
+    async def run(self):
+        try:
+            res = await asyncio.wait_for(self.handshake(), HANDSHAKE_MAX)
             if res is None:
+                finish(self.transport)
                 return
-            target, buf = res
-        else:
-            rounds = 0
-            while buf and is_http(buf) and rounds < MAX_ROUNDS:
-                buf = buf.lstrip(b"\r\n")
-                m = HEAD_END.search(buf)
-                while m is None:                      # cabecera incompleta ([split]) o payload sin linea vacia
-                    more = await read_some(reader, NEXT_WAIT)
-                    if more == b"" or len(buf) > MAX_HEAD:
-                        return
-                    if more is None:                  # ya no llega nada: lo recibido es el payload completo
-                        break
-                    ini = max(0, len(buf) - 8)        # sigue buscando donde se quedo (no desde el principio)
-                    buf += more
-                    m = HEAD_END.search(buf, ini)
-                if m:
-                    head, buf = buf[:m.start()], buf[m.end():]
-                else:
-                    head, buf = buf, b""
-                head = NL.sub(b"\r\n", head)          # saltos LF o CRLF: las cabeceras se leen igual
-                target = pick_target(head, target)
-                writer.write(make_response(head))
-                await writer.drain()
-                rounds += 1
-                buf = buf.lstrip(b"\r\n")
-                if not buf:                           # espera el siguiente payload o el banner SSH
-                    more = await read_some(reader, NEXT_WAIT)
-                    if more == b"":
-                        return
-                    buf = (more or b"").lstrip(b"\r\n")
-            if buf and not buf.startswith(b"SSH-") and is_http(buf):
-                return                                # demasiados payloads
-
-        r_reader, remote = await asyncio.open_connection(*target)
-        tune(remote)
-        if buf:
-            remote.write(buf)
-            await remote.drain()
-        await asyncio.gather(pipe(reader, remote), pipe(r_reader, writer))
-    except Exception:
-        pass
-    finally:
-        for w in (writer, remote):
-            if w is not None:
-                try:
-                    w.close()
-                except Exception:
-                    pass
+            target, first = res
+            up = await self.connect(target)
+            # sin ningun await entre medias: primero lo guardado y despues el reenvio directo
+            self.peer = up.transport
+            up.adopted = True
+            self.relay = True
+            if self.slow:
+                pause(self.peer)
+            if self.held:                         # antes de escribir: si el destino no da abasto
+                self.held = False                 # volvera a pausar la lectura (pause_writing)
+                resume(self.transport)
+            data = first + bytes(self.buf)
+            self.buf = bytearray()
+            if data and not self.peer.is_closing():
+                self.peer.write(data)
+            if self.eof:                          # el cliente ya cerro: se entrega y se cierra
+                finish(self.peer)
+            if up.dead:
+                finish(self.transport)
+        except Exception:
+            finish(self.transport)
+            finish(self.peer)
 
 
-async def serve(listen):
-    servers = []
+# ------------------------------ Servidor --------------------------------------
+def listen_sockets(listen, workers):
+    """Sockets de escucha ya abiertos: un grupo por proceso de trabajo (SO_REUSEPORT)."""
     if listen.startswith("unix:"):
         path = listen[5:]
         try:
             os.unlink(path)
         except FileNotFoundError:
             pass
-        servers.append(await asyncio.start_unix_server(handle, path=path))
-        os.chmod(path, 0o660)
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            s.bind(path)
+            os.chmod(path, 0o660)
+            s.listen(BACKLOG)
+        except OSError as e:
+            log("no se pudo escuchar en %s: %s" % (path, e))
+            sys.exit(1)
+        s.setblocking(False)
+        return [[s]] * workers                        # todos aceptan del mismo socket
+    host, port = split_hostport(listen) if ":" in listen else ("", int(listen))
+    if host:
+        addrs = [(socket.AF_INET6 if ":" in host else socket.AF_INET, host)]
     else:
-        host, port = split_hostport(listen) if ":" in listen else ("", int(listen))
-        if host:
-            fam = socket.AF_INET6 if ":" in host else socket.AF_INET
-            addrs = [(fam, host)]
+        addrs = [(socket.AF_INET, "0.0.0.0"), (socket.AF_INET6, "::")]
+
+    def bind(fam, h, reuseport):
+        s = socket.socket(fam, socket.SOCK_STREAM)
+        try:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if reuseport:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+            if fam == socket.AF_INET6:
+                s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+            s.bind((h, port))
+            s.listen(BACKLOG)
+        except OSError:
+            s.close()
+            raise
+        s.setblocking(False)
+        return s
+
+    groups = [[] for _ in range(workers)]
+    for fam, h in addrs:
+        try:
+            if workers > 1:
+                bind(fam, h, False).close()           # que no haya otro programa en el puerto
+            for g in groups:
+                g.append(bind(fam, h, workers > 1))
+        except OSError as e:
+            if fam == socket.AF_INET6 and not host:
+                log("sin IPv6 en el puerto %d (%s): solo IPv4" % (port, e))
+                continue
+            log("no se pudo escuchar en %s:%s: %s" % (h, port, e))
+            sys.exit(1)
+    return groups
+
+
+async def serve(socks):
+    loop = asyncio.get_event_loop()
+    servers = []
+    for s in socks:
+        if s.family == getattr(socket, "AF_UNIX", -1):
+            kw = {}
+            if sys.version_info >= (3, 13) and type(loop).__module__.startswith("asyncio"):
+                kw["cleanup_socket"] = False          # un proceso que termina no borra el socket de todos
+            servers.append(await loop.create_unix_server(lambda: Client(loop), sock=s, backlog=BACKLOG, **kw))
         else:
-            addrs = [(socket.AF_INET, "0.0.0.0"), (socket.AF_INET6, "::")]
-        for fam, h in addrs:
+            servers.append(await loop.create_server(lambda: Client(loop), sock=s, backlog=BACKLOG))
+    await loop.create_future()                        # sirve hasta que se detenga el proceso
+
+
+def new_loop():
+    if uvloop is not None:
+        try:
+            return uvloop.new_event_loop()
+        except Exception as e:
+            log("uvloop no funciona (%r): se usa asyncio" % e)
+    return asyncio.new_event_loop()
+
+
+def run_worker(socks):
+    loop = new_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(serve(socks))
+    except KeyboardInterrupt:
+        pass
+
+
+def auto_workers():
+    """Un proceso por nucleo, con tope segun la RAM (cada uno usa unos 15 MB)."""
+    try:
+        n = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        n = os.cpu_count() or 1
+    mem = 0
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    mem = int(line.split()[1]) // 1024
+                    break
+    except (OSError, ValueError, IndexError):
+        pass
+    if mem < 1500:
+        return 1
+    return max(1, min(n, 2 if mem < 3800 else 4))
+
+
+def die_with_parent():
+    try:
+        import ctypes
+        ctypes.CDLL(None).prctl(1, int(signal.SIGTERM))      # PR_SET_PDEATHSIG
+    except Exception:
+        pass
+
+
+def supervise(groups):
+    """Mantiene vivos los procesos de trabajo; si caen sin parar, sale (systemd reinicia todo)."""
+    kids = {}
+    state = {"stop": False}
+    stopsigs = {signal.SIGTERM, signal.SIGINT}
+
+    def kill(pid):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+
+    def stop(signum=None, frame=None):
+        state["stop"] = True
+        for pid in list(kids):
+            kill(pid)
+
+    def spawn(i):
+        signal.pthread_sigmask(signal.SIG_BLOCK, stopsigs)    # que ninguna senal caiga a medias
+        pid = os.fork()
+        if pid == 0:
+            signal.signal(signal.SIGTERM, signal.SIG_DFL)
+            signal.signal(signal.SIGINT, signal.SIG_DFL)
+            signal.pthread_sigmask(signal.SIG_UNBLOCK, stopsigs)
+            die_with_parent()
             try:
-                s = socket.socket(fam, socket.SOCK_STREAM)
-                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                if fam == socket.AF_INET6:
-                    s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
-                s.bind((h, port))
-                s.listen(1024)
-                s.setblocking(False)
-            except OSError as e:
-                if fam == socket.AF_INET6 and not host:
-                    continue                          # sin IPv6: solo IPv4
-                log("no se pudo escuchar en %s:%s: %s" % (h, port, e))
-                sys.exit(1)
-            servers.append(await asyncio.start_server(handle, sock=s))
-    log("escuchando en %s -> 127.0.0.1:%d (permitidos: %s)"
-        % (listen, DEFAULT, ",".join(str(p) for p in sorted(ALLOWED)) or "-"))
-    await asyncio.gather(*(srv.serve_forever() for srv in servers))
+                run_worker(groups[i])
+            except BaseException as e:
+                log("proceso %d: %r" % (i, e))
+            os._exit(1)
+        kids[pid] = i
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, stopsigs)
+        if state["stop"]:
+            kill(pid)
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    if hasattr(gc, "freeze"):
+        gc.freeze()                                   # los procesos comparten la memoria ya cargada
+    for i in range(len(groups)):
+        spawn(i)
+    deaths = []
+    while kids:
+        try:
+            pid, status = os.wait()
+        except ChildProcessError:
+            break
+        i = kids.pop(pid, None)
+        if i is None or state["stop"]:
+            continue
+        now = time.monotonic()
+        deaths = [t for t in deaths if now - t < 60] + [now]
+        if len(deaths) > 5:
+            log("los procesos de trabajo fallan sin parar: se detiene el proxy")
+            stop()
+            for p in list(kids):
+                try:
+                    os.waitpid(p, 0)
+                except OSError:
+                    pass
+            sys.exit(1)
+        log("el proceso de trabajo %d termino (estado %d): se inicia otro" % (i, status))
+        time.sleep(0.5)
+        if not state["stop"]:
+            spawn(i)
+    sys.exit(0 if state["stop"] else 1)
 
 
 def main():
-    global DEFAULT, ALLOWED, STATUS, SOCKS
+    global DEFAULT, ALLOWED, STATUS, SOCKS, SPREAD
     ap = argparse.ArgumentParser(add_help=True)
     ap.add_argument("-l", "--listen", required=True)
     ap.add_argument("-t", "--target", type=int, required=True)
     ap.add_argument("-a", "--allow", default="")
     ap.add_argument("-s", "--status", type=int, choices=(101, 200), default=101)
+    ap.add_argument("-w", "--workers", type=int, default=0)
     ap.add_argument("--self", dest="selfips", default="")
     ap.add_argument("--socks", action="store_true")
+    ap.add_argument("--no-spread", action="store_true")
     a = ap.parse_args()
     DEFAULT = a.target
     ALLOWED = {int(p) for p in a.allow.split(",") if p.strip().isdigit()}
     STATUS = a.status
     SOCKS = a.socks
+    SPREAD = not a.no_spread
     SELF.update(x.strip().lower() for x in a.selfips.split(",") if x.strip())
     SELF.add(socket.gethostname().lower())
-    try:
-        asyncio.run(serve(a.listen))
-    except KeyboardInterrupt:
-        pass
+    workers = max(1, min(a.workers, 64)) if a.workers > 0 else auto_workers()
+    groups = listen_sockets(a.listen, workers)
+    log("escuchando en %s -> 127.0.0.1:%d (permitidos: %s; procesos: %d, %s)"
+        % (a.listen, DEFAULT, ",".join(str(p) for p in sorted(ALLOWED)) or "-", workers,
+           "uvloop" if uvloop is not None else "asyncio"))
+    if workers == 1:
+        run_worker(groups[0])
+    else:
+        supervise(groups)
 
 
 if __name__ == "__main__":
@@ -1272,6 +1799,13 @@ PYEOF
   vps-probe ovpn    PUERTO tcp|udp    OpenVPN: reinicio de control -> respuesta del servidor
   vps-probe http    PUERTO            responde HTTP
   vps-probe tcp     PUERTO            acepta conexiones TCP
+  vps-probe hello   PUERTO            proxy: payload -> 101/200, sin entrar al destino
+  vps-probe tlshello PUERTO           SSL: TLS + payload -> 101/200, sin entrar al destino
+  vps-probe udp     PUERTO            algun programa escucha en el puerto UDP
+  vps-probe wg      PUERTO [IFAZ]     la interfaz de WireGuard existe
+  vps-probe watch [LISTA ESTADO REGISTRO]
+                                      vigilante (cada minuto desde cron): levanta los servicios
+                                      caidos y reinicia los que dejan de responder
 Opcion: --host IP (por defecto 127.0.0.1). Sale con 0 si pasa; si no, imprime el motivo.
 """
 import base64
@@ -1280,7 +1814,9 @@ import random
 import socket
 import ssl
 import struct
+import subprocess
 import sys
+import time
 
 TIMEOUT = 8
 HOST = "127.0.0.1"
@@ -1535,13 +2071,219 @@ def p_tcp(port):
     return "acepta conexiones"
 
 
+def p_hello(port):
+    """El proxy responde el payload; se cierra antes de que conecte con SSH (comprobacion ligera)."""
+    s = connect(port)
+    s.sendall(PAYLOAD)
+    st = recv_head(s)
+    s.close()
+    if not status_ok(st):
+        raise Fail("respuesta inesperada al payload: %s" % st)
+    return st
+
+
+def p_tlshello(port):
+    s = tls_wrap(connect(port))
+    s.sendall(PAYLOAD)
+    st = recv_head(s)
+    tls_close(s)
+    if not status_ok(st):
+        raise Fail("TLS + payload: respuesta inesperada: %s" % st)
+    return st
+
+
+def p_udp(port):
+    for f in ("/proc/net/udp", "/proc/net/udp6"):
+        try:
+            with open(f) as fh:
+                for line in fh.readlines()[1:]:
+                    if int(line.split()[1].rsplit(":", 1)[1], 16) == port:
+                        return "escucha en el puerto %d/udp" % port
+        except OSError:
+            pass
+    raise Fail("nada escucha en el puerto UDP %d" % port)
+
+
+def p_wg(port, iface="wg0"):
+    if not os.path.exists("/sys/class/net/%s" % iface):
+        raise Fail("la interfaz %s no existe" % iface)
+    return "interfaz %s activa" % iface
+
+
 MODES = {"banner": p_banner, "ws": p_ws, "tls": p_tls, "connect": p_connect, "socks5": p_socks5,
-         "v2ws": p_v2ws, "udpgw": p_udpgw, "dns": p_dns, "ovpn": p_ovpn, "http": p_http, "tcp": p_tcp}
+         "v2ws": p_v2ws, "udpgw": p_udpgw, "dns": p_dns, "ovpn": p_ovpn, "http": p_http, "tcp": p_tcp,
+         "hello": p_hello, "tlshello": p_tlshello, "udp": p_udp, "wg": p_wg}
+
+
+# ------------------------------ Vigilante -------------------------------------
+HEALTH = "/etc/vpspanel/health.list"        # "unidad|prueba|puerto|dato" (lo escribe el panel)
+STATE = "/run/vpspanel/watch.json"          # se borra en cada arranque del VPS
+WLOG = "/var/log/vpspanel/watchdog.log"
+FAILS = 3            # pruebas fallidas seguidas antes de reiniciar
+COOLDOWN = 600       # entre reinicios de un servicio que no responde (se alarga si se repite)
+RECOVER = 300        # entre intentos de levantar un servicio caido (se alarga si se repite)
+GRACE = 90           # un servicio recien arrancado todavia no se prueba
+
+
+def note(path, msg):
+    try:
+        import syslog
+        syslog.openlog("vpspanel")
+        syslog.syslog("vigilante: " + msg)
+    except Exception:
+        pass
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        if os.path.exists(path) and os.path.getsize(path) > 262144:
+            with open(path, "rb") as f:
+                f.seek(-65536, 2)
+                tail = f.read().split(b"\n", 1)[-1]
+            with open(path, "wb") as f:
+                f.write(tail)
+        with open(path, "a") as f:
+            f.write("%s %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg))
+    except OSError:
+        pass
+
+
+def systemctl(*args):
+    try:
+        return subprocess.run(["systemctl"] + list(args), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                              universal_newlines=True, timeout=30).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def unit_states(units):
+    """unidad -> {propiedad: valor} con una sola llamada a systemctl."""
+    out = systemctl("show", "-p", "LoadState", "-p", "ActiveState", "-p", "UnitFileState",
+                    "-p", "ActiveEnterTimestampMonotonic", "--", *units)
+    blocks = [b for b in out.split("\n\n") if b.strip()]
+    if len(blocks) != len(units):
+        return {}
+    return {u: dict(l.split("=", 1) for l in b.strip().split("\n") if "=" in l) for u, b in zip(units, blocks)}
+
+
+def run_probe(entry):
+    unit, mode, port, extra = entry
+    try:
+        args = [extra] if extra and mode in ("v2ws", "dns", "ovpn", "wg") else []
+        MODES[mode](port, *args)
+        return None
+    except Fail as e:
+        return str(e)
+    except Exception as e:
+        return "%s: %s" % (type(e).__name__, e)
+
+
+def watch(health=HEALTH, state=STATE, wlog=WLOG):
+    global TIMEOUT
+    import fcntl
+    import json
+    from concurrent.futures import ThreadPoolExecutor
+    TIMEOUT = min(TIMEOUT, 6)
+    entries = []
+    try:
+        with open(health) as f:
+            for line in f:
+                p = line.rstrip("\n").split("|")
+                if len(p) == 4 and p[0] and (p[1] == "failed" or p[1] in MODES) and p[2].isdigit():
+                    entries.append((p[0], p[1], int(p[2]), p[3]))
+    except OSError:
+        return 0
+    if not entries:
+        return 0
+    try:
+        os.makedirs(os.path.dirname(state) or ".", mode=0o700, exist_ok=True)
+        lock = open(state + ".lock", "a")
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)      # una sola ronda a la vez
+    except OSError:
+        return 0
+    try:
+        with open(state) as f:
+            memo = json.load(f)
+        assert isinstance(memo, dict)
+    except Exception:
+        memo = {}
+    info = unit_states([e[0] for e in entries])
+    if not info:
+        return 0                                             # systemd no responde: en la proxima ronda
+    now = time.time()
+    mono = time.clock_gettime(time.CLOCK_MONOTONIC) * 1e6
+    try:
+        busy = os.getloadavg()[0] > 4 * (os.cpu_count() or 1)
+    except OSError:
+        busy = False
+    todo = []
+    for e in entries:
+        unit = e[0]
+        p = info.get(unit)
+        if not p or p.get("LoadState") != "loaded" or p.get("UnitFileState", "").startswith(("disabled", "masked")):
+            memo.pop(unit, None)                              # desinstalado o detenido a proposito
+            continue
+        m = memo.get(unit)
+        if not isinstance(m, dict):
+            m = memo[unit] = {}
+        st = p.get("ActiveState")
+        if st == "failed":
+            m["fails"] = 0
+            n = m.get("starts", 0)
+            if now - m.get("started", 0) >= RECOVER * min(2 ** n, 12):
+                systemctl("reset-failed", unit)
+                systemctl("start", "--no-block", unit)
+                m["started"], m["starts"] = now, n + 1
+                note(wlog, "%s estaba caido (failed): se vuelve a iniciar" % unit)
+            continue
+        if st != "active":
+            m["fails"] = 0                                    # parado a mano o arrancando: no se toca
+            continue
+        since = p.get("ActiveEnterTimestampMonotonic", "")
+        if since.isdigit() and int(since) and mono - int(since) < GRACE * 1e6:
+            continue
+        if e[1] == "failed":
+            m["starts"] = 0
+            continue
+        todo.append(e)
+    results = []
+    if todo:
+        with ThreadPoolExecutor(max_workers=len(todo)) as pool:
+            results = list(zip(todo, pool.map(run_probe, todo)))
+    for (unit, mode, port, extra), why in results:
+        m = memo[unit]
+        if why is None:
+            if m.get("restarts"):
+                note(wlog, "%s vuelve a responder" % unit)
+            m.update(ok=True, fails=0, restarts=0, starts=0)
+            continue
+        m["fails"] = m.get("fails", 0) + 1
+        if m["fails"] < FAILS:
+            continue
+        n = m.get("restarts", 0)
+        if not m.get("ok") and n >= 1:
+            continue            # su prueba nunca paso (configuracion propia): no se insiste
+        if now - m.get("restarted", 0) < COOLDOWN * min(2 ** max(n - 1, 0), 6):
+            continue
+        if busy:
+            if m["fails"] == FAILS:
+                note(wlog, "%s no responde (%s), pero el VPS esta sobrecargado: no se reinicia" % (unit, why))
+            continue
+        systemctl("restart", "--no-block", unit)
+        m.update(restarted=now, restarts=n + 1, fails=0)
+        note(wlog, "%s no responde (%d veces seguidas: %s): se reinicia" % (unit, FAILS, why))
+    try:
+        with open(state + ".new", "w") as f:
+            json.dump(memo, f)
+        os.replace(state + ".new", state)
+    except OSError:
+        pass
+    return 0
 
 
 def main():
     global HOST
     args = sys.argv[1:]
+    if args and args[0] == "watch":
+        return watch(*args[1:4])
     if "--host" in args:
         i = args.index("--host")
         HOST = args[i + 1]
@@ -1577,6 +2319,7 @@ install_firewall() {   # vps-fw y el servicio que reaplica las reglas al arranca
 #   vps-fw udpclean PUERTO  quita las reglas que deja UDP Custom (no las borra al detenerse)
 BASE=/etc/vpspanel
 TAG=vpspanel
+STATE=/run/vpspanel/fw.state     # huella de las reglas aplicadas (se borra al reiniciar el VPS)
 
 del_tagged() {   # iptables|ip6tables tabla cadena
   local r
@@ -1591,11 +2334,21 @@ clear_rules() {
     del_tagged $ipt filter INPUT
     del_tagged $ipt filter FORWARD
     del_tagged $ipt nat POSTROUTING
+    del_tagged $ipt mangle FORWARD
   done
 }
 
-apply() {
-  local ipt p pr sub dev
+huella() {   # puertos y NAT pedidos + las reglas actuales de las cadenas que usa el panel
+  {
+    cat "$BASE/fw.ports" "$BASE/fw.nat" "$0" 2>/dev/null
+    echo "$DEV"
+    iptables -w -S INPUT; ip6tables -w -S INPUT
+    iptables -w -S FORWARD; iptables -w -t nat -S POSTROUTING; iptables -w -t mangle -S FORWARD
+  } 2>/dev/null | sha256sum
+}
+
+reglas() {   # quita y vuelve a poner las reglas del panel, al principio de las cadenas
+  local ipt p pr sub
   clear_rules
   for ipt in iptables ip6tables; do
     command -v $ipt >/dev/null 2>&1 || continue
@@ -1608,24 +2361,54 @@ apply() {
     done < "$BASE/fw.ports"
   done
   if [[ -s $BASE/fw.nat ]] && command -v iptables >/dev/null 2>&1; then
-    sysctl -qw net.ipv4.ip_forward=1
-    dev=$(ip -4 route show default 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); exit }}')
     while read -r sub; do
       [[ $sub =~ ^[0-9./]+$ ]] || continue
-      iptables -w -t nat -A POSTROUTING -s "$sub" ${dev:+-o "$dev"} -m comment --comment $TAG -j MASQUERADE
+      iptables -w -t nat -A POSTROUTING -s "$sub" ${DEV:+-o "$DEV"} -m comment --comment $TAG -j MASQUERADE
       iptables -w -I FORWARD -s "$sub" -m comment --comment $TAG -j ACCEPT
       iptables -w -I FORWARD -d "$sub" -m state --state RELATED,ESTABLISHED -m comment --comment $TAG -j ACCEPT
+      # tamano maximo de segmento segun la ruta: evita paginas que no cargan en redes moviles (MTU bajo)
+      for p in -s -d; do
+        iptables -w -t mangle -A FORWARD "$p" "$sub" -p tcp --tcp-flags SYN,RST SYN \
+          -m comment --comment $TAG -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null
+      done
     done < "$BASE/fw.nat"
   fi
-  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: active'; then
-    while IFS=/ read -r p pr; do ufw allow "$p/$pr" >/dev/null 2>&1; done < "$BASE/fw.ports"
+}
+
+otros_firewalls() {   # ufw y firewalld (si estan activos): solo se agrega lo que falta (cada orden tarda)
+  local st run perm p pr
+  [[ -s $BASE/fw.ports ]] || return 0
+  if command -v ufw >/dev/null 2>&1; then
+    st=$(ufw status 2>/dev/null)
+    if [[ $st == *'Status: active'* ]]; then
+      while IFS=/ read -r p pr; do
+        grep -qE "^$p(/$pr)?[[:space:]]+ALLOW[[:space:]]+Anywhere" <<< "$st" || ufw allow "$p/$pr" >/dev/null 2>&1
+      done < "$BASE/fw.ports"
+    fi
   fi
   if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+    run=" $(firewall-cmd --list-ports 2>/dev/null) "
+    perm=" $(firewall-cmd --permanent --list-ports 2>/dev/null) "
     while IFS=/ read -r p pr; do
-      firewall-cmd -q --add-port="$p/$pr" 2>/dev/null; firewall-cmd -q --permanent --add-port="$p/$pr" 2>/dev/null
+      [[ $run == *" $p/$pr "* ]] || firewall-cmd -q --add-port="$p/$pr" 2>/dev/null
+      [[ $perm == *" $p/$pr "* ]] || firewall-cmd -q --permanent --add-port="$p/$pr" 2>/dev/null
     done < "$BASE/fw.ports"
-    if [[ -s $BASE/fw.nat ]]; then firewall-cmd -q --add-masquerade; firewall-cmd -q --permanent --add-masquerade; fi
+    if [[ -s $BASE/fw.nat ]]; then
+      firewall-cmd -q --query-masquerade 2>/dev/null || firewall-cmd -q --add-masquerade
+      firewall-cmd -q --permanent --query-masquerade 2>/dev/null || firewall-cmd -q --permanent --add-masquerade
+    fi
   fi
+}
+
+apply() {
+  DEV=$(ip -4 route show default 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); exit }}')
+  [[ -s $BASE/fw.nat ]] && sysctl -qw net.ipv4.ip_forward=1
+  # si las reglas ya estan tal como se aplicaron, no se tocan (quitarlas y ponerlas deja un hueco)
+  if [[ ! -s $STATE || $(< "$STATE") != "$(huella)" ]]; then
+    reglas
+    { [[ -d ${STATE%/*} ]] || mkdir -m 700 "${STATE%/*}"; } 2>/dev/null && huella 2>/dev/null > "$STATE"
+  fi
+  otros_firewalls
   return 0
 }
 
@@ -1644,7 +2427,7 @@ udpclean() {   # puerto
 
 case ${1:-} in
   apply)    apply ;;
-  clear)    clear_rules ;;
+  clear)    clear_rules; rm -f "$STATE" ;;
   udpclean) udpclean "${2:-}" ;;
   *) echo "uso: vps-fw apply|clear|udpclean PUERTO"; exit 1 ;;
 esac
@@ -1669,39 +2452,86 @@ EOF
   systemctl enable vps-firewall >/dev/null 2>&1
 }
 
+helper_put() {   # nombre  (contenido por la entrada)  ->  /usr/local/bin/nombre, de una vez
+  local t rc=1
+  t=$(mktemp) || return 1
+  cat > "$t" && [[ -s $t ]] && tool_put "$t" "/usr/local/bin/$1" && rc=0
+  rm -f "$t"
+  return $rc
+}
+
 install_helpers() {
-  cat > /usr/local/bin/vps-sessions <<'EOF'
+  local rc=0
+  helper_put vps-sessions <<'EOF' || rc=1
 #!/bin/bash
 # Sesiones SSH y Dropbear activas, una por linea: "usuario pid segundos"
+R=/run/vpspanel
+export LC_ALL=C
+P=$(ps -eo user=,pid=,etimes=,comm= 2>/dev/null)
 # OpenSSH: el proceso de cada sesion corre como el usuario.
-ps -eo user=,pid=,etimes=,comm= 2>/dev/null |
-  awk '($4=="sshd" || $4=="sshd-session") && $1!="root" && $1!="sshd" {print $1, $2, $3}'
+awk '($4=="sshd" || $4=="sshd-session") && $1!="root" && $1!="sshd" {print $1, $2, $3}' <<< "$P"
 # Dropbear: las sesiones de solo tunel siguen como root; el usuario sale del journal
-# ("[PID] ... auth succeeded for 'usuario'"). Se toma la ultima linea de cada PID vivo.
-journalctl -u vps-dropbear --since "-3 days" -o cat 2>/dev/null |
-  sed -n "s/^\[\([0-9][0-9]*\)\] .*auth succeeded for '\([^']*\)'.*/\1 \2/p" |
-  awk '{u[$1] = $2} END {for (p in u) print p, u[p]}' |
-  while read -r pid u; do
-    [[ $(cat "/proc/$pid/comm" 2>/dev/null) == dropbear ]] || continue
-    echo "$u $pid $(ps -o etimes= -p "$pid" 2>/dev/null | tr -d ' ')"
-  done
+# ("[PID] ... auth succeeded for 'usuario'"). Solo se leen las lineas nuevas desde la ultima vez
+# (cursor del journal); las sesiones vivas se recuerdan en $R y se comprueba que cada PID siga
+# siendo el mismo proceso (momento de inicio en /proc/PID/stat).
+D=$(awk '$4=="dropbear" {print $2, $3}' <<< "$P")
+[[ -n $D ]] || exit 0
+M=/dev/null N=/dev/null CF=/dev/null C=
+if { [[ -d $R ]] || mkdir -m 700 "$R" || [[ -d $R ]]; } 2>/dev/null && { exec 9>> "$R/sessions.lock"; } 2>/dev/null; then
+  flock -w 20 9
+  M=$R/dropbear.map N=$R/dropbear.new CF=$R/dropbear.cursor
+  [[ -s $CF ]] && read -r C < "$CF"
+fi
+if [[ -n $C ]]; then
+  L=$(journalctl -q -u vps-dropbear --after-cursor="$C" --show-cursor -o cat 2>/dev/null) || C=
+fi
+# primera vez (o cursor ilegible: journal borrado o rotado): se revisan los ultimos 3 dias
+[[ -n $C ]] || L=$(journalctl -q -u vps-dropbear --since "-3 days" --show-cursor -o cat 2>/dev/null)
+awk -v live="$D" -v map="$M" -v new="$N" -v cf="$CF" '
+  function inicio(p,   f, l, a) {          # momento de inicio del proceso (campo 22 de /proc/PID/stat)
+    f = "/proc/" p "/stat"; l = ""
+    if ((getline l < f) <= 0) l = ""
+    close(f); sub(/^.*\) /, "", l); split(l, a, " "); return a[20]
+  }
+  BEGIN {
+    n = split(live, v, "\n"); for (i = 1; i <= n; i++) { split(v[i], x, " "); age[x[1]] = x[2] }
+    while ((getline l < map) > 0) { split(l, x, " "); if (x[1] in age) { ini[x[1]] = x[2]; usr[x[1]] = x[3] } }
+    close(map)
+  }
+  /^-- cursor: / { c = substr($0, 12); next }
+  /^\[[0-9]+\] .*auth succeeded for \047[^\047]+\047/ {
+    p = $1; gsub(/[^0-9]/, "", p)
+    if (!(p in age)) next
+    u = $0; sub(/^.*auth succeeded for \047/, "", u); sub(/\047.*$/, "", u)
+    usr[p] = u; ini[p] = inicio(p)
+  }
+  END {
+    printf "" > new
+    for (p in usr) if (ini[p] != "" && ini[p] == inicio(p)) { print p, ini[p], usr[p] > new; print usr[p], p, age[p] }
+    if (c != "") print c > cf
+  }' <<< "$L"
+[[ $N == /dev/null ]] || mv -f "$N" "$M"
 EOF
-  cat > /usr/local/bin/vps-limiter <<'EOF'
+  helper_put vps-limiter <<'EOF' || rc=1
 #!/bin/bash
-# Limita conexiones simultaneas por usuario (SSH/Dropbear): se quedan las mas antiguas
+# Limita conexiones simultaneas por usuario (SSH/Dropbear): se quedan las mas antiguas. Una sesion
+# de mas solo se corta cuando ya lleva GRACE segundos: al reconectar, la sesion anterior (caida)
+# tarda hasta 90-120 s en cerrarse y la nueva no debe cortarse mientras tanto.
 DB=/etc/vpspanel/users.db
+GRACE=130
+export LC_ALL=C
 [[ -s $DB ]] || exit 0
+grep -qE '\|[0-9]*[1-9][0-9]*$' "$DB" || exit 0                  # nadie tiene limite
 S=$(/usr/local/bin/vps-sessions)
-while IFS='|' read -r u p e l; do
-  [[ -n $u && ${l:-0} -gt 0 ]] || continue
-  mapfile -t pids < <(awk -v u="$u" '$1==u {print $3" "$2}' <<< "$S" | sort -rn | awk '{print $2}')
-  if (( ${#pids[@]} > l )); then
-    kill -9 "${pids[@]:l}" 2>/dev/null
-  fi
-done < "$DB"
+[[ -n $S ]] || exit 0
+mapfile -t K < <(sort -k3,3rn <<< "$S" | awk -v g="$GRACE" -v db="$DB" '
+  BEGIN { while ((getline l < db) > 0) { split(l, a, "|"); if (a[1] != "" && a[4] + 0 > 0) lim[a[1]] = a[4] + 0 } }
+  $1 in lim { if (++n[$1] > lim[$1] && $3 + 0 >= g) print $2 }')
+(( ${#K[@]} )) && kill -9 "${K[@]}" 2>/dev/null
+exit 0
 EOF
 
-  cat > /usr/local/bin/vps-cleanup <<'EOF'
+  helper_put vps-cleanup <<'EOF' || rc=1
 #!/bin/bash
 # Elimina cuentas SSH y V2Ray vencidas. Una cuenta vence a las 00:00 UTC de su fecha (igual que
 # en la tabla de cuentas del panel, donde ya sale en rojo). Las cuentas de prueba vencen a la hora
@@ -1775,21 +2605,21 @@ if [[ -s $V2DB && -f $V2CFG ]]; then
 fi
 exit 0
 EOF
-  chmod 755 /usr/local/bin/vps-sessions /usr/local/bin/vps-limiter /usr/local/bin/vps-cleanup
 
   cat > /etc/cron.d/vpspanel <<'EOF'
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 * * * * * root /usr/local/bin/vps-limiter >/dev/null 2>&1
 * * * * * root /usr/local/bin/vps-cleanup --auto >/dev/null 2>&1
+* * * * * root [ -e /etc/vpspanel/watchdog.off ] || /usr/local/bin/vps-probe watch >/dev/null 2>&1
 41 3 * * * root [ -x /usr/local/bin/vpspanel ] && /usr/local/bin/vpspanel --backup auto >/dev/null 2>&1
 EOF
   chmod 644 /etc/cron.d/vpspanel
   systemctl enable --now cron >/dev/null 2>&1
-  install_tools
+  install_tools || rc=1
   install_firewall
   install_rollback
-  echo "$HELPERS_V" > "$BASE/.helpers"
+  (( rc )) || echo "$HELPERS_V" > "$BASE/.helpers"     # si algo no se pudo escribir, se reintenta
 }
 
 install_rollback() {   # vps-rollback: vuelve a la version anterior del panel (sirve aunque la nueva falle)
@@ -1836,6 +2666,23 @@ EOF
 # Eliminacion automatica de cuentas vencidas: activada por defecto (se apaga con autodel.off)
 autodel_on() { [[ ! -f $BASE/autodel.off ]]; }
 
+# Vigilante: levanta los servicios caidos y reinicia los que dejan de responder (watchdog.off lo apaga)
+watchdog_on() { [[ ! -f $BASE/watchdog.off ]]; }
+
+toggle_watchdog() {
+  if watchdog_on; then
+    touch "$BASE/watchdog.off"
+    ok "Reparacion automatica DESACTIVADA"
+    info "Los servicios caidos ya no se levantan solos (systemd si reinicia los que se cierran)."
+  else
+    rm -f "$BASE/watchdog.off"
+    health_sync
+    ok "Reparacion automatica ACTIVADA"
+    info "Cada minuto se prueba cada servicio activo; si no responde 3 veces seguidas, se reinicia."
+    info "Registro: $LOG_DIR/watchdog.log"
+  fi
+}
+
 toggle_autodel() {
   if autodel_on; then
     touch "$BASE/autodel.off"
@@ -1870,10 +2717,56 @@ proxy_refresh() {
   return 0
 }
 
+# Instalaciones anteriores: se agrega a la configuracion existente solo lo nuevo (lo demas no se toca).
+# Cada funcion devuelve 0 si cambio algo.
+ssl_tune() {
+  local f=$BASE/stunnel.conf t
+  [[ -f $f ]] && ! grep -q '^sessionCacheTimeout' "$f" || return 1
+  t=$(mktemp) || return 1
+  { sed '/^\[/,$d' "$f"; ssl_opts; sed -n '/^\[/,$p' "$f"; } > "$t"
+  cat "$t" > "$f"; rm -f "$t"
+}
+squid_tune() {
+  local f=/etc/squid/squid.conf
+  grep -q '^# VPS PANEL' "$f" 2>/dev/null && ! grep -q '^client_lifetime' "$f" || return 1
+  printf '%s\n' 'client_lifetime 7 days' 'max_filedescriptors 65535' >> "$f"
+  squid_dropin
+}
+v2ray_tune() {
+  local u=/etc/systemd/system/v2ray.service rc=1
+  v2_tune && rc=0
+  if grep -qx 'Restart=on-failure' "$u" 2>/dev/null && grep -q '^ExecStart=/usr/local/bin/v2ray ' "$u"; then
+    sed -i 's/^Restart=on-failure$/Restart=always/' "$u" && systemctl daemon-reload && rc=0
+  fi
+  return $rc
+}
+openvpn_tune() {
+  local f=$OVPN_DIR/server.conf
+  grep -q '^# VPS PANEL' "$f" 2>/dev/null && grep -q '^proto tcp' "$f" && ! grep -qx tcp-nodelay "$f" || return 1
+  sed -i "s/^data-ciphers AES-128-GCM:AES-256-GCM:CHACHA20-POLY1305:AES-128-CBC$/data-ciphers $(ovpn_ciphers)/" "$f"
+  echo tcp-nodelay >> "$f"
+}
+svc_upgrade() {   # aplica los ajustes nuevos y reinicia solo los servicios que cambiaron (si estan activos)
+  local k u keep=$LOG
+  log_use sistema "Ajustes de los servicios"
+  for k in ssl squid v2ray openvpn; do
+    proto_installed "$k" || continue
+    "${k}_tune" || continue
+    u=$(svc_unit "$k")
+    logln "$u: ajustes nuevos aplicados"
+    [[ -n ${NOSTART:-} ]] || systemctl try-restart "$u" >> "$LOG" 2>&1
+  done
+  LOG=$keep
+  return 0
+}
+
 helpers_update() {   # instalaciones anteriores o actualizadas: vps-cleanup, vps-rollback, el cron y el motor de los proxies
   [[ -f $BASE/.prep ]] || return 0
   [[ $(cat "$BASE/.helpers" 2>/dev/null) == "$HELPERS_V" ]] && return 0
   install_helpers >/dev/null 2>&1
+  proxy_installed && uvloop_install              # antes de proxy_refresh: reinicia una sola vez
+  svc_upgrade
+  health_sync
   proxy_refresh
   return 0
 }
@@ -1929,6 +2822,7 @@ ssh_legacy() {   # algoritmos extra con "+" (solo los que esta version de OpenSS
 
 cfg_ssh() {
   local f=/etc/ssh/sshd_config.d/00-vpspanel.conf out hk lg
+  rm -f "$RUN_DIR/ssh_ok"
   mkdir -p /etc/ssh/sshd_config.d
   [[ -d /run/sshd ]] || install -d -m 0755 -o root -g root /run/sshd   # sshd -t la exige (root, 0755)
   grep -qE '^\s*Include\s+/etc/ssh/sshd_config\.d' /etc/ssh/sshd_config \
@@ -2028,10 +2922,15 @@ inst_ssl() {
   apt_i stunnel4 || return 1
   systemctl disable --now stunnel4 >> "$LOG" 2>&1
   install_tools
+  uvloop_install
   [[ -s $CERT ]] || mk_selfsigned "$(get_host)"
   conf_ssl
 }
 
+ssl_opts() {   # sesiones TLS reutilizables (reconectar es mas rapido) y deteccion de clientes caidos
+  printf '%s\n' 'sessionCacheTimeout = 3600' 'socket = l:SO_KEEPALIVE=1' 'socket = l:TCP_KEEPIDLE=60' \
+    'socket = l:TCP_KEEPINTVL=30' 'socket = l:TCP_KEEPCNT=8'
+}
 conf_ssl() {   # stunnel + proxy interno: SSH directo, payload o WebSocket dentro de TLS
   cat > "$BASE/stunnel.conf" <<EOF
 foreground = yes
@@ -2041,6 +2940,7 @@ client = no
 socket = a:SO_REUSEADDR=1
 socket = l:TCP_NODELAY=1
 socket = r:TCP_NODELAY=1
+$(ssl_opts)
 
 [ssl-ssh]
 accept = $PORT_SSL
@@ -2058,7 +2958,9 @@ RuntimeDirectory=vps-sslws
 ExecStart=$(proxy_exec "unix:$SSL_SOCK" "$SSH_PORT" 101)
 Restart=always
 RestartSec=2
-LimitNOFILE=65535
+LimitNOFILE=$(unit_nofile)
+TasksMax=infinity
+OOMScoreAdjust=-250
 EOF
   mkunit vps-stunnel "Stunnel SSL a SSH" "/usr/bin/stunnel4 $BASE/stunnel.conf" "" \
     "Requires=vps-sslws.service
@@ -2115,6 +3017,7 @@ inst_ws() {
   need_port ws "$PORT_WS" || return 1
   info "Instalando proxy WebSocket..."
   install_tools
+  uvloop_install
   unit_ws
 }
 
@@ -2130,6 +3033,7 @@ inst_socks() {
   need_port socks "$PORT_SOCKS" || return 1
   info "Instalando SOCKS Python..."
   install_tools
+  uvloop_install
   unit_socks
 }
 
@@ -2147,6 +3051,7 @@ inst_wsepro() {
   need_port wsepro "$PORT_WSEPRO" || return 1
   info "Instalando WS-ePro..."
   install_tools
+  uvloop_install
   unit_wsepro
 }
 
@@ -2165,6 +3070,12 @@ inst_squid() {
   conf_squid
 }
 
+squid_dropin() {   # mas conexiones a la vez y reinicio automatico si Squid se cae
+  mkdir -p /etc/systemd/system/squid.service.d
+  printf '[Service]\nLimitNOFILE=65535\nRestart=on-failure\nRestartSec=3\nOOMScoreAdjust=-250\n' \
+    > /etc/systemd/system/squid.service.d/vpspanel.conf
+  systemctl daemon-reload
+}
 conf_squid() {
   local ips out
   # shellcheck disable=SC2046
@@ -2178,6 +3089,8 @@ forwarded_for delete
 cache deny all
 access_log none
 shutdown_lifetime 1 seconds
+client_lifetime 7 days
+max_filedescriptors 65535
 acl self_dst dst $ips
 acl tunnel_ports port $SSH_PORT $PORT_DROPBEAR $PORT_WS $PORT_SOCKS $PORT_WSEPRO $(ovpn_port)
 http_access allow self_dst tunnel_ports
@@ -2189,6 +3102,7 @@ EOF
     printf '%s\n' "$out" | grep -iE 'error|fatal|warn|bungled' | gray_lines 8
     return 1
   fi
+  squid_dropin
   svc_restart squid
   fw_sync
   VERIFY_WAIT=40 verify squid Squid
@@ -2229,7 +3143,8 @@ v2_write_config() {   # config con las cuentas de v2ray.db (asi una reinstalacio
   mkdir -p "$(dirname "$V2CFG")"
   cat > "$V2CFG" <<EOF
 {
-  "log": { "loglevel": "warning" },
+  "log": { "loglevel": "warning", "access": "none" },
+  "policy": { "levels": { "0": { "connIdle": 900, "uplinkOnly": 5, "downlinkOnly": 10 } } },
   "inbounds": [
     {
       "port": $PORT_V2RAY,
@@ -2263,9 +3178,11 @@ AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
 Environment=V2RAY_LOCATION_ASSET=/usr/local/share/v2ray
 ExecStart=/usr/local/bin/v2ray $(v2_cmd) $V2CFG
-Restart=on-failure
-RestartSec=3
-LimitNOFILE=65535
+Restart=always
+RestartSec=2
+LimitNOFILE=$(unit_nofile)
+TasksMax=infinity
+OOMScoreAdjust=-250
 
 [Install]
 WantedBy=multi-user.target
@@ -2436,6 +3353,10 @@ inst_openvpn() {
   ovpn_conf
 }
 
+ovpn_ciphers() {   # sin AES en el procesador, ChaCha20 es varias veces mas rapido que AES
+  if grep -qw aes /proc/cpuinfo 2>/dev/null; then echo AES-128-GCM:AES-256-GCM:CHACHA20-POLY1305:AES-128-CBC
+  else echo CHACHA20-POLY1305:AES-128-GCM:AES-256-GCM:AES-128-CBC; fi
+}
 ovpn_conf() {
   local plugin ver ciph proto
   plugin=$(find /usr/lib -name openvpn-plugin-auth-pam.so 2>/dev/null | head -1)
@@ -2443,7 +3364,7 @@ ovpn_conf() {
   printf 'auth     required pam_unix.so\naccount  required pam_unix.so\n' > /etc/pam.d/openvpn-vpspanel
   ver=$(openvpn --version 2>/dev/null | awk 'NR==1{print $2}')
   if dpkg --compare-versions "${ver:-2.4}" ge 2.5; then
-    ciph=$'data-ciphers AES-128-GCM:AES-256-GCM:CHACHA20-POLY1305:AES-128-CBC\ndata-ciphers-fallback AES-128-CBC'
+    ciph="data-ciphers $(ovpn_ciphers)"$'\ndata-ciphers-fallback AES-128-CBC'
   else
     ciph=$'cipher AES-128-CBC\nncp-ciphers AES-128-GCM:AES-256-GCM'
   fi
@@ -2464,6 +3385,7 @@ push "redirect-gateway def1 bypass-dhcp"
 push "dhcp-option DNS 1.1.1.1"
 push "dhcp-option DNS 8.8.8.8"
 keepalive 10 120
+tcp-nodelay
 $ciph
 auth SHA256
 tls-version-min 1.2
@@ -2820,11 +3742,22 @@ test_user() {
 
 # Dias que faltan para una fecha AAAA-MM-DD: desde ahora hasta las 00:00 UTC de esa fecha
 # (cuando la cuenta vence), redondeado hacia abajo. Negativo si ya vencio.
-days_left() {   # fecha ahora_en_segundos
-  local s r
-  s=$(date -u -d "$1" +%s 2>/dev/null) || { echo 0; return; }
+days_left() {   # fecha ahora_en_segundos  ->  DL = dias que faltan (hacia abajo); calculo sin lanzar date
+  local s r y m d e yoe
+  DL=0
+  if [[ $1 =~ ^([0-9]{4})-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$ ]]; then
+    y=${BASH_REMATCH[1]}; m=$(( 10#${BASH_REMATCH[2]} )); d=$(( 10#${BASH_REMATCH[3]} ))
+    y=$(( 10#$y )); r=31
+    case $m in 4|6|9|11) r=30 ;; 2) r=$(( (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 ? 29 : 28 )) ;; esac
+    (( d <= r )) || return 0
+    (( m <= 2 )) && y=$(( y - 1 ))                           # dias desde 1970 (calendario gregoriano)
+    e=$(( y / 400 )); yoe=$(( y - e * 400 ))
+    s=$(( (e * 146097 + yoe * 365 + yoe / 4 - yoe / 100 + (153 * (m > 2 ? m - 3 : m + 9) + 2) / 5 + d - 1 - 719468) * 86400 ))
+  else
+    s=$(date -u -d "$1" +%s 2>/dev/null) || return 0
+  fi
   r=$(( s - $2 ))
-  if (( r < 0 && r % 86400 != 0 )); then echo $(( r / 86400 - 1 )); else echo $(( r / 86400 )); fi
+  if (( r < 0 && r % 86400 != 0 )); then DL=$(( r / 86400 - 1 )); else DL=$(( r / 86400 )); fi
 }
 
 fdate() {   # AAAA-MM-DD -> FD="May10/27" (mes en ingles, como la referencia)
@@ -2843,7 +3776,7 @@ acct_table() {   # archivo
   local -A LK=() PXT=()
   [[ $db == "$USERDB" ]] && kind=ssh
   ACCT=()
-  now=$(date +%s)
+  printf -v now '%(%s)T' -1
   num=$'N\xc2\xb0'
   if [[ $kind == ssh ]]; then
     if [[ -r /etc/shadow ]]; then
@@ -2862,10 +3795,10 @@ acct_table() {   # archivo
     ACCT+=("$n")
     if [[ -n ${PXT[$n]:-} ]]; then   # prueba: fecha de su hora de vencimiento y horas que faltan (24h, 5h...)
       r=$(( PXT[$n] - now ))
-      fdate "$(date -d "@${PXT[$n]}" +%F)"
+      printf -v t '%(%F)T' "${PXT[$n]}"; fdate "$t"
       if (( r > 0 )); then d="$(( (r + 3599) / 3600 ))h"; c=$GRN; else d=0; c=$RED; fi
     else
-      d=$(days_left "$e" "$now"); fdate "$e"
+      days_left "$e" "$now"; d=$DL; fdate "$e"
       if (( d < 0 )); then c=$RED; else c=$GRN; fi
     fi
     if [[ $kind == ssh ]]; then
@@ -3155,7 +4088,8 @@ proto_uninstall() {   # clave -> quita el servicio, el programa y su puerto del 
     ssl)       systemctl stop vps-sslws >/dev/null 2>&1
                rm -f /etc/systemd/system/vps-sslws.service "$BASE/stunnel.conf" ;;
     badvpn)    rm -f /usr/local/bin/badvpn-udpgw ;;
-    squid)     run "Quitando squid" apt-get purge -y squid ;;
+    squid)     run "Quitando squid" apt-get purge -y squid
+               rm -f /etc/systemd/system/squid.service.d/vpspanel.conf ;;
     v2ray)     rm -f /usr/local/bin/v2ray "$V2CFG" /etc/systemd/system/v2ray.service       # las cuentas quedan en v2ray.db
                rm -rf /usr/local/share/v2ray /etc/systemd/system/v2ray.service.d ;;
     udp)       /usr/local/bin/vps-fw udpclean "$PORT_UDP"; rm -rf /etc/udp-custom ;;
@@ -3200,6 +4134,10 @@ proto_diag() {   # clave -> estado, puerto, firewall, prueba real y registros
     fi
   fi
   svc_report "$k"
+  if grep -qF " $u " "$LOG_DIR/watchdog.log" 2>/dev/null; then
+    printf ' %sREPARACION AUTOMATICA (%s):%s\n' "$BLU" "$LOG_DIR/watchdog.log" "$RST"
+    grep -F " $u " "$LOG_DIR/watchdog.log" | tail -n 5 | gray_lines 5
+  fi
   l=$LOG_DIR/$k.log
   if [[ -s $l ]]; then
     printf ' %sULTIMAS LINEAS DEL REGISTRO DE INSTALACION:%s\n' "$BLU" "$RST"
@@ -3219,7 +4157,7 @@ banner_apply() {   # aplica el estado actual a OpenSSH y a Dropbear
 }
 
 banner_migrate() {   # versiones anteriores creaban un banner con el nombre del VPS
-  [[ -s $BANNER && ! -f $BASE/.banner-off ]] || { touch "$BASE/.banner-off"; return 0; }
+  [[ -s $BANNER && ! -f $BASE/.banner-off ]] || { [[ -f $BASE/.banner-off ]] || touch "$BASE/.banner-off"; return 0; }
   local b; b=$(<"$BANNER"); b=${b%$'\n'}
   if [[ $b == "VPS PANEL" || $b == "$(vps_name)" ]]; then
     rm -f "$BANNER"
@@ -3324,9 +4262,15 @@ dropbear_win() {   # ventana de recepcion por conexion de Dropbear (limita la su
 }
 
 netopt_list() {   # clave|valor|modo   max: solo sube  min: solo baja  set: fija  top: sube el maximo (3 numeros)
-  local ct r
+  local ct r d=1048576
+  r=$(ram_mb); [[ $r =~ ^[0-9]+$ ]] || r=1024
+  (( r < 900 )) && d=524288                        # buffer inicial de los sockets UDP (rafagas sin perdidas)
   printf '%s\n' \
     'net.core.rmem_max|16777216|max' 'net.core.wmem_max|16777216|max' \
+    "net.core.rmem_default|$d|max" "net.core.wmem_default|$d|max" \
+    'net.ipv4.udp_rmem_min|16384|max' 'net.ipv4.udp_wmem_min|16384|max' \
+    'net.core.netdev_budget|600|max' 'net.ipv4.tcp_max_syn_backlog|8192|max' \
+    'net.ipv4.tcp_fin_timeout|30|min' \
     'net.core.netdev_max_backlog|16384|max' 'net.core.somaxconn|4096|max' \
     'net.core.default_qdisc|fq|set' \
     'net.ipv4.tcp_rmem|16777216|top' 'net.ipv4.tcp_wmem|16777216|top' \
@@ -3338,7 +4282,6 @@ netopt_list() {   # clave|valor|modo   max: solo sube  min: solo baja  set: fija
   grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null &&
     echo 'net.ipv4.tcp_congestion_control|bbr|set'
   if [[ -e /proc/sys/net/netfilter/nf_conntrack_max ]]; then   # solo si hay NAT (UDP Custom, OpenVPN...)
-    r=$(ram_mb); [[ $r =~ ^[0-9]+$ ]] || r=1024
     ct=$(( r * 128 )); (( ct < 65536 )) && ct=65536; (( ct > 1048576 )) && ct=1048576
     printf '%s\n' "net.netfilter.nf_conntrack_max|$ct|max" \
       'net.netfilter.nf_conntrack_tcp_timeout_established|7440|min' \
@@ -3417,6 +4360,7 @@ rps_state() {   # si | no | na (no hace falta: un nucleo o tarjeta con varias co
 netopt_apply() {   # [quiet]
   local quiet=${1:-} k v m cur tgt hs b
   local -a conf=() badk=()
+  NETOPT_BUF=''                    # cambiaron los buffers UDP: UDP Custom se reinicia para usarlos
   log_use red "Optimizacion de red"
   NETOPT_OK=0; NETOPT_BAD=0
   touch "$NETOPT_ORIG"; chmod 600 "$NETOPT_ORIG"
@@ -3429,7 +4373,10 @@ netopt_apply() {   # [quiet]
     if [[ -z $cur ]]; then badk+=("$k"); continue; fi             # no existe en este kernel
     grep -q "^${k//./\\.}=" "$NETOPT_ORIG" || echo "$k=$cur" >> "$NETOPT_ORIG"
     tgt=$(netopt_target "$cur" "$v" "$m")
-    [[ $tgt == "$cur" ]] || sysctl -qw "$k=$tgt" >> "$LOG" 2>&1
+    if [[ $tgt != "$cur" ]]; then
+      sysctl -qw "$k=$tgt" >> "$LOG" 2>&1
+      [[ $k == net.core.?mem_* ]] && NETOPT_BUF=1
+    fi
     if [[ $(sysv "$k") != "$tgt" ]]; then badk+=("$k"); continue; fi   # el proveedor no lo deja cambiar
     conf+=("$k = $tgt")
   done < <(netopt_list)
@@ -3469,14 +4416,19 @@ netopt_apply() {   # [quiet]
     [[ $(rps_state) == si ]] && ok "RPS: la red se procesa en los $(nproc) nucleos"
   fi
   netopt_services "$quiet"
+  # si aun falta uvloop (apt estaba ocupado), se instala y los proxies activos lo toman
+  if proxy_installed && ! uvloop_ok && uvloop_install; then
+    systemctl try-restart vps-ws vps-socks vps-wsepro vps-stunnel >> "$LOG" 2>&1
+  fi
   return 0
 }
 
 netopt_services() {   # [quiet]  ->  UDP Custom, BadVPN y Dropbear toman los limites actuales
-  local k quiet=${1:-}
+  local k f quiet=${1:-}
   for k in udp badvpn dropbear; do   # solo lo instalado; lo detenido sigue detenido
     proto_installed "$k" || continue
-    if [[ -n $quiet ]]; then apply_proto "$k" >/dev/null 2>&1; else apply_proto "$k"; fi
+    f=''; [[ $k == udp ]] && f=${NETOPT_BUF:-}
+    if [[ -n $quiet ]]; then FORCE_RESTART=$f apply_proto "$k" >/dev/null 2>&1; else FORCE_RESTART=$f apply_proto "$k"; fi
   done
   return 0
 }
@@ -3677,7 +4629,7 @@ menu_netopt() {   # PREPARACION DEL SISTEMA > OPTIMIZAR RED
     case $o in
       1) sub_header "OPTIMIZACION DE RED"
          if is_on udp || is_on badvpn; then
-           info "UDP Custom y BadVPN se reinician: sus usuarios se reconectan solos."
+           info "Si cambian sus ajustes, UDP Custom y BadVPN se reinician (los usuarios se reconectan solos)."
            menu_end
            rd "APLICAR AHORA? (S/n): " c
            [[ $c == [nN0]* ]] && continue
@@ -3813,15 +4765,16 @@ EOF
   fi
 }
 
-restart_services() {   # reinicia lo que esta activo y comprueba que de verdad responda
+restart_services() {   # reinicia lo que esta activo (todo a la vez) y comprueba que de verdad responda
   local k
+  local -a ks=() us=()
   log_use servicios "Reiniciar servicios"
   is_on ssh && ssh_restart && echo "  reiniciado: ssh"
   for k in "${PROTO_KEYS[@]}"; do
-    is_on "$k" || continue
-    systemctl restart "$(svc_unit "$k")" >> "$LOG" 2>&1
-    VERIFY_WAIT=30 verify "$k" "$(proto_label "$k")"
+    is_on "$k" && { ks+=("$k"); us+=("$(svc_unit "$k")"); }
   done
+  (( ${#us[@]} )) && systemctl restart "${us[@]}" >> "$LOG" 2>&1
+  for k in "${ks[@]}"; do VERIFY_WAIT=30 verify "$k" "$(proto_label "$k")"; done
   fw_sync
   ok "Servicios reiniciados"
 }
@@ -3915,12 +4868,13 @@ uninstall_all() {
   rm -rf /etc/udp-custom
   rm -f /usr/local/bin/{vps-ws.py,vps-proxy.py,vps-probe,vps-fw,vps-sessions,vps-limiter,vps-cleanup,vps-rollback,vps-netopt,badvpn-udpgw,dnstt-server,psiphond,wireguard-go}
   rm -f /etc/systemd/system/vps-netopt.service "$NETOPT_CONF" "$NETOPT_MODS" "$NETOPT_HASH"
+  rm -f /etc/systemd/system/squid.service.d/vpspanel.conf
   rm -f /etc/cron.d/vpspanel /etc/sysctl.d/99-vpspanel.conf /etc/sysctl.d/99-vpspanel-forward.conf
   rm -f /etc/ssh/sshd_config.d/00-vpspanel.conf /etc/ssh/sshd_config.d/01-vpspanel-root.conf
   rm -f /etc/letsencrypt/renewal-hooks/{pre,post,deploy}/vpspanel.sh
   systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null
   autostart_on && sed -i '/vpspanel-autostart/d' /root/.bashrc
-  rm -rf "$BASE" "$LOG_DIR" "$UPD_DIR"
+  rm -rf "$BASE" "$LOG_DIR" "$UPD_DIR" "$RUN_DIR"
   rm -f "$PANEL_BIN"
   if [[ $keep == [nN]* ]]; then
     rm -rf "$BK_DIR"
@@ -3958,7 +4912,7 @@ self_install() {
 #   por evento: antes de actualizar, restaurar o desinstalar, y a mano (COPIAS DE SEGURIDAD)
 # Restaurar UNE las cuentas (las de la copia + las actuales que no estan en ella): no borra ninguna.
 # Lo que nunca se copia ni se restaura (temporales, candados y marcas propias de este servidor):
-BK_SKIP='^(\.prep|\.helpers|\.netopt(\.base)?|netopt\.(orig|99)|[^/]*\.lock|fw\.(ports|nat)|.*\.tmp|(.*/)?\.tmp-.*)$'
+BK_SKIP='^(\.prep|\.helpers|\.netopt(\.base)?|netopt\.(orig|99)|[^/]*\.lock|fw\.(ports|nat)|health\.list|.*\.tmp|(.*/)?\.tmp-.*)$'
 BK_DBS='^(users\.db|v2ray\.db|users\.exp|quick\.seq|test\.seq)$'   # se unen aparte al restaurar
 
 bk_files() { ls -1 "$BK_DIR"/vpspanel-*.tar.gz 2>/dev/null | LC_ALL=C sort -r; }   # la mas reciente primero
@@ -3970,7 +4924,7 @@ mf_get() {   # clave MANIFEST  ->  valor (solo caracteres seguros: la copia pued
 bk_fingerprint() {   # huella rapida (nombres, tamanos, fechas): si no cambio, no hace falta copiar
   {                    # sin candados ni temporales (el cron abre cleanup.lock cada minuto)
     find "$BASE" -type f ! -name '*.lock' ! -name '*.tmp' ! -name '.tmp-*' ! -name 'fw.ports' ! -name 'fw.nat' \
-      ! -name '.prep' ! -name '.helpers' ! -name '.netopt*' -printf '%P %s %T@\n' 2>/dev/null
+      ! -name 'health.list' ! -name '.prep' ! -name '.helpers' ! -name '.netopt*' -printf '%P %s %T@\n' 2>/dev/null
     stat -c '%n %s %Y' "$OVPN_DIR/ca.crt" "$OVPN_DIR/server.key" "$WG_CONF" /etc/shadow 2>/dev/null
   } | LC_ALL=C sort | sha256sum | cut -d' ' -f1
 }
@@ -4385,16 +5339,18 @@ reinstall_protos() {   # claves...  ->  instala esos protocolos con los puertos 
   else ok "Protocolos instalados con la configuracion recuperada"; fi
 }
 
+bk_last_valid() {   # imprime la copia mas reciente si es valida
+  local f; f=$(bk_files | head -1)
+  [[ -n $f ]] && bk_valid "$f" && echo "$f"
+}
 data_check() {   # base de cuentas y cuentas del sistema en orden; si no, ofrece repararlo
   local f='' u p e l t c='' now today tmp
   local -a lost=() gone=() glines=()
   local -A SYS=() PXT=() BH=()
-  now=$(date +%s); today=$(date -u +%F)
+  printf -v now '%(%s)T' -1; today=$(TZ=UTC0 printf '%(%F)T' -1)
   while IFS=: read -r u _; do SYS[$u]=1; done < <(getent passwd)
-  f=$(bk_files | head -1)
-  [[ -n $f ]] && ! bk_valid "$f" && f=''
   # a) users.db quedo vacia, pero siguen en el servidor cuentas del panel que estan en la ultima copia
-  if [[ -n $f ]] && ! grep -q '^[^|]' "$USERDB" 2>/dev/null; then
+  if ! grep -q '^[^|]' "$USERDB" 2>/dev/null && f=$(bk_last_valid); then
     while IFS='|' read -r u p e l; do
       [[ $u =~ ^[a-z_][a-z0-9_-]{0,31}$ && -n ${SYS[$u]:-} ]] && panel_acct "$u" && lost+=("$u")
     done < <(tar -xzOf "$f" vpspanel-backup/base/users.db 2>/dev/null)
@@ -4448,6 +5404,7 @@ data_check() {   # base de cuentas y cuentas del sistema en orden; si no, ofrece
       [[ -s $PX_DB ]] && db_filter "$PX_DB" awk -F'|' -v list="|$t|" 'index(list, "|" $1 "|") == 0'
       ok "${#gone[@]} cuentas quitadas de la lista"
     else
+      [[ -n $f ]] || f=$(bk_last_valid) || f=''
       if [[ -n $f ]]; then   # hash de la ultima copia: la contrasena queda identica a la original
         while IFS=: read -r u t; do [[ -n $u && -n $t ]] && BH[$u]=$t; done < <(tar -xzOf "$f" vpspanel-backup/extra/shadow 2>/dev/null)
       fi
@@ -4579,22 +5536,22 @@ upd_probe() {   # sin pantalla ni cambios en el panel: guarda "sha256 version" d
 }
 
 upd_due() {   # 0 si la ultima revision tiene mas de UPD_EVERY segundos (o no hay ninguna)
-  local t now
-  t=$(stat -c %Y "$UPD_STAMP" 2>/dev/null) || return 0
+  local t='' now
+  { read -r t < "$UPD_STAMP"; } 2>/dev/null
   [[ $t =~ ^[0-9]+$ ]] || return 0
-  now=$(date +%s)
+  printf -v now '%(%s)T' -1
   (( now < t || now - t >= UPD_EVERY ))
 }
 
-upd_refresh() {   # [wait]  ->  si toca, revisa GitHub en segundo plano; "wait" espera hasta 3 s
-  local i                 # (solo la primera vez) para que el aviso ya salga en la primera pantalla
+upd_refresh() {   # [wait]  ->  si toca, revisa GitHub en segundo plano; "wait" (primera pantalla) espera
+  local i                 # hasta 1 s, y solo si aun no hay ningun resultado guardado
   upd_due || return 0
   mkdir -p "$UPD_DIR" 2>/dev/null && chmod 700 "$UPD_DIR" 2>/dev/null || return 0
-  : > "$UPD_STAMP"                                             # se anota ya: no se lanza otra revision encima
+  printf '%(%s)T\n' -1 > "$UPD_STAMP"                         # se anota ya: no se lanza otra revision encima
   ( upd_probe ) >/dev/null 2>&1 </dev/null &
   UPD_PID=$!
-  if [[ ${1:-} == wait ]]; then
-    for (( i = 0; i < 30; i++ )); do kill -0 "$UPD_PID" 2>/dev/null || break; sleep 0.1; done
+  if [[ ${1:-} == wait && ! -s $UPD_AVAIL ]]; then
+    for (( i = 0; i < 10; i++ )); do kill -0 "$UPD_PID" 2>/dev/null || break; sleep 0.1; done
   fi
   return 0
 }
@@ -4772,10 +5729,24 @@ cfg_vpsname() { register_vps; }
 # ------------------------- Preparacion del sistema --------------------
 # Se marca como hecha solo si todo salio bien: si falla (sin internet, apt ocupado...),
 # se vuelve a intentar en la siguiente instalacion en lugar de dejar el sistema a medias.
-ssh_ok() {   # sshd acepta contrasenas, reenvio TCP y negocia con las librerias SSH de las apps
+ssh_ok() {   # como ssh_check, pero solo se repite si cambio algo de SSH (o tras reiniciar el VPS)
+  local s=$RUN_DIR/ssh_ok f
+  if [[ -f $s ]]; then
+    for f in /etc/ssh/sshd_config /etc/ssh/sshd_config.d /etc/ssh/sshd_config.d/*.conf /etc/ssh/ssh_host_*_key /usr/sbin/sshd; do
+      [[ $f -nt $s ]] && { rm -f "$s"; break; }
+    done
+    [[ -f $s ]] && return 0
+  fi
+  ssh_check || return 1
+  [[ -n $SSH_CHECKED ]] && run_dir && : > "$s" 2>/dev/null
+  return 0
+}
+ssh_check() {   # sshd acepta contrasenas, reenvio TCP y negocia con las librerias SSH de las apps
   local t k
+  SSH_CHECKED=''
   t=$(sshd -T 2>/dev/null)
   [[ -n $t ]] || return 0                                   # no se puede comprobar
+  SSH_CHECKED=1
   grep -qx 'passwordauthentication yes' <<< "$t" || return 1
   grep -qx 'allowtcpforwarding no' <<< "$t" && return 1
   for k in rsa ecdsa ed25519; do
@@ -4965,13 +5936,16 @@ ssh_list() {
 }
 
 ssh_online() {
-  local u p e l n tot=0 sess
-  sess=$(/usr/local/bin/vps-sessions 2>/dev/null)
+  local u p e l n tot=0 s
+  local -A N=()
+  while read -r s _; do
+    [[ -n $s ]] && N[$s]=$(( ${N[$s]:-0} + 1 ))
+  done < <(/usr/local/bin/vps-sessions 2>/dev/null)
   printf '%s %-20s %s%s\n' "$LYE" USUARIO CONEXIONES "$RST"
   line_dash
   while IFS='|' read -r u p e l; do
     [[ -n $u ]] || continue
-    n=$(awk -v u="$u" '$1==u' <<< "$sess" | wc -l)
+    n=${N[$u]:-0}
     if (( n > 0 )); then printf ' %s%-20s%s %s%s%s\n' "$WHT" "$u" "$RST" "$GRN" "$n" "$RST"; tot=$(( tot + n )); fi
   done < "$USERDB"
   printf '\n %sTOTAL DE CONEXIONES: %d%s\n' "$BLU" "$tot" "$RST"
@@ -5041,10 +6015,10 @@ v2_create() {
 
 v2_list() {
   local n id e c=0 d col now
-  now=$(date +%s)
+  printf -v now '%(%s)T' -1
   while IFS='|' read -r n id e; do
     [[ -n $n ]] || continue
-    d=$(days_left "$e" "$now")
+    days_left "$e" "$now"; d=$DL
     if (( d < 0 )); then col=$RED; else col=$GRN; fi
     printf ' %s%s%s   %sEXPIRA%s %s%s%s\n' "$WHT" "$n" "$RST" "$BLU" "$RST" "$col" "${e:8:2}/${e:5:2}/${e:0:4}" "$RST"
     printf ' %s\n\n' "$(v2_link "$n" "$id")"
@@ -5158,6 +6132,20 @@ port_check() {   # clave puerto -> 0 si sirve (deja el numero en PCHK); si no, e
 
 port_set() { printf -v "${PVAR[$1]}" '%s' "$2"; save_ports; }
 
+# Sin registrar cada conexion en el journal y sin cortar a los 5 minutos las inactivas (avisos de apps).
+# Solo agrega lo que no este puesto y solo si V2Ray acepta la configuracion resultante.
+v2_tune() {
+  local t rc=1
+  [[ -f $V2CFG ]] && command -v jq >/dev/null 2>&1 || return 1
+  jq -e '.log.access != null and .policy != null' "$V2CFG" >/dev/null 2>&1 && return 1
+  t=$(mktemp --suffix=.json) || return 1
+  if jq '.log.access //= "none" | .policy //= {"levels":{"0":{"connIdle":900,"uplinkOnly":5,"downlinkOnly":10}}}' \
+       "$V2CFG" > "$t" 2>/dev/null && [[ -s $t ]] && V2CFG=$t v2_test >/dev/null 2>&1; then
+    cat "$t" > "$V2CFG" && rc=0                           # cat: conserva permisos
+  fi
+  rm -f "$t"
+  return $rc
+}
 v2_apply() {   # puerto y path de V2Ray en su config (sin tocar las cuentas)
   [[ -f $V2CFG ]] || return 0
   local t; t=$(mktemp)
@@ -5167,6 +6155,7 @@ v2_apply() {   # puerto y path de V2Ray en su config (sin tocar las cuentas)
   fi
   rm -f "$t"
   v2_test || return 1
+  v2_tune
   svc_restart v2ray
   fw_sync
   verify v2ray V2Ray
@@ -5396,6 +6385,7 @@ mark() {   # comando [args]  ->  marca verde (activo) o roja (inactivo)
 menu_system() {   # PREPARACION DEL SISTEMA: puertos activos, protocolos y configuraciones rapidas
   local o i h n
   while :; do
+    svc_snapshot
     cls
     title "INFORMACION DEL SISTEMA Y PUERTOS ACTIVOS" "$YEL"
     ports_block
@@ -5424,7 +6414,10 @@ menu_system() {   # PREPARACION DEL SISTEMA: puertos activos, protocolos y confi
       "$GRN" "[26]" "$RST" "$RED" "$RST" "$WHT" "$RST" "$(onoff autostart_on)"
     printf ' %26s%s%4s%s %s>%s %sAUTO-ELIMINAR%s %s\n' '' \
       "$GRN" "[27]" "$RST" "$RED" "$RST" "$WHT" "$RST" "$(onoff autodel_on)"
+    printf ' %26s%s%4s%s %s>%s %sAUTO-REPARAR%s %s\n' '' \
+      "$GRN" "[28]" "$RST" "$RED" "$RST" "$WHT" "$RST" "$(onoff watchdog_on)"
     line_eq
+    SVC_ON=()
     ask o || return
     case $o in
       0)  return ;;
@@ -5442,6 +6435,7 @@ menu_system() {   # PREPARACION DEL SISTEMA: puertos activos, protocolos y confi
       25) menu_view; continue ;;
       26) toggle_autostart ;;
       27) toggle_autodel ;;
+      28) toggle_watchdog ;;
       *)  if [[ $o =~ ^[0-9]+$ ]] && (( o >= 1 && o <= ${#PROTO_KEYS[@]} )); then
             proto_menu "${PROTO_KEYS[o-1]}" "${PROTO_NAMES[o-1]}"
           fi
@@ -5460,14 +6454,15 @@ fmt_mb() {   # MB -> 1.9Gi / 186Mi (redondeado como "free -h")
 }
 
 sys_stats() {   # llena las variables de CPU y RAM que muestra header()
-  local l1 mt mu mf
+  local l1 a b c d mt=0 mu=0 mf=0 p
   read -r l1 _ < /proc/loadavg
-  CPU_N=$(nproc 2>/dev/null || echo 1)
-  CPU_P=$(awk -v l="$l1" -v n="$CPU_N" 'BEGIN{p=l/n*100; if(p>100)p=100; printf "%d", p}')
-  read -r mt mu mf < <(free -m | awk '/^Mem:/{print $2, $3, $4}')
-  mt=${mt:-0}; mu=${mu:-0}; mf=${mf:-0}
+  [[ -n ${CPU_N:-} ]] || CPU_N=$(nproc 2>/dev/null || echo 1)
+  l1=${l1/./}; [[ $l1 =~ ^[0-9]+$ ]] || l1=0                  # carga en centesimas
+  CPU_P=$(( 10#$l1 / CPU_N )); (( CPU_P > 100 )) && CPU_P=100
+  while read -r a b c d _; do [[ $a == Mem: ]] && { mt=$b; mu=$c; mf=$d; }; done < <(free -m)
   RAM_T=$(fmt_mb "$mt"); RAM_U=$(fmt_mb "$mu"); RAM_F=$(fmt_mb "$mf")
-  RAM_P=$(awk -v u="$mu" -v t="$mt" 'BEGIN{printf "%.2f", (t > 0 ? u / t * 100 : 0)}')
+  p=$(( mt > 0 ? (mu * 20000 / mt + 1) / 2 : 0 ))            # porcentaje con 2 decimales
+  printf -v RAM_P '%d.%02d' $(( p / 100 )) $(( p % 100 ))
 }
 
 # Servicios del bloque de puertos (en este orden) y como se llaman ahi
@@ -5502,10 +6497,12 @@ ports_block() {   # puertos de los servicios activos: ETIQUETA: puerto, en dos c
 }
 
 header() {
-  local name
+  local name hoy hora
+  printf -v hoy '%(%D)T' -1; printf -v hora '%(%T)T' -1
   name=$(vps_name)
   if is_hidden name || [[ -z $name ]]; then name='VPS PANEL'; fi
   is_hidden server || sys_stats
+  svc_snapshot
 
   cls
   # Titulo: el nombre del VPS en blanco, entre las mismas lineas que el resto del panel
@@ -5520,9 +6517,9 @@ header() {
     cols "1:${BLU}IP:${RST} ${PNK}${IP:0:18}${RST}" \
          "24:${BLU}USADA:${RST}  ${GRN}${RAM_U}${RST}" \
          "40:${BLU}EN USO:${RST}${GRN}${CPU_P}%${RST}"
-    cols "1:${BLU}FECHA:${RST} ${WHT}$(date +%D)${RST}" \
+    cols "1:${BLU}FECHA:${RST} ${WHT}${hoy}${RST}" \
          "24:${BLU}LIBRE:${RST}  ${GRN}${RAM_F}${RST}"
-    cols "1:${BLU}HORA:${RST}  ${WHT}$(date +%T)${RST}" \
+    cols "1:${BLU}HORA:${RST}  ${WHT}${hora}${RST}" \
          "24:${BLU}EN USO:${RST} ${GRN}${RAM_P}%${RST}"
     line_eq
   fi
@@ -5553,6 +6550,7 @@ header() {
   printf ' %s0)%s %sSALIR DEL VPS%s  %s6)%s %sSALIR DEL SCRIPT%s  %s7)%s %sREBOOT VPS%s\n' \
     "$GRN" "$RST" "$BTN_GRAY" "$RST" "$GRN" "$RST" "$BTN_RED" "$RST" "$GRN" "$RST" "$BTN_BLUE" "$RST"
   line_eq
+  SVC_ON=()
 }
 
 exit_vps() {   # cierra el panel y la sesion SSH que lo abrio
