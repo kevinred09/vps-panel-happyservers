@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ======================================================================
-#  VPS PANEL v3.6.1 - instalador y administrador de protocolos para tuneles
+#  VPS PANEL v3.6.2 - instalador y administrador de protocolos para tuneles
 #  Compatible con HTTP Custom y apps similares.
 #  SSH, Dropbear, SSL, WebSocket, SOCKS Python, WS-ePro, Squid, V2Ray,
 #  BadVPN-UDPGW, UDP Custom, SlowDNS, OpenVPN, WireGuard y Psiphon
@@ -104,7 +104,7 @@ export VPSPANEL_ACTIVE=1
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}
 
 # ------------------------------ Configuracion -------------------------
-VERSION=3.6.1
+VERSION=3.6.2
 PREP_V=3          # version de la preparacion del sistema (se repite si cambia)
 NAME_MAX=24        # largo maximo del nombre del VPS (se muestra en el titulo)
 DEF_PASS=xxxx      # contrasena por defecto de las cuentas SSH (ENTER en el campo la escribe sola)
@@ -144,7 +144,7 @@ BK_KEEP_EV=15              # copias manuales y de antes de actualizar, restaurar
 BK_FORMAT=1                # formato de las copias (MANIFEST: format=1)
 SCRIPT_BK=$BK_DIR/scripts  # versiones anteriores del panel (vps-rollback)
 PANEL_BIN=${VPSPANEL_BIN:-/usr/local/bin/vpspanel}
-HELPERS_V=6                # version de los ayudantes (vps-proxy.py, cron...) y ajustes de servicios: si cambia, se aplican solos
+HELPERS_V=7                # version de los ayudantes (vps-proxy.py, cron...) y ajustes de servicios: si cambia, se aplican solos
 # Enlace RAW del instalador en tu repositorio: en ACTUALIZAR PANEL basta con ENTER. Si alguna vez
 # actualizas desde otro enlace, el panel recuerda ese (/etc/vpspanel/update.url) y lo usa primero.
 UPDATE_URL='https://raw.githubusercontent.com/kevinred09/vps-panel-happyservers/main/vps-panel.sh'
@@ -161,6 +161,7 @@ NETOPT_CONF=/etc/sysctl.d/60-vpspanel-red.conf   # el /etc/sysctl.conf del admin
 NETOPT_MODS=/etc/modules-load.d/vpspanel.conf     # modulos que se cargan antes de aplicar los ajustes
 NETOPT_HASH=/etc/modprobe.d/vpspanel.conf         # tamano de la tabla de conntrack al cargar el modulo
 NETOPT_ORIG=$BASE/netopt.orig                     # valores que tenia el sistema (para deshacer)
+UDP_RESERVA=/etc/sysctl.d/60-vpspanel-udp.conf    # puerto de UDP Custom apartado (ver udp_reserve)
 BADVPN_CONNS=64            # conexiones UDP por usuario en BadVPN con la optimizacion (40 con menos de 1 GB; sin ella, 20)
 BADVPN_MTU=16384           # datagrama maximo de BadVPN (por defecto 65520). Debe superar la MTU de la TUN de las apps
                            # (1500 o 9000): un datagrama mayor no se descarta, udpgw corta la sesion UDP del usuario
@@ -2795,6 +2796,7 @@ helpers_update() {   # instalaciones anteriores o actualizadas: vps-cleanup, vps
   install_helpers >/dev/null 2>&1
   proxy_installed && uvloop_install              # antes de proxy_refresh: reinicia una sola vez
   svc_upgrade
+  proto_installed udp && udp_reserve             # solo cambia el kernel: no reinicia nada
   health_sync
   proxy_refresh
   return 0
@@ -4121,7 +4123,7 @@ proto_uninstall() {   # clave -> quita el servicio, el programa y su puerto del 
                rm -f /etc/systemd/system/squid.service.d/vpspanel.conf ;;
     v2ray)     rm -f /usr/local/bin/v2ray "$V2CFG" /etc/systemd/system/v2ray.service       # las cuentas quedan en v2ray.db
                rm -rf /usr/local/share/v2ray /etc/systemd/system/v2ray.service.d ;;
-    udp)       /usr/local/bin/vps-fw udpclean "$PORT_UDP"; rm -rf /etc/udp-custom ;;
+    udp)       /usr/local/bin/vps-fw udpclean "$PORT_UDP"; rm -rf /etc/udp-custom "$UDP_RESERVA" ;;
     slowdns)   rm -f /usr/local/bin/dnstt-server ;;                                        # las llaves quedan en $BASE/slowdns
     openvpn)   rm -f "$OVPN_DIR/server.conf" /etc/pam.d/openvpn-vpspanel ;;               # la CA queda: el .ovpn sigue valido
     wireguard) mkdir -p "$BASE/wireguard"; mv -f "$WG_CONF" "$BASE/wireguard/wg0.conf.bak" 2>/dev/null ;;
@@ -4926,7 +4928,7 @@ uninstall_all() {
   systemctl daemon-reload
   rm -rf /etc/udp-custom
   rm -f /usr/local/bin/{vps-ws.py,vps-proxy.py,vps-probe,vps-fw,vps-sessions,vps-limiter,vps-cleanup,vps-rollback,vps-netopt,badvpn-udpgw,dnstt-server,psiphond,wireguard-go}
-  rm -f /etc/systemd/system/vps-netopt.service "$NETOPT_CONF" "$NETOPT_MODS" "$NETOPT_HASH"
+  rm -f /etc/systemd/system/vps-netopt.service "$NETOPT_CONF" "$NETOPT_MODS" "$NETOPT_HASH" "$UDP_RESERVA"
   rm -f /etc/systemd/system/squid.service.d/vpspanel.conf
   rm -f /etc/cron.d/vpspanel /etc/sysctl.d/99-vpspanel.conf /etc/sysctl.d/99-vpspanel-forward.conf
   rm -f /etc/ssh/sshd_config.d/00-vpspanel.conf /etc/ssh/sshd_config.d/01-vpspanel-root.conf
@@ -5892,6 +5894,35 @@ udp_excl() {   # puertos UDP que udp-custom NO debe capturar (DNS, SlowDNS, Open
   printf '%s\n' "${e[@]}" | sort -un | paste -sd, -
 }
 
+# UDP Custom escucha en un puerto que el kernel tambien reparte a las conexiones salientes (por
+# defecto, de 32768 a 60999). Con miles de sockets de BadVPN, uno puede quedarse con el justo cuando
+# UDP Custom se reinicia, y entonces no arranca ("address already in use") hasta que ese socket se
+# cierra. Apartar el puerto impide que el kernel lo entregue; escuchar en el sigue igual.
+puerto_en_lista() {   # puerto lista("53,36712-36715")  ->  0 si la lista lo incluye
+  local r a b
+  local -a rs
+  IFS=, read -ra rs <<< "$2"
+  for r in ${rs[@]+"${rs[@]}"}; do
+    [[ $r =~ ^([0-9]+)(-([0-9]+))?$ ]] || continue
+    a=${BASH_REMATCH[1]}; b=${BASH_REMATCH[3]:-$a}
+    (( $1 >= a && $1 <= b )) && return 0
+  done
+  return 1
+}
+
+udp_reserve() {   # aparta el puerto de UDP Custom ahora y en cada arranque (conserva los ya apartados)
+  local cur
+  [[ $PORT_UDP =~ ^[0-9]+$ ]] || return 0
+  cur=$(sysctl -n net.ipv4.ip_local_reserved_ports 2>/dev/null) || return 0
+  puerto_en_lista "$PORT_UDP" "$cur" || cur=${cur:+$cur,}$PORT_UDP
+  if ! sysctl -qw "net.ipv4.ip_local_reserved_ports=$cur" >> "$LOG" 2>&1; then
+    logln "no se pudo apartar el puerto $PORT_UDP (el proveedor no lo permite)"; return 0
+  fi
+  printf '%s\n' '# VPS PANEL: puerto de UDP Custom apartado (ninguna conexion saliente lo puede ocupar)' \
+    "net.ipv4.ip_local_reserved_ports = $cur" > "$UDP_RESERVA" 2>/dev/null
+  return 0
+}
+
 conf_udp() {   # configuracion y servicio de UDP Custom con el puerto actual
   local dir=/etc/udp-custom
   cat > "$dir/config.json" <<EOF
@@ -5902,6 +5933,7 @@ conf_udp() {   # configuracion y servicio de UDP Custom con el puerto actual
   "auth": { "mode": "passwords" }
 }
 EOF
+  udp_reserve                                      # antes de (re)iniciarlo
   # udp-custom crea reglas DNAT para casi todos los puertos UDP y no las borra al detenerse:
   # se limpian antes de cada inicio y al detenerlo, asi no capturan puertos de otros servicios.
   mkunit udp-custom "UDP Custom" "$dir/udp-custom server -exclude $(udp_excl)" \
